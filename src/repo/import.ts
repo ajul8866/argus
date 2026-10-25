@@ -5,7 +5,7 @@ import type { Store } from "../db/index.ts";
 import { runCommand } from "../harness/process.ts";
 import { badRequest, now, parseJson, toJson, uid } from "../util.ts";
 import { DEFAULT_EXCLUDES, buildInventory, gitInfo } from "./inventory.ts";
-import { assertAuthorizedRoot, createWorkspace } from "./workspace.ts";
+import { assertAuthorizedRoot, createWorkspace, removeSymlinks } from "./workspace.ts";
 
 export async function importRepository(
   deps: { config: Config; store: Store },
@@ -47,15 +47,20 @@ export async function importRepository(
       { timeoutMs: 20_000 },
     );
     if (resolved.code !== 0) throw badRequest(`Unknown git ref: ${ref}`);
-    commit = resolved.stdout.trim();
+    const commitSha = resolved.stdout.trim();
+    if (!/^[0-9a-f]{40}$/.test(commitSha) && !/^[0-9a-f]{64}$/.test(commitSha)) {
+      throw badRequest("Git did not resolve the ref to a commit");
+    }
+    commit = commitSha;
     await mkdir(snapshotBase, { recursive: true, mode: 0o700 });
     const archived = await runCommand(
-      ["sh", "-c", 'git -C "$1" archive --format=tar "$2" | tar -xf - -C "$3"', "argus", sourceRoot, ref, snapshotBase],
+      ["sh", "-c", 'git -C "$1" archive --format=tar "$2" | tar -xf - -C "$3"', "argus", sourceRoot, commitSha, snapshotBase],
       { timeoutMs: 180_000 },
     );
     if (archived.code !== 0) {
       throw badRequest(`Failed to archive ${ref}: ${archived.stderr.slice(0, 500)}`);
     }
+    await removeSymlinks(snapshotBase);
     importRoot = snapshotBase;
     branch = ref;
   } else {

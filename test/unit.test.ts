@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
+import { lstat, mkdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Config } from "../src/config.ts";
@@ -10,7 +11,8 @@ import { buildFallbackPdf } from "../src/reports/pdf.ts";
 import { EvidenceStore } from "../src/orchestrator/evidence.ts";
 import { buildInventory, gitInfo } from "../src/repo/inventory.ts";
 import { importRepository } from "../src/repo/import.ts";
-import { verifyQuote } from "../src/repo/workspace.ts";
+import { createWorkspace, readScopedFile, verifyQuote } from "../src/repo/workspace.ts";
+import { runCommand } from "../src/harness/process.ts";
 import { createScopeMatcher, globToRegExp, matchesScope, extractJson, sha256 } from "../src/util.ts";
 import { redactSecrets } from "../src/security/redact.ts";
 import { credentialEnvironment, decryptSecret, encryptSecret, type StoredCredential } from "../src/security/credentials.ts";
@@ -213,6 +215,50 @@ describe("inventory and evidence gates", () => {
     });
     expect(traversal.found).toBe(false);
   });
+
+  test("scoped reads reject symlinks and dotted exclude bypasses", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "argus-contain-"));
+    try {
+      const root = join(dir, "repo");
+      const outside = join(dir, "outside");
+      await mkdir(join(root, "nested"), { recursive: true });
+      await mkdir(outside, { recursive: true });
+      await writeFile(join(outside, "master.key"), "OUTSIDE-SECRET-VALUE");
+      await writeFile(join(root, "secret.js"), "EXCLUDED-SECRET");
+      await writeFile(join(root, "nested", "ok.js"), "visible-file");
+      await symlink(join(outside, "master.key"), join(root, "leak.txt"));
+      await symlink(outside, join(root, "linkdir"));
+      await symlink(join(root, "secret.js"), join(root, "alias.txt"));
+      const scope = { include: ["**/*"], exclude: ["secret.js", "private/**"] };
+      const visible = await readScopedFile(root, "nested/./ok.js", scope);
+      expect(visible.path).toBe("nested/ok.js");
+      expect(visible.content).toBe("visible-file");
+      await expect(readScopedFile(root, "leak.txt", scope)).rejects.toMatchObject({ code: "symlink_rejected" });
+      await expect(readScopedFile(root, "linkdir/master.key", scope)).rejects.toMatchObject({ code: "symlink_rejected" });
+      await expect(readScopedFile(root, "alias.txt", scope)).rejects.toMatchObject({ code: "symlink_rejected" });
+      await expect(readScopedFile(root, "nested/../secret.js", scope)).rejects.toMatchObject({ code: "out_of_scope" });
+      await expect(readScopedFile(root, "nested\\..\\secret.js", scope)).rejects.toMatchObject({ code: "out_of_scope" });
+      await expect(readScopedFile(root, "../outside/master.key", scope)).rejects.toMatchObject({ code: "bad_request" });
+      const quoted = await verifyQuote(root, scope, { path: "leak.txt", quote: "OUTSIDE-SECRET-VALUE" });
+      expect(quoted.found).toBe(false);
+      const workspace = join(dir, "workspace");
+      await expect(createWorkspace(root, {
+        files: [{ path: "leak.txt", size: 4, lines: 1, language: "Text", sha256: "abc" }],
+        skipped: [],
+        languages: {},
+        frameworks: [],
+        endpoints: [],
+        auth_boundaries: [],
+        dependency_graph: [],
+        entrypoints: [],
+        total_bytes: 4,
+        truncated: false,
+      }, scope, workspace, {})).rejects.toMatchObject({ code: "symlink_rejected" });
+      await expect(lstat(join(workspace, "leak.txt"))).rejects.toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("repository import", () => {
@@ -277,6 +323,58 @@ describe("repository import", () => {
     await expect(importRepository({ config, store }, { ...project, scope_include: "[]" }, null, "tester"))
       .rejects.toThrow("No in-scope files were found");
     expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+  });
+
+  test("git ref snapshots remove symlinks and keep excluded files unreadable", async () => {
+    const source = join(dir, "source");
+    const outside = join(dir, "outside");
+    await mkdir(join(source, "nested"), { recursive: true });
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(outside, "master.key"), "OUTSIDE-SECRET-VALUE");
+    await writeFile(join(source, "readme.txt"), "hello snapshot");
+    await writeFile(join(source, "secret.js"), "EXCLUDED-SECRET");
+    await writeFile(join(source, "nested", "ok.js"), "visible-file");
+    await symlink(join(outside, "master.key"), join(source, "leak.txt"));
+    await symlink(outside, join(source, "linkdir"));
+    await symlink(join(source, "secret.js"), join(source, "alias.txt"));
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: "Argus Test",
+      GIT_AUTHOR_EMAIL: "test@argus.local",
+      GIT_COMMITTER_NAME: "Argus Test",
+      GIT_COMMITTER_EMAIL: "test@argus.local",
+    };
+    for (const args of [["init", "-b", "main"], ["add", "."], ["commit", "-m", "init"]] as const) {
+      const result = await runCommand(["git", "-C", source, ...args], { env });
+      if (result.code !== 0) throw new Error(result.stderr || result.stdout);
+    }
+    const scoped = {
+      id: "p-symlink",
+      name: "Symlink",
+      source_path: source,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: JSON.stringify(["secret.js"]),
+    };
+    store.run(
+      `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+       VALUES (?, ?, '', ?, ?, ?, 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+      scoped.id, scoped.name, scoped.source_path, scoped.scope_include, scoped.scope_exclude,
+    );
+    const scope = { include: ["**/*"], exclude: ["secret.js"] };
+    const worktree = await importRepository({ config, store }, scoped, null, "tester@argus.local");
+    expect(await Bun.file(join(worktree.path, "readme.txt")).text()).toBe("hello snapshot");
+    await expect(lstat(join(worktree.path, "leak.txt"))).rejects.toThrow();
+    await expect(lstat(join(worktree.path, "secret.js"))).rejects.toThrow();
+    const archived = await importRepository({ config, store }, scoped, "HEAD", "tester@argus.local");
+    expect(archived.commit_sha).toMatch(/^[0-9a-f]{40}$/);
+    expect(await Bun.file(join(archived.path, "readme.txt")).text()).toBe("hello snapshot");
+    await expect(lstat(join(archived.path, "leak.txt"))).rejects.toThrow();
+    await expect(lstat(join(archived.path, "linkdir"))).rejects.toThrow();
+    await expect(lstat(join(archived.path, "alias.txt"))).rejects.toThrow();
+    await expect(readScopedFile(archived.path, "secret.js", scope)).rejects.toMatchObject({ code: "out_of_scope" });
+    await expect(readScopedFile(archived.path, "nested/../secret.js", scope)).rejects.toMatchObject({ code: "out_of_scope" });
+    await expect(readScopedFile(archived.path, "linkdir/master.key", scope)).rejects.toMatchObject({ code: "not_found" });
+    expect(await readScopedFile(archived.path, "nested/ok.js", scope)).toMatchObject({ content: "visible-file" });
   });
 });
 

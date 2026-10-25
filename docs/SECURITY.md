@@ -9,11 +9,16 @@ LLM agents. Use it only on repositories you are authorized to assess.
 - The source path is canonicalized with `realpath` and checked against
   `ARGUS_ALLOWED_ROOTS` on create/import and again when a workspace/evidence
   file is opened.
-- Scope globs are enforced before file copy, in inventory, in explorer/file
-  APIs, and in excerpt verification. Prompt text is never the authorization
-  boundary.
-- Only regular files are imported; symlinks are skipped. Files larger than the
-  cap are skipped and recorded.
+- Scope globs are enforced on the normalized relative path before file copy,
+  in inventory, in explorer/file APIs, and in excerpt verification. `.` and
+  `..` segments are resolved first, and a path that leaves the snapshot is
+  rejected, so an exclude cannot be bypassed with a dotted path. Prompt text
+  is never the authorization boundary.
+- Only regular files are imported. Symlinks are skipped during inventory and
+  removed from git-archive snapshots before that snapshot is stored. File
+  reads do not follow a final symlink, and a file whose resolved location
+  differs from the normalized path is rejected. Files larger than the cap are
+  skipped and recorded.
 - An immutable snapshot is created at import, so later edits to the original
   worktree cannot change what the evidence refers to.
 

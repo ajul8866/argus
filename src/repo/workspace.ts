@@ -1,8 +1,104 @@
-import { chmod, copyFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { AppError, createScopeMatcher, matchesScope, normalizePath, safeJoin } from "../util.ts";
+import { constants } from "node:fs";
+import { chmod, lstat, mkdir, open, readdir, realpath, stat, unlink, writeFile } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
+import { dirname, join, relative } from "node:path";
+import { AppError, badRequest, createScopeMatcher, matchesScope, normalizePath, safeJoin } from "../util.ts";
 import type { Scope } from "../util.ts";
 import type { Inventory } from "./inventory.ts";
+
+const READ_NOFOLLOW = constants.O_RDONLY | constants.O_NOFOLLOW;
+
+/**
+ * Resolve `.` and `..` without letting the path leave the repository root.
+ * Scope checks must use this path: a lexical `safeJoin` would otherwise
+ * accept `nested/../secret.js` and bypass an exclude on `secret.js`.
+ */
+export function canonicalRelativePath(value: string): string {
+  const normalized = normalizePath(value);
+  if (normalized.includes("\0")) throw badRequest("Invalid path");
+  const parts: string[] = [];
+  for (const part of normalized.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (parts.length === 0) throw badRequest("Path escapes the repository root");
+      parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  if (parts.length === 0) throw new AppError(400, "not_a_file", "Path is not a regular file");
+  return parts.join("/");
+}
+
+async function resolvedDescriptorPath(handle: FileHandle, target: string): Promise<string> {
+  for (const candidate of [`/proc/self/fd/${handle.fd}`, `/dev/fd/${handle.fd}`]) {
+    try {
+      return await realpath(candidate);
+    } catch {
+      // The platform exposes opened-file paths at a different location.
+    }
+  }
+  return realpath(target);
+}
+
+async function openRegularFileWithin(
+  root: string,
+  relativePath: string,
+): Promise<{ path: string; handle: FileHandle; size: number }> {
+  const normalized = canonicalRelativePath(relativePath);
+  let rootReal: string;
+  try {
+    rootReal = await realpath(root);
+  } catch {
+    throw new AppError(400, "invalid_repository", "Repository path does not exist");
+  }
+  const target = safeJoin(rootReal, normalized);
+  let handle: FileHandle;
+  try {
+    handle = await open(target, READ_NOFOLLOW);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") throw new AppError(404, "not_found", "File not found");
+    if (code === "ELOOP" || code === "EPERM") {
+      throw new AppError(403, "symlink_rejected", "Symlinks are excluded from repository reads");
+    }
+    if (code === "EISDIR") throw new AppError(400, "not_a_file", "Path is not a regular file");
+    throw error;
+  }
+  try {
+    const stats = await handle.stat();
+    if (!stats.isFile()) throw new AppError(400, "not_a_file", "Path is not a regular file");
+    const opened = await resolvedDescriptorPath(handle, target);
+    const openedRelative = normalizePath(relative(rootReal, opened));
+    if (openedRelative !== normalized || openedRelative.split("/").includes("..")) {
+      throw new AppError(403, "symlink_rejected", "Symlinks are excluded from repository reads");
+    }
+    return { path: normalized, handle, size: stats.size };
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+/** Delete symlinks extracted into a snapshot without following them. */
+export async function removeSymlinks(root: string): Promise<number> {
+  let removed = 0;
+  const visit = async (directory: string): Promise<void> => {
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      const absolute = join(directory, entry.name);
+      const info = await lstat(absolute);
+      if (info.isSymbolicLink()) {
+        await unlink(absolute);
+        removed += 1;
+        continue;
+      }
+      if (info.isDirectory()) await visit(absolute);
+    }
+  };
+  await visit(root);
+  return removed;
+}
 
 export async function createWorkspace(
   repositoryPath: string,
@@ -15,10 +111,14 @@ export async function createWorkspace(
   const scopeMatcher = createScopeMatcher(scope);
   for (const file of inventory.files) {
     if (!scopeMatcher.matches(file.path)) continue;
-    const source = safeJoin(repositoryPath, file.path);
     const target = safeJoin(workspace, file.path);
     await mkdir(dirname(target), { recursive: true, mode: 0o700 });
-    await copyFile(source, target);
+    const opened = await openRegularFileWithin(repositoryPath, file.path);
+    try {
+      await writeFile(target, Buffer.from(await opened.handle.readFile()), { mode: 0o400 });
+    } finally {
+      await opened.handle.close();
+    }
     await chmod(target, 0o400);
   }
   await chmod(workspace, 0o700);
@@ -44,27 +144,35 @@ export async function readScopedFile(
   scope: Scope,
   maxBytes = 512_000,
 ): Promise<{ path: string; content: string; size: number; truncated: boolean; binary: boolean }> {
-  const normalized = normalizePath(relativePath);
+  const normalized = canonicalRelativePath(relativePath);
   if (!matchesScope(normalized, scope)) {
     throw new AppError(403, "out_of_scope", "File is outside the authorized project scope");
   }
-  const target = safeJoin(root, normalized);
-  const stats = await stat(target);
-  if (!stats.isFile()) throw new AppError(400, "not_a_file", "Path is not a regular file");
-  if (stats.size > maxBytes) {
-    const handle = Bun.file(target);
-    const text = await handle.slice(0, maxBytes).text();
-    return { path: normalized, content: text, size: stats.size, truncated: true, binary: false };
+  const opened = await openRegularFileWithin(root, normalized);
+  try {
+    if (opened.size > maxBytes) {
+      const buffer = Buffer.alloc(maxBytes);
+      const { bytesRead } = await opened.handle.read(buffer, 0, maxBytes, 0);
+      return {
+        path: opened.path,
+        content: buffer.subarray(0, bytesRead).toString("utf8"),
+        size: opened.size,
+        truncated: true,
+        binary: false,
+      };
+    }
+    const buffer = Buffer.from(await opened.handle.readFile());
+    const binary = buffer.includes(0);
+    return {
+      path: opened.path,
+      content: binary ? "" : buffer.toString("utf8"),
+      size: opened.size,
+      truncated: false,
+      binary,
+    };
+  } finally {
+    await opened.handle.close();
   }
-  const buffer = Buffer.from(await readFile(target));
-  const binary = buffer.includes(0);
-  return {
-    path: normalized,
-    content: binary ? "" : buffer.toString("utf8"),
-    size: stats.size,
-    truncated: false,
-    binary,
-  };
 }
 
 export function normalizeQuote(value: string): string {

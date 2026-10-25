@@ -142,7 +142,7 @@ function shell(): void {
             setNavOpen(open, open);
             if (!open) document.querySelector<HTMLButtonElement>(".mobile-toggle")?.focus();
           },
-        }, icon("tasks")),
+        }, icon("menu")),
         h("div", { class: "breadcrumbs" },
           h("a", { href: "#/dashboard" }, "Argus"),
           h("span", { class: "sep" }, "/"),

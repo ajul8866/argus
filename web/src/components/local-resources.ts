@@ -29,10 +29,10 @@ export function usagePanel(usage: Usage, kind: "skill" | "mcp"): HTMLElement {
     usage.recent.length > 0 ? h("div", { class: "table-wrap" }, h("table", {},
       h("thead", {}, h("tr", {}, ...["Time", "Agent", "Task", kind === "mcp" ? "Tool" : "Harness"].map((label) => h("th", {}, label)))),
       h("tbody", {}, ...usage.recent.map((call) => h("tr", {},
-        h("td", { class: "tiny" }, formatDate(call.created_at)),
-        h("td", { class: "tiny mono" }, call.role),
-        h("td", {}, h("a", { class: "tiny", href: `#/tasks?audit_id=${encodeURIComponent(call.audit_id)}&task_id=${encodeURIComponent(call.task_id)}` }, call.task_id.slice(0, 8))),
-        h("td", { class: "tiny mono" }, kind === "mcp" ? call.tool_name ?? "" : call.harness),
+        h("td", { "data-label": "Time", class: "tiny" }, formatDate(call.created_at)),
+        h("td", { "data-label": "Agent", class: "tiny mono" }, call.role),
+        h("td", { "data-label": "Task" }, h("a", { class: "tiny", href: `#/tasks?audit_id=${encodeURIComponent(call.audit_id)}&task_id=${encodeURIComponent(call.task_id)}` }, call.task_id.slice(0, 8))),
+        h("td", { "data-label": kind === "mcp" ? "Tool" : "Harness", class: "tiny mono" }, kind === "mcp" ? call.tool_name ?? "" : call.harness),
       ))),
     )) : h("p", { class: "muted small" }, "No usage recorded yet."),
   ));
@@ -40,7 +40,7 @@ export function usagePanel(usage: Usage, kind: "skill" | "mcp"): HTMLElement {
 
 export function discoveryDetails(view: CatalogView): HTMLElement {
   return h("details", { class: "local-discovery" },
-    h("summary", {}, `Automatic local discovery · ${formatDate(view.scan.scanned_at)}${view.scan.errors.length ? ` · ${view.scan.errors.length} source issue(s)` : ""}`),
+    h("summary", {}, `Automatic local discovery, ${formatDate(view.scan.scanned_at)}${view.scan.errors.length ? `, ${view.scan.errors.length} source issue(s)` : ""}`),
     h("p", { class: "small muted" }, "The catalog refreshes automatically every 30 seconds while this page is open. Local files remain the source of truth."),
     sourceList(view.scan.roots),
     ...view.scan.errors.map((error) => h("p", { class: "small local-warning" }, h("span", { class: "mono tiny" }, error.source), h("br"), error.message)),

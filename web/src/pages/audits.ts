@@ -94,16 +94,16 @@ export async function renderAudits(root: HTMLElement): Promise<void> {
     const { audits } = await api<{ audits: Array<Record<string, unknown>> }>("/api/audits");
     const rows = audits.map((audit) =>
       h("tr", {},
-        h("td", {},
+        h("td", { "data-label": "Project / audit" },
           h("a", { class: "table-title", href: `#/audits/${String(audit.id)}` }, String(audit.project_name)),
-          h("div", { class: "table-sub mono" }, `${String(audit.id).slice(0, 10)} · ${String(audit.commit_sha ?? "no commit").slice(0, 10)}`),
+          h("div", { class: "table-sub mono" }, `${String(audit.id).slice(0, 10)} / ${String(audit.commit_sha ?? "no commit").slice(0, 10)}`),
         ),
-        h("td", {}, statusBadge(String(audit.status))),
-        h("td", { class: "small" }, `Phase ${String(audit.current_phase)} · ${phaseLabel(Number(audit.current_phase))}`),
-        h("td", { class: "small" }, String(audit.finding_count ?? 0)),
-        h("td", { class: "small" }, String(audit.active_tasks ?? 0)),
-        h("td", { class: "small muted" }, formatDate(String(audit.created_at))),
-        h("td", {}, h("div", { class: "table-actions" }, h("a", { class: "btn btn-sm btn-secondary", href: `#/audits/${String(audit.id)}` }, "Open"))),
+        h("td", { "data-label": "Status" }, statusBadge(String(audit.status))),
+        h("td", { class: "small", "data-label": "Phase" }, `Phase ${String(audit.current_phase)} / ${phaseLabel(Number(audit.current_phase))}`),
+        h("td", { class: "small", "data-label": "Findings" }, String(audit.finding_count ?? 0)),
+        h("td", { class: "small", "data-label": "Active" }, String(audit.active_tasks ?? 0)),
+        h("td", { class: "small muted", "data-label": "Created" }, formatDate(String(audit.created_at))),
+        h("td", { "data-label": "Actions" }, h("div", { class: "table-actions" }, h("a", { class: "btn btn-sm btn-secondary", href: `#/audits/${String(audit.id)}` }, "Open"))),
       ),
     );
     root.replaceChildren(
@@ -193,7 +193,7 @@ export async function renderAuditDetail(root: HTMLElement, auditId: string, para
         onclick: () => {
           location.hash = `#/audits/${auditId}?tab=${key}`;
         },
-      }, `${label} · ${count}`),
+      }, `${label} (${count})`),
     ));
 
     let tabContent: HTMLElement;
@@ -209,7 +209,7 @@ export async function renderAuditDetail(root: HTMLElement, auditId: string, para
     root.replaceChildren(
       pageHeader(
         detail.project?.name ?? "Audit",
-        `Autonomous six-phase assessment · ${audit.id}`,
+        `Autonomous six-phase assessment / ${audit.id}`,
         h("div", { class: "row" },
           startButton,
           cancelButton,
@@ -222,7 +222,7 @@ export async function renderAuditDetail(root: HTMLElement, auditId: string, para
           section("Assessment progress",
             h("div", { class: "stack" },
               h("div", { class: "row", style: { justifyContent: "space-between" } },
-                h("div", { class: "row" }, statusBadge(audit.status), h("span", { class: "small muted" }, `Phase ${audit.current_phase}/6 · ${audit.phase_name ?? phaseName(audit.current_phase)}`)),
+                h("div", { class: "row" }, statusBadge(audit.status), h("span", { class: "small muted" }, `Phase ${audit.current_phase}/6 / ${audit.phase_name ?? phaseName(audit.current_phase)}`)),
                 h("span", { class: "tiny muted" }, `${completedPhases}/6 phases complete`),
               ),
               progress(completedPhases, 6, `${completedPhases} of 6 phases complete`),
@@ -247,7 +247,7 @@ export async function renderAuditDetail(root: HTMLElement, auditId: string, para
           ) : h("p", { class: "muted small" }, "Repository unavailable.")),
           section("Evidence integrity", h("div", { class: "stack" },
             h("div", { class: "row-between" }, h("span", { class: "small" }, "Hash chain"), badge(detail.evidence.chain.ok ? "intact" : "broken", detail.evidence.chain.ok ? "good" : "bad")),
-            h("div", { class: "tiny muted" }, `${detail.evidence.chain.count} evidence records · ${detail.evidence.chain.reason ?? "all hashes verified"}`),
+            h("div", { class: "tiny muted" }, `${detail.evidence.chain.count} evidence records, ${detail.evidence.chain.reason ?? "all hashes verified"}`),
             detail.evidence.chain.broken_at ? h("div", { class: "callout bad mono tiny" }, detail.evidence.chain.broken_at) : null,
           )),
           section("Sessions", h("div", { class: "stack" },
@@ -261,7 +261,7 @@ export async function renderAuditDetail(root: HTMLElement, auditId: string, para
             : null,
         ),
       ),
-      h("div", { class: "panel", style: { marginTop: "14px" } }, tabBar, tabContent),
+      h("div", { class: "panel audit-tabs", style: { marginTop: "var(--space-md)" } }, tabBar, tabContent),
     );
   } catch (error) {
     root.replaceChildren(errorState(error instanceof Error ? error.message : "Unable to load audit", () => void renderAuditDetail(root, auditId, params)));
@@ -284,19 +284,19 @@ function tasksTab(tasks: Task[], refresh: () => void): HTMLElement {
       )),
       h("tbody", {}, ...tasks.map((task) =>
         h("tr", {},
-          h("td", { class: "small nowrap" }, `${task.phase} · ${phaseLabel(task.phase)}`),
-          h("td", {},
+          h("td", { class: "small nowrap", "data-label": "Phase" }, `${task.phase} / ${phaseLabel(task.phase)}`),
+          h("td", { "data-label": "Task" },
             h("div", { class: "table-title" }, task.title),
             h("div", { class: "table-sub mono" }, task.kind),
           ),
-          h("td", {},
+          h("td", { "data-label": "Role / harness" },
             h("div", { class: "small" }, task.agent_role ?? "deterministic"),
-            h("div", { class: "table-sub" }, task.harness ? `${task.harness}${task.model ? ` · ${task.model}` : ""}` : "platform"),
+            h("div", { class: "table-sub" }, task.harness ? `${task.harness}${task.model ? ` / ${task.model}` : ""}` : "platform"),
           ),
-          h("td", {}, h("div", { class: "stack", style: { gap: "3px" } }, statusBadge(task.status), task.error ? h("span", { class: "tiny muted truncate", title: task.error }, task.error) : null)),
-          h("td", { class: "small mono" }, `${task.attempts}/${task.max_attempts}`),
-          h("td", { class: "small muted" }, task.started_at ? timeAgo(task.started_at) : "—"),
-          h("td", {}, h("div", { class: "table-actions" }, button("Inspect", () => void openTaskDetail(task.id, refresh), "ghost", { class: "btn-sm" }))),
+          h("td", { "data-label": "Status" }, h("div", { class: "stack", style: { gap: "var(--space-2xs)" } }, statusBadge(task.status), task.error ? h("span", { class: "tiny muted truncate", title: task.error }, task.error) : null)),
+          h("td", { class: "small mono", "data-label": "Attempt" }, `${task.attempts}/${task.max_attempts}`),
+          h("td", { class: "small muted", "data-label": "Started" }, task.started_at ? timeAgo(task.started_at) : "—"),
+          h("td", { "data-label": "Actions" }, h("div", { class: "table-actions" }, button("Inspect", () => void openTaskDetail(task.id, refresh), "ghost", { class: "btn-sm" }))),
         ),
       )),
     ),
@@ -310,14 +310,14 @@ function findingsTab(findings: Finding[], refresh: () => void): HTMLElement {
       h("thead", {}, h("tr", {}, h("th", {}, "Finding"), h("th", {}, "Severity"), h("th", {}, "Status"), h("th", {}, "Verifications"), h("th", {}, ""))),
       h("tbody", {}, ...findings.map((finding) =>
         h("tr", {},
-          h("td", {},
-            h("div", { class: "row", style: { gap: "6px" } }, h("span", { class: "mono tiny muted" }, finding.code), h("span", { class: "table-title" }, finding.title)),
+          h("td", { "data-label": "Finding" },
+            h("div", { class: "row", style: { gap: "var(--space-xs)" } }, h("span", { class: "mono tiny muted" }, finding.code), h("span", { class: "table-title" }, finding.title)),
             h("div", { class: "table-sub" }, finding.category),
           ),
-          h("td", {}, severityBadge(finding.severity)),
-          h("td", {}, statusBadge(finding.status)),
-          h("td", { class: "small mono" }, String(finding.verification_count)),
-          h("td", {}, h("div", { class: "table-actions" }, button("Open", () => void openFindingDetail(finding.id, refresh), "ghost", { class: "btn-sm" }))),
+          h("td", { "data-label": "Severity" }, severityBadge(finding.severity)),
+          h("td", { "data-label": "Status" }, statusBadge(finding.status)),
+          h("td", { class: "small mono", "data-label": "Verifications" }, String(finding.verification_count)),
+          h("td", { "data-label": "Actions" }, h("div", { class: "table-actions" }, button("Open", () => void openFindingDetail(finding.id, refresh), "ghost", { class: "btn-sm" }))),
         ),
       )),
     ),
@@ -331,10 +331,10 @@ function coverageTab(detail: Detail): HTMLElement {
       h("thead", {}, h("tr", {}, h("th", {}, "Area"), h("th", {}, "Status"), h("th", {}, "Files"), h("th", {}, "Notes"))),
       h("tbody", {}, ...detail.coverage.map((row) =>
         h("tr", {},
-          h("td", {}, h("div", { class: "table-title" }, row.title), h("div", { class: "table-sub mono" }, row.area_id)),
-          h("td", {}, statusBadge(row.status)),
-          h("td", { class: "mono small" }, String(row.files.length)),
-          h("td", { class: "small muted" }, row.notes ?? "—"),
+          h("td", { "data-label": "Area" }, h("div", { class: "table-title" }, row.title), h("div", { class: "table-sub mono" }, row.area_id)),
+          h("td", { "data-label": "Status" }, statusBadge(row.status)),
+          h("td", { class: "mono small", "data-label": "Files" }, String(row.files.length)),
+          h("td", { class: "small muted", "data-label": "Notes" }, row.notes ?? "—"),
         ),
       )),
     ),
@@ -386,18 +386,18 @@ function evidenceTab(evidence: Array<Record<string, unknown>>, chain: Chain): HT
         h("span", { class: "small strong" }, chain.ok ? "Evidence chain intact" : "Evidence chain verification failed"),
         h("span", { class: "tiny muted" }, `${chain.count} records`),
       ),
-      chain.reason ? h("div", { class: "tiny", style: { marginTop: "3px" } }, chain.reason) : null,
+      chain.reason ? h("div", { class: "tiny", style: { marginTop: "var(--space-2xs)" } }, chain.reason) : null,
     ),
     h("div", { class: "table-wrap" },
       h("table", {},
         h("thead", {}, h("tr", {}, h("th", {}, "Evidence"), h("th", {}, "Kind"), h("th", {}, "SHA-256"), h("th", {}, "Created"), h("th", {}, ""))),
         h("tbody", {}, ...evidence.map((row) =>
           h("tr", {},
-            h("td", {}, h("div", { class: "table-title" }, String(row.title)), row.finding_id ? h("div", { class: "table-sub mono" }, String(row.finding_id).slice(0, 12)) : null),
-            h("td", { class: "small" }, String(row.kind)),
-            h("td", { class: "mono tiny" }, String(row.sha256).slice(0, 20)),
-            h("td", { class: "small muted" }, formatDate(String(row.created_at))),
-            h("td", {}, h("div", { class: "table-actions" }, button("View", async () => {
+            h("td", { "data-label": "Evidence" }, h("div", { class: "table-title" }, String(row.title)), row.finding_id ? h("div", { class: "table-sub mono" }, String(row.finding_id).slice(0, 12)) : null),
+            h("td", { class: "small", "data-label": "Kind" }, String(row.kind)),
+            h("td", { class: "mono tiny", "data-label": "SHA-256" }, String(row.sha256).slice(0, 20)),
+            h("td", { class: "small muted", "data-label": "Created" }, formatDate(String(row.created_at))),
+            h("td", { "data-label": "Actions" }, h("div", { class: "table-actions" }, button("View", async () => {
               try {
                 const result = await api<{ content: string }>(`/api/evidence/${String(row.id)}`);
                 modal(String(row.title), h("pre", { class: "json-block", style: { maxHeight: "60vh" } }, result.content), null, { wide: true });
@@ -416,7 +416,7 @@ function reportsTab(reports: Report[], auditId: string, refresh: () => void): HT
   const canGenerate = session.user && ["admin", "auditor"].includes(session.user.role);
   return h("div", { class: "stack" },
     h("div", { class: "row-between" },
-      h("p", { class: "hint", style: { margin: 0 } }, "Reports are assembled deterministically from verified database records. Markdown, JSON, HTML, and PDF are generated together."),
+      h("p", { class: "hint" }, "Reports are assembled deterministically from verified database records. Markdown, JSON, HTML, and PDF are generated together."),
       canGenerate
         ? button("Generate all formats", async () => {
             try {
@@ -435,12 +435,12 @@ function reportsTab(reports: Report[], auditId: string, refresh: () => void): HT
           h("thead", {}, h("tr", {}, h("th", {}, "Format"), h("th", {}, "Status"), h("th", {}, "Size"), h("th", {}, "Generated"), h("th", {}, "SHA-256"), h("th", {}, ""))),
           h("tbody", {}, ...reports.map((report) =>
             h("tr", {},
-              h("td", { class: "strong" }, report.format.toUpperCase()),
-              h("td", {}, statusBadge(report.status)),
-              h("td", { class: "mono small" }, report.size ? `${Math.round(report.size / 1024)} KiB` : "—"),
-              h("td", { class: "small muted" }, formatDate(report.generated_at)),
-              h("td", { class: "mono tiny" }, report.sha256?.slice(0, 18) ?? "—"),
-              h("td", {}, h("div", { class: "table-actions" },
+              h("td", { class: "strong", "data-label": "Format" }, report.format.toUpperCase()),
+              h("td", { "data-label": "Status" }, statusBadge(report.status)),
+              h("td", { class: "mono small", "data-label": "Size" }, report.size ? `${Math.round(report.size / 1024)} KiB` : "—"),
+              h("td", { class: "small muted", "data-label": "Generated" }, formatDate(report.generated_at)),
+              h("td", { class: "mono tiny", "data-label": "SHA-256" }, report.sha256?.slice(0, 18) ?? "—"),
+              h("td", { "data-label": "Actions" }, h("div", { class: "table-actions" },
                 report.status === "generated" && report.format !== "pdf" ? button("Preview", () => void previewReport(report.id, report.format, "Audit report"), "ghost", { class: "btn-sm" }) : null,
                 report.status === "generated" ? h("a", { class: "btn btn-sm btn-secondary", href: `/api/reports/${report.id}/download` }, "Download") : null,
               )),
@@ -456,7 +456,7 @@ function activityTab(events: EventRow[]): HTMLElement {
     h("div", { class: "event-row" },
       h("span", { class: "event-time" }, new Date(event.created_at).toLocaleTimeString()),
       h("span", { class: "event-type" }, event.type),
-      h("span", { class: "event-detail" }, Object.entries(event.payload).slice(0, 4).map(([key, value]) => `${key}: ${typeof value === "object" ? JSON.stringify(value) : String(value)}`).join(" · ")),
+      h("span", { class: "event-detail" }, Object.entries(event.payload).slice(0, 4).map(([key, value]) => `${key}: ${typeof value === "object" ? JSON.stringify(value) : String(value)}`).join(", ")),
     ),
   ));
 }
@@ -468,13 +468,13 @@ function sessionsTab(sessions: Session[]): HTMLElement {
       h("thead", {}, h("tr", {}, h("th", {}, "Session"), h("th", {}, "Role"), h("th", {}, "Harness"), h("th", {}, "Model"), h("th", {}, "Status"), h("th", {}, "Sandbox"), h("th", {}, "Started"))),
       h("tbody", {}, ...sessions.map((agentSession) =>
         h("tr", {},
-          h("td", { class: "mono tiny" }, agentSession.id.slice(0, 12)),
-          h("td", { class: "small" }, agentSession.role),
-          h("td", { class: "small" }, agentSession.harness),
-          h("td", { class: "small mono" }, agentSession.model ?? "default"),
-          h("td", {}, statusBadge(agentSession.status)),
-          h("td", { class: "small" }, agentSession.sandbox_mode),
-          h("td", { class: "small muted" }, formatDate(agentSession.started_at)),
+          h("td", { class: "mono tiny", "data-label": "Session" }, agentSession.id.slice(0, 12)),
+          h("td", { class: "small", "data-label": "Role" }, agentSession.role),
+          h("td", { class: "small", "data-label": "Harness" }, agentSession.harness),
+          h("td", { class: "small mono", "data-label": "Model" }, agentSession.model ?? "default"),
+          h("td", { "data-label": "Status" }, statusBadge(agentSession.status)),
+          h("td", { class: "small", "data-label": "Sandbox" }, agentSession.sandbox_mode),
+          h("td", { class: "small muted", "data-label": "Started" }, formatDate(agentSession.started_at)),
         ),
       )),
     ),

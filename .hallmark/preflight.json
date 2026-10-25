@@ -1,0 +1,14 @@
+{
+  "scanned": "2026-10-25",
+  "findings": {
+    "fonts": "Inter/system sans and system mono, web/src/styles.css:28-29; no bundled font assets",
+    "palette": "Dark surfaces with Argus green #54dfc2, web/src/styles.css:1-24; user confirmed preservation",
+    "motion": "CSS progress width transition and decorative pulse, web/src/styles.css:89-91,198; no motion library",
+    "spacing": "Existing ad-hoc 2-44px spacing in web/src/styles.css; shared selectors cover all screens",
+    "framework": "Bun-built vanilla TypeScript DOM application, package.json:19-29, scripts/build-web.ts:6-14",
+    "scope": "Login and 13 hash destinations plus project/audit details, web/src/main.ts:26-55,164-215",
+    "runtime": "Isolated real application at http://127.0.0.1:8899 with temporary data and disabled model harness executables"
+  },
+  "preserve": ["Argus wordmark and A identity", "green accent and dark foundation", "all route destinations, content facts, fields and handlers", "component ownership and API logic"],
+  "introduce": ["restrained brand token system", "readable app typography", "recomposed operational dashboard", "flat table and form surfaces", "consistent accessible controls", "responsive mobile shell"]
+}

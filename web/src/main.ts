@@ -23,6 +23,8 @@ import { renderSkills } from "./pages/skills.ts";
 import { renderMcp } from "./pages/mcp.ts";
 import { openAuditCreate } from "./components/audit-create.ts";
 
+document.documentElement.classList.add("js");
+
 const NAV_GROUPS: Array<{ label: string; items: Array<{ route: string; label: string; icon: string }> }> = [
   {
     label: "Operate",
@@ -61,6 +63,16 @@ let renderToken = 0;
 let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 let liveConnected = false;
 
+function setNavOpen(open: boolean, focusFirstLink = false): void {
+  document.body.classList.toggle("nav-open", open);
+  const toggle = document.querySelector<HTMLButtonElement>(".mobile-toggle");
+  toggle?.setAttribute("aria-expanded", String(open));
+  toggle?.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
+  if (open && focusFirstLink) {
+    requestAnimationFrame(() => document.querySelector<HTMLAnchorElement>("#sidebar .nav a")?.focus({ preventScroll: true }));
+  }
+}
+
 function parseRoute(): { route: string; id: string | null; params: URLSearchParams } {
   const raw = location.hash.replace(/^#\/?/, "");
   const [pathPart = "", queryPart = ""] = raw.split("?");
@@ -85,7 +97,7 @@ function shell(): void {
       { class: "nav" },
       h("div", { class: "nav-label" }, group.label),
       ...group.items.map((item) =>
-        h("a", { href: `#/${item.route}`, "data-route": item.route, class: item.route === currentRoute ? "active" : "" },
+        h("a", { href: `#/${item.route}`, "data-route": item.route, class: item.route === currentRoute ? "active" : "", "aria-current": item.route === currentRoute ? "page" : null },
           icon(item.icon),
           h("span", {}, item.label),
         ),
@@ -96,14 +108,13 @@ function shell(): void {
   const sidebar = h(
     "aside",
     { class: "sidebar", id: "sidebar" },
-    h("a", { class: "brand", href: "#/dashboard", style: { textDecoration: "none" } },
+    h("a", { class: "brand", href: "#/dashboard", "aria-label": "Argus overview" },
       h("div", { class: "brand-mark" }, "A"),
       h("div", {}, h("div", { class: "brand-name" }, "Argus"), h("div", { class: "brand-sub" }, "autonomous audit")),
     ),
     h("nav", { "aria-label": "Main navigation" }, ...nav),
     h("div", { class: "sidebar-foot" },
-      h("div", { class: "live-indicator", id: "live-indicator" },
-        h("span", { class: "live-dot" }),
+      h("div", { class: "live-indicator", id: "live-indicator", role: "status" },
         h("span", { id: "live-label" }, liveConnected ? "live" : "offline"),
       ),
       h("div", { class: "user-chip" },
@@ -123,9 +134,15 @@ function shell(): void {
         h("button", {
           class: "btn btn-ghost btn-icon mobile-toggle",
           "aria-label": "Open navigation",
+          "aria-controls": "sidebar",
+          "aria-expanded": "false",
           type: "button",
-          onclick: () => document.body.classList.toggle("nav-open"),
-        }, "☰"),
+          onclick: () => {
+            const open = !document.body.classList.contains("nav-open");
+            setNavOpen(open, open);
+            if (!open) document.querySelector<HTMLButtonElement>(".mobile-toggle")?.focus();
+          },
+        }, icon("menu")),
         h("div", { class: "breadcrumbs" },
           h("a", { href: "#/dashboard" }, "Argus"),
           h("span", { class: "sep" }, "/"),
@@ -134,7 +151,7 @@ function shell(): void {
       ),
       h("div", { class: "topbar-right" },
         h("a", { class: "btn btn-secondary btn-sm", href: "#/findings" }, "Findings"),
-        button("New audit", () => void openAuditCreate(), "primary", { class: "btn-sm" }),
+        button("New audit", () => void openAuditCreate(), "secondary", { class: "btn-sm" }),
       ),
     ),
     h("div", { id: "view" }),
@@ -148,7 +165,10 @@ function shell(): void {
 
 function syncNav(): void {
   for (const link of document.querySelectorAll<HTMLAnchorElement>(".nav a[data-route]")) {
-    link.classList.toggle("active", link.dataset.route === currentRoute);
+    const active = link.dataset.route === currentRoute;
+    link.classList.toggle("active", active);
+    if (active) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
   }
   const label = document.getElementById("breadcrumb-label");
   if (label) label.textContent = routeLabel(currentRoute);
@@ -169,7 +189,7 @@ async function renderRoute(): Promise<void> {
   const view = document.getElementById("view");
   if (!view) return;
   syncNav();
-  document.title = `${routeLabel(parsed.route)} · Argus`;
+  document.title = `${routeLabel(parsed.route)} | Argus`;
   try {
     switch (parsed.route) {
       case "dashboard":
@@ -234,7 +254,7 @@ async function renderRoute(): Promise<void> {
       ),
     );
   }
-  document.body.classList.remove("nav-open");
+  setNavOpen(false);
 }
 
 function scheduleRefresh(): void {
@@ -250,7 +270,7 @@ function loginView(errorMessage?: string): void {
   disconnectEvents();
   const email = input("email", { type: "email", placeholder: "admin@argus.local", autocomplete: "username" });
   const password = input("password", { type: "password", placeholder: "Password", autocomplete: "current-password" });
-  const errorBox = h("div", { class: "login-error hidden" }, errorMessage ?? "");
+  const errorBox = h("div", { class: "login-error hidden", role: "alert" }, errorMessage ?? "");
   if (errorMessage) errorBox.classList.remove("hidden");
   const submit = h("button", { class: "btn btn-primary", type: "submit", style: { width: "100%" } }, "Sign in");
   const form = h("form", {
@@ -278,10 +298,10 @@ function loginView(errorMessage?: string): void {
     h("h2", {}, "Sign in to Argus"),
     h("span", { class: "hint" }, "Local operator authentication. Sessions are HttpOnly and CSRF-protected."),
     errorBox,
-    h("label", { class: "field", style: { marginBottom: "12px" } }, h("span", { class: "field-label" }, "Email"), email),
-    h("label", { class: "field", style: { marginBottom: "18px" } }, h("span", { class: "field-label" }, "Password"), password),
+    h("label", { class: "field" }, h("span", { class: "field-label" }, "Email"), email),
+    h("label", { class: "field" }, h("span", { class: "field-label" }, "Password"), password),
     submit,
-    h("div", { class: "login-foot" }, "Argus · self-hosted autonomous security audit platform"),
+    h("div", { class: "login-foot" }, "Argus, self-hosted autonomous security audit platform"),
   );
 
   app.replaceChildren(
@@ -292,7 +312,7 @@ function loginView(errorMessage?: string): void {
           h("div", {}, h("div", { class: "brand-name" }, "Argus"), h("div", { class: "brand-sub" }, "autonomous audit")),
         ),
         h("div", { class: "login-headline" },
-          h("h1", {}, "Security review at ", h("em", {}, "agent speed"), ", with evidence you can defend."),
+          h("h1", {}, "Security review at agent speed, with evidence you can defend."),
           h("p", {}, "Six orchestrated phases. Real Pi and Claude Code execution. Independent confirmation, exact-source evidence gates, immutable findings, and deterministic reports."),
           h("div", { class: "login-points" },
             h("div", { class: "login-point" }, h("span", {}, "01"), h("span", {}, "Codebase map and attack-surface inventory")),
@@ -301,7 +321,9 @@ function loginView(errorMessage?: string): void {
             h("div", { class: "login-point" }, h("span", {}, "04"), h("span", {}, "Hash-chained evidence and professional exports")),
           ),
         ),
-        h("div", { class: "tiny muted" }, "Self-hosted · local-first · no simulated agents"),
+        h("div", { class: "login-principles" },
+          h("span", {}, "Self-hosted"), h("span", {}, "local-first"), h("span", {}, "no simulated agents"),
+        ),
       ),
       h("main", { class: "login-panel" }, form),
     ),
@@ -335,6 +357,7 @@ async function logout(): Promise<void> {
 }
 
 window.addEventListener("hashchange", () => {
+  setNavOpen(false);
   if (session.user) void renderRoute();
   else loginView();
 });
@@ -355,12 +378,18 @@ window.addEventListener("visibilitychange", () => {
 document.addEventListener("click", (event) => {
   const target = event.target as HTMLElement;
   if (document.body.classList.contains("nav-open") && !target.closest("#sidebar") && !target.closest(".mobile-toggle")) {
-    document.body.classList.remove("nav-open");
+    setNavOpen(false);
   }
 });
 
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !document.body.classList.contains("nav-open")) return;
+  setNavOpen(false);
+  document.querySelector<HTMLButtonElement>(".mobile-toggle")?.focus();
+});
+
 async function bootstrap(): Promise<void> {
-  app.replaceChildren(h("div", { class: "loading-state", style: { minHeight: "60vh" } }, h("span", { class: "spinner" }), "Starting Argus control plane"));
+  app.replaceChildren(h("div", { class: "loading-state app-starting", role: "status" }, h("span", { class: "spinner", "aria-hidden": "true" }), "Starting Argus control plane"));
   const authenticated = await loadSession();
   if (!authenticated) {
     loginView();

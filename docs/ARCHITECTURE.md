@@ -201,6 +201,8 @@ operation, preserving include/exclude short-circuit behavior.
    ref is archived as the resolved commit, symlinks and files outside the
    import scope are removed, and the inventory is rebuilt from that snapshot.
    Built-in excludes match nested directories, not only the repository root.
+   Dotenv excludes also match any capitalization and a directory such as
+   `.env.local/`.
    A worktree import copies only in-scope regular files.
 4. Each task gets a fresh read-only copy under
    `$ARGUS_DATA_DIR/workspaces/<audit>/<session>`.

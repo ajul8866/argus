@@ -6,7 +6,9 @@ import type { Scope } from "../util.ts";
 
 // Directory and dotenv patterns match at any depth. A root-only glob such as
 // `node_modules/**` or `.env` would leave `app/node_modules` and `app/.env`
-// in the snapshot, where a wider project scope can still read them.
+// in the snapshot, where a wider project scope can still read them. The
+// `.env.*` file glob does not cover a directory such as `app/.env.local/token`;
+// `**/.env.*/**` does. Dotenv globs are also matched case-insensitively.
 export const DEFAULT_EXCLUDES = [
   "**/.git/**",
   "**/node_modules/**",
@@ -39,6 +41,7 @@ export const DEFAULT_EXCLUDES = [
   "**/.env",
   "**/.env.*",
   "**/.env/**",
+  "**/.env.*/**",
 ];
 
 const LANGUAGE_BY_EXT: Record<string, string> = {

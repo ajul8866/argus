@@ -59,7 +59,12 @@ describe("scope and parsing", () => {
       ".env/secret",
       "app/.env",
       "app/.env.local",
+      "app/.env.local/token",
+      "app/.ENV.production/credentials",
+      ".Env.local/nested/token",
       "services/api/.env/token",
+      "app/.ENV",
+      "app/.Env.local",
       "node_modules/leftpad/index.js",
       "app/node_modules/leftpad/index.js",
       "app/dist/bundle.js",
@@ -73,7 +78,14 @@ describe("scope and parsing", () => {
     expect(matchesScope("src/ok.js", scope)).toBe(true);
     expect(matchesScope("src/node_modules_utils.js", scope)).toBe(true);
     expect(matchesScope(".environment", scope)).toBe(true);
+    expect(matchesScope(".environment/notes.js", scope)).toBe(true);
+    expect(matchesScope("src/.environment/notes.js", scope)).toBe(true);
+    expect(matchesScope("src/env.local/file.js", scope)).toBe(true);
+    expect(matchesScope("src/ENV/notes.js", scope)).toBe(true);
     expect(matchesScope("src/distribution/notes.js", scope)).toBe(true);
+    expect(matchesScope("app/.ENV", { include: ["**/*"], exclude: ["**/.env"] })).toBe(false);
+    expect(matchesScope("app/.Env.local/token", { include: ["**/*"], exclude: ["**/.env.*/**"] })).toBe(false);
+    expect(matchesScope(".environment", { include: ["**/*"], exclude: ["**/.env", "**/.env.*", "**/.env/**", "**/.env.*/**"] })).toBe(true);
   });
 
   test("reusable scope matching preserves glob semantics and path normalization", () => {
@@ -488,14 +500,21 @@ describe("repository import", () => {
     const source = join(dir, "nested-excludes");
     await mkdir(join(source, "app", "node_modules", "leftpad"), { recursive: true });
     await mkdir(join(source, "app", "dist"), { recursive: true });
-    await mkdir(join(source, "src"), { recursive: true });
+    await mkdir(join(source, "services", "api", ".env.local"), { recursive: true });
+    await mkdir(join(source, "app", ".ENV.production"), { recursive: true });
+    await mkdir(join(source, "src", ".environment"), { recursive: true });
     const secret = "AWS_SECRET_ACCESS_KEY=NESTEDSECRETVALUE123456";
+    const directorySecret = "AWS_SECRET_ACCESS_KEY=DOTENVDIRSECRET123456789";
     await writeFile(join(source, "app", ".env"), secret);
     await writeFile(join(source, "app", ".env.local"), "LOCAL_TOKEN=nested-local-secret");
+    await writeFile(join(source, "app", ".ENV"), "CASE_SECRET=uppercase-env-value-123");
+    await writeFile(join(source, "services", "api", ".env.local", "token"), directorySecret);
+    await writeFile(join(source, "app", ".ENV.production", "credentials"), "DB_PASSWORD=prod-secret-value");
     await writeFile(join(source, "app", "node_modules", "leftpad", "index.js"), "module.exports=1");
     await writeFile(join(source, "app", "dist", "bundle.js"), "DIST-BUNDLE");
     await writeFile(join(source, "src", "ok.js"), "console.log('ok')");
     await writeFile(join(source, "src", "node_modules_utils.js"), "export const kept = true");
+    await writeFile(join(source, "src", ".environment", "notes.js"), "export const notes = true");
     const env = {
       ...process.env,
       GIT_AUTHOR_NAME: "Argus Test",
@@ -506,6 +525,10 @@ describe("repository import", () => {
     for (const args of [["init", "-b", "main"], ["add", "-A"], ["commit", "-m", "init"]] as const) {
       const result = await runCommand(["git", "-C", source, ...args], { env });
       if (result.code !== 0) throw new Error(result.stderr || result.stdout);
+    }
+    const committed = new Set((await runCommand(["git", "-C", source, "ls-files"], { env })).stdout.split("\n"));
+    for (const rel of ["app/.ENV", "services/api/.env.local/token", "app/.ENV.production/credentials", "src/.environment/notes.js"]) {
+      expect(committed.has(rel)).toBe(true);
     }
     const scoped = {
       id: "p-nested",
@@ -523,19 +546,39 @@ describe("repository import", () => {
     const archived = await importRepository({ config, store }, scoped, "HEAD", "tester@argus.local");
     const row = store.get<{ inventory: string }>("SELECT inventory FROM repositories WHERE id = ?", archived.id)!;
     const inventory = JSON.parse(row.inventory) as { files: Array<{ path: string }> };
-    expect(inventory.files.map((file) => file.path).sort()).toEqual(["src/node_modules_utils.js", "src/ok.js"]);
-    for (const rel of ["app/.env", "app/.env.local", "app/node_modules/leftpad/index.js", "app/dist/bundle.js"]) {
+    expect(inventory.files.map((file) => file.path).sort()).toEqual([
+      "src/.environment/notes.js",
+      "src/node_modules_utils.js",
+      "src/ok.js",
+    ]);
+    for (const rel of [
+      "app/.env",
+      "app/.env.local",
+      "app/.ENV",
+      "services/api/.env.local/token",
+      "app/.ENV.production/credentials",
+      "app/node_modules/leftpad/index.js",
+      "app/dist/bundle.js",
+    ]) {
       await expect(lstat(join(archived.path, rel))).rejects.toThrow();
       await expect(readScopedFile(archived.path, rel, projectScope)).rejects.toMatchObject({ code: "not_found" });
     }
     expect(await verifyQuote(archived.path, projectScope, { path: "app/.env", quote: secret })).toMatchObject({ found: false });
+    expect(await verifyQuote(archived.path, projectScope, { path: "services/api/.env.local/token", quote: directorySecret })).toMatchObject({ found: false });
+    expect(await verifyQuote(archived.path, projectScope, { path: "app/.ENV", quote: "CASE_SECRET=uppercase-env-value-123" })).toMatchObject({ found: false });
     expect(await readScopedFile(archived.path, "src/ok.js", projectScope)).toMatchObject({ content: "console.log('ok')" });
     expect(await readScopedFile(archived.path, "src/node_modules_utils.js", projectScope)).toMatchObject({ content: "export const kept = true" });
+    expect(await readScopedFile(archived.path, "src/.environment/notes.js", projectScope)).toMatchObject({ content: "export const notes = true" });
     const worktree = await importRepository({ config, store }, scoped, null, "tester@argus.local");
     await expect(lstat(join(worktree.path, "app", ".env"))).rejects.toThrow();
     await expect(readScopedFile(worktree.path, "app/.env", projectScope)).rejects.toMatchObject({ code: "not_found" });
+    await expect(lstat(join(worktree.path, "services", "api", ".env.local", "token"))).rejects.toThrow();
+    await expect(readScopedFile(worktree.path, "services/api/.env.local/token", projectScope)).rejects.toMatchObject({ code: "not_found" });
+    await expect(lstat(join(worktree.path, "app", ".ENV"))).rejects.toThrow();
+    await expect(readScopedFile(worktree.path, "app/.ENV.production/credentials", projectScope)).rejects.toMatchObject({ code: "not_found" });
     await expect(lstat(join(worktree.path, "app", "node_modules", "leftpad", "index.js"))).rejects.toThrow();
     expect(await readScopedFile(worktree.path, "src/ok.js", projectScope)).toMatchObject({ content: "console.log('ok')" });
+    expect(await readScopedFile(worktree.path, "src/.environment/notes.js", projectScope)).toMatchObject({ content: "export const notes = true" });
   });
 });
 

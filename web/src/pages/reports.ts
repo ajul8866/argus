@@ -79,7 +79,7 @@ export async function renderReports(root: HTMLElement, params: URLSearchParams):
             onchange: (event: Event) => {
               location.hash = `#/reports?audit=${(event.target as HTMLSelectElement).value}`;
             },
-          }, ...audits.map((entry) => h("option", { value: entry.id, selected: entry.id === selected }, `${entry.project_name} · ${entry.id.slice(0, 8)} · ${entry.status}`))),
+          }, ...audits.map((entry) => h("option", { value: entry.id, selected: entry.id === selected }, `${entry.project_name}, ${entry.id.slice(0, 8)}, ${entry.status}`))),
         ),
         h("div", { class: "row" }, statusBadge(audit.status), h("span", { class: "tiny muted" }, `Phase ${audit.current_phase}/6`)),
       ),
@@ -104,7 +104,7 @@ export async function renderReports(root: HTMLElement, params: URLSearchParams):
             h("thead", {}, h("tr", {}, h("th", {}, "Format"), h("th", {}, "Generated"), h("th", {}, "Size"), h("th", {}, "SHA-256"), h("th", {}, ""))),
             h("tbody", {}, ...reports.map((report) =>
               h("tr", {},
-                h("td", { class: "strong" }, report.format.toUpperCase()),
+                h("td", { class: "strong" }, report.format === "markdown" ? "Markdown" : report.format.toUpperCase()),
                 h("td", { class: "small muted" }, formatDate(report.generated_at)),
                 h("td", { class: "mono small" }, report.size ? `${Math.round(report.size / 1024)} KiB` : "—"),
                 h("td", { class: "mono tiny" }, report.sha256?.slice(0, 32) ?? "—"),

@@ -164,9 +164,9 @@ export async function renderSettings(root: HTMLElement): Promise<void> {
             h("p", {}, "Harness tools are read-only by default. Shell access is globally disabled, requires administrator enablement, and remains blocked per task until approval is recorded. Writable workspaces are also disabled by default, require an explicit per-audit request and a per-task approval, and never make the imported snapshot writable."),
             h("p", { class: "muted small" }, "Credentials are encrypted at rest with AES-256-GCM. Values are write-only through the API and are injected only into harness child processes."),
           )),
-          isAdmin ? auditLogSection(entries) : null,
         ),
       ),
+      ...(isAdmin ? [auditLogSection(entries)] : []),
     );
   } catch (error) {
     root.replaceChildren(errorState(error instanceof Error ? error.message : "Unable to load settings", () => void renderSettings(root)));
@@ -355,14 +355,17 @@ function openUserCreate(root: HTMLElement): void {
 function auditLogSection(entries: AuditLog[]): HTMLElement {
   return section("Security audit log", entries.length
     ? h("div", { class: "table-wrap", style: { maxHeight: "420px" } }, h("table", { class: "small-table" },
-        h("thead", {}, h("tr", {}, h("th", {}, "Time"), h("th", {}, "Actor"), h("th", {}, "Action"), h("th", {}, "Target"), h("th", {}, "IP"))),
+        h("thead", {}, h("tr", {}, h("th", {}, "Time"), h("th", { class: "col-optional" }, "Actor"), h("th", {}, "Action"), h("th", { class: "col-optional" }, "Target"), h("th", { class: "col-optional" }, "IP"))),
         h("tbody", {}, ...entries.slice(0, 100).map((entry) =>
           h("tr", {},
             h("td", { class: "tiny muted nowrap" }, formatDate(entry.created_at)),
-            h("td", { class: "tiny" }, entry.actor ?? "system"),
-            h("td", { class: "mono tiny" }, entry.action),
-            h("td", { class: "tiny muted truncate" }, entry.target ?? "—"),
-            h("td", { class: "tiny muted" }, entry.ip ?? "—"),
+            h("td", { class: "tiny col-optional" }, entry.actor ?? "system"),
+            h("td", { class: "mono tiny" },
+              entry.action,
+              h("div", { class: "phone-only tiny muted" }, `${entry.actor ?? "system"}, ${entry.target ?? "no target"}, ${entry.ip ?? "no ip"}`),
+            ),
+            h("td", { class: "tiny muted truncate col-optional" }, entry.target ?? "—"),
+            h("td", { class: "tiny muted col-optional" }, entry.ip ?? "—"),
           ),
         )),
       ))

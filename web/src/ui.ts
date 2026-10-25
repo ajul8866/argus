@@ -52,33 +52,6 @@ export function clear(node: HTMLElement): void {
   while (node.firstChild) node.removeChild(node.firstChild);
 }
 
-export function icon(name: string): HTMLElement {
-  const glyphs: Record<string, string> = {
-    dashboard: "◫",
-    projects: "▤",
-    audits: "◉",
-    explorer: "⌘",
-    harnesses: "⚙",
-    agents: "◈",
-    skills: "▧",
-    mcp: "⛓",
-    tasks: "☰",
-    findings: "⚑",
-    reports: "▣",
-    settings: "⚒",
-    approvals: "⚖",
-    plus: "+",
-    refresh: "↻",
-    play: "▶",
-    stop: "■",
-    download: "↓",
-    close: "×",
-    chevron: "›",
-    search: "⌕",
-  };
-  return h("span", { class: "glyph", "aria-hidden": "true" }, glyphs[name] ?? "·");
-}
-
 export function formatDate(value: string | null | undefined): string {
   if (!value) return "—";
   const date = new Date(value);
@@ -125,8 +98,9 @@ export function badge(label: string, tone = "neutral"): HTMLElement {
 
 export function statusTone(status: string): string {
   const value = status.toLowerCase();
-  if (["completed", "reverified", "confirmed", "ready", "approved", "generated", "reverified"].includes(value)) return "good";
-  if (["running", "queued", "starting", "confirming", "reported", "pending", "waiting_approval"].includes(value)) return "warn";
+  if (["completed", "reverified", "confirmed", "ready", "approved", "generated"].includes(value)) return "good";
+  if (["running", "starting", "confirming", "reported"].includes(value)) return "warn";
+  if (["queued", "pending", "waiting_approval"].includes(value)) return "neutral";
   if (["failed", "rejected", "blocked", "cancelled", "missing", "error", "unauthenticated", "denied", "timeout"].includes(value)) return "bad";
   if (["needs_correction", "unresolved", "inconclusive", "refuted"].includes(value)) return "warn";
   return "neutral";
@@ -137,7 +111,7 @@ export function statusBadge(status: string): HTMLElement {
 }
 
 export function severityBadge(severity: string): HTMLElement {
-  return h("span", { class: `severity severity-${severity.toLowerCase()}` }, severity.toUpperCase());
+  return h("span", { class: `severity severity-${severity.toLowerCase()}` }, severity.toLowerCase());
 }
 
 export function phaseLabel(phase: number): string {
@@ -172,9 +146,9 @@ export function progress(value: number, total: number, label?: string): HTMLElem
     "div",
     { class: "progress-wrap" },
     h("div", { class: "progress-track", role: "progressbar", "aria-valuenow": percent, "aria-valuemin": 0, "aria-valuemax": 100 },
-      h("div", { class: "progress-fill", style: { width: `${percent}%` } }),
+      h("div", { class: "progress-fill", style: { "--progress": String(percent / 100) } }),
     ),
-    h("div", { class: "progress-label" }, label ?? `${value} / ${total} · ${percent}%`),
+    h("div", { class: "progress-label" }, label ?? `${value} of ${total}, ${percent}%`),
   );
 }
 
@@ -193,7 +167,6 @@ export function pageHeader(title: string, subtitle: string, actions?: Child): HT
     "header",
     { class: "page-header" },
     h("div", { class: "page-heading" },
-      h("div", { class: "eyebrow" }, "Security operations"),
       h("h1", {}, title),
       h("p", {}, subtitle),
     ),
@@ -217,7 +190,6 @@ export function emptyState(title: string, detail: string, action?: Child): HTMLE
   return h(
     "div",
     { class: "empty-state" },
-    h("div", { class: "empty-mark" }, "◇"),
     h("h3", {}, title),
     h("p", {}, detail),
     action ?? null,
@@ -244,7 +216,13 @@ export function button(
   tone: "primary" | "secondary" | "danger" | "ghost" = "primary",
   extra: Attrs = {},
 ): HTMLButtonElement {
-  return h("button", { class: `btn btn-${tone}`, type: "button", onclick, ...extra }, label) as HTMLButtonElement;
+  const { class: extraClass, ...rest } = extra;
+  return h("button", {
+    class: `btn btn-${tone}${extraClass ? ` ${String(extraClass)}` : ""}`,
+    type: "button",
+    onclick,
+    ...rest,
+  }, label) as HTMLButtonElement;
 }
 
 export function linkButton(label: string, href: string, tone = "secondary"): HTMLElement {

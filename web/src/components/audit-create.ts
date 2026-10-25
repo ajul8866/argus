@@ -64,7 +64,7 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
           h(
             "option",
             { value: repository.id },
-            `${repository.commit_sha ? repository.commit_sha.slice(0, 10) : "no commit"} · ${repository.file_count} files · ${new Date(repository.imported_at).toLocaleDateString()}`,
+            `${repository.commit_sha ? repository.commit_sha.slice(0, 10) : "no commit"}, ${repository.file_count} files, ${new Date(repository.imported_at).toLocaleDateString()}`,
           ),
         );
       }

@@ -95,7 +95,7 @@ export async function renderExplorer(root: HTMLElement, params: URLSearchParams)
       "repository",
       repositories.map((repository) => ({
         value: repository.id,
-        label: `${repository.project_name} · ${repository.commit_sha?.slice(0, 8) ?? "worktree"} · ${repository.file_count} files`,
+        label: `${repository.project_name}, ${repository.commit_sha?.slice(0, 8) ?? "worktree"}, ${repository.file_count} files`,
       })),
       selected,
     );
@@ -213,7 +213,7 @@ function sourceTab(
           class: `tree-file ${entry.path === currentPath ? "active" : ""}`,
           onclick: () => onSelect(entry.path),
         },
-          h("span", { class: "truncate" }, `${entry.type === "directory" ? "▸ " : "· "}${entry.path.split("/").pop()}`),
+          h("span", { class: "truncate" }, entry.path.split("/").pop()),
           entry.type === "file" ? h("span", { class: "tiny muted nowrap" }, `${entry.lines} L`) : null,
         ),
       ),
@@ -240,7 +240,7 @@ function sourceTab(
   return h("div", { class: "explorer-grid" },
     h("aside", { class: "explorer-tree" },
       search,
-      h("div", { class: "tiny muted", style: { margin: "6px 0" } }, `${repo.inventory.files.length} files · ${(repo.total_bytes / 1024).toFixed(1)} KiB`),
+      h("div", { class: "tiny muted" }, `${repo.inventory.files.length} files, ${(repo.total_bytes / 1024).toFixed(1)} KiB`),
       treeHost,
     ),
     h("div", { class: "explorer-main" },
@@ -248,7 +248,7 @@ function sourceTab(
         ? h("div", { class: "row-between", style: { marginBottom: "10px" } },
             h("div", {},
               h("div", { class: "mono small" }, file.path),
-              h("div", { class: "tiny muted" }, `${file.lines} lines · ${file.size} bytes${file.truncated ? " · preview truncated" : ""}`),
+              h("div", { class: "tiny muted" }, `${file.lines} lines, ${file.size} bytes${file.truncated ? ", preview truncated" : ""}`),
             ),
             badge(file.truncated ? "preview" : "read-only", file.truncated ? "warn" : "neutral"),
           )
@@ -291,7 +291,7 @@ function architectureTab(detail: RepoDetail): HTMLElement {
           ? h("div", { class: "stack" }, ...map.areas.map((area) =>
               h("div", { class: "callout" },
                 h("div", { class: "row", style: { justifyContent: "space-between" } }, h("span", { class: "small strong" }, area.title), h("span", { class: "chip mono" }, area.id)),
-                h("div", { class: "tiny muted", style: { marginTop: "3px" } }, `${area.files.length} files · ${area.security_focus.join(", ")}`),
+                h("div", { class: "tiny muted" }, `${area.files.length} files, ${area.security_focus.join(", ")}`),
               ),
             ))
           : h("p", { class: "muted small" }, "Areas appear after Phase 1 completes."),
@@ -319,12 +319,12 @@ function architectureTab(detail: RepoDetail): HTMLElement {
     repo.inventory.auth_boundaries.length
       ? h("div", { class: "stack" }, ...repo.inventory.auth_boundaries.slice(0, 50).map((boundary) =>
           h("div", { class: "row-between small" },
-            h("div", {}, h("span", { class: "strong" }, boundary.kind), h("span", { class: "muted" }, ` · ${boundary.detail}`)),
+            h("div", {}, h("span", { class: "strong" }, boundary.kind), h("span", { class: "muted" }, `, ${boundary.detail}`)),
             h("span", { class: "mono tiny muted" }, `${boundary.file}:${boundary.line}`),
           ),
         ))
       : h("p", { class: "muted small" }, "No authentication boundary signals detected."),
-    map?.limitations?.length ? h("div", { class: "callout warn" }, h("div", { class: "tiny" }, "MAP LIMITATIONS"), h("div", { class: "small" }, map.limitations.join(" · "))) : null,
+    map?.limitations?.length ? h("div", { class: "callout warn" }, h("div", { class: "small" }, "Map limitations"), h("div", { class: "small" }, map.limitations.join(", "))) : null,
   );
 }
 

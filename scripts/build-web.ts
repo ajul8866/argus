@@ -37,8 +37,8 @@ const html = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
 <meta name="description" content="Argus self-hosted autonomous multi-agent source code security audit platform">
-<title>Argus · Autonomous Security Audit</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230b141d'/%3E%3Cpath d='M18 44 L32 14 L46 44 Z' fill='none' stroke='%2354dfc2' stroke-width='4'/%3E%3Ccircle cx='32' cy='35' r='4' fill='%2354dfc2'/%3E%3C/svg%3E">
+<title>Argus | Autonomous Security Audit</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='10' fill='%23151619'/%3E%3Cpath d='M20 44 L32 18 L44 44' fill='none' stroke='%23f2c56b' stroke-width='3'/%3E%3Cpath d='M25 36 H39' stroke='%23f2c56b' stroke-width='3'/%3E%3C/svg%3E">
 ${stylesheet ? `<link rel="stylesheet" href="${stylesheet}">` : ""}
 </head>
 <body>

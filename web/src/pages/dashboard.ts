@@ -69,19 +69,21 @@ export async function renderDashboard(root: HTMLElement): Promise<void> {
       (overview.findings.by_status.unresolved ?? 0);
     const coverageTotal = Object.values(overview.coverage).reduce((sum, value) => sum + value, 0);
     const coverageCompleted = overview.coverage.COMPLETED ?? 0;
+    const runningAudit = overview.recent_audits.find((audit) => audit.status === "running");
 
+    const mixTotal = Math.max(1, verified);
     const findingMix = ["critical", "high", "medium", "low", "info"].map((severity) =>
       h(
         "div",
         { class: "row-between" },
-        h("div", { class: "row" }, severityBadge(severity), h("span", { class: "muted tiny" }, `${overview.findings.by_severity[severity] ?? 0} verified`)),
-        h("div", { class: "progress-track", style: { width: "90px" } },
+        h("div", { class: "row" },
+          severityBadge(severity),
+          h("span", { class: "mono tiny muted" }, String(overview.findings.by_severity[severity] ?? 0)),
+        ),
+        h("div", { class: "progress-track", style: { width: "96px" } },
           h("div", {
             class: "progress-fill",
-            style: {
-              width: `${Math.min(100, ((overview.findings.by_severity[severity] ?? 0) / Math.max(1, verified)) * 100)}%`,
-              background: severity === "critical" || severity === "high" ? "var(--red)" : severity === "medium" ? "var(--amber)" : "var(--blue)",
-            },
+            style: { "--progress": String(Math.min(1, (overview.findings.by_severity[severity] ?? 0) / mixTotal)) },
           }),
         ),
       ),
@@ -113,10 +115,11 @@ export async function renderDashboard(root: HTMLElement): Promise<void> {
                 statusBadge(audit.status),
               ),
               h("div", { class: "table-sub" },
-                `Phase ${audit.current_phase} · ${phaseLabel(audit.current_phase)} · ${audit.commit_sha?.slice(0, 10) ?? "no commit"}`,
+                `Phase ${audit.current_phase} of 6, ${phaseLabel(audit.current_phase)}, `,
+                h("span", { class: "mono" }, audit.commit_sha?.slice(0, 10) ?? "no commit"),
               ),
             ),
-            h("div", { class: "tiny muted nowrap" }, timeAgo(audit.created_at)),
+            h("div", { class: "mono tiny muted nowrap" }, timeAgo(audit.created_at)),
           ),
         )
       : [emptyState("No audits yet", "Create a project, import an authorized repository, then launch the six-phase workflow.")];
@@ -173,14 +176,31 @@ export async function renderDashboard(root: HTMLElement): Promise<void> {
       h(
         "div",
         { class: "stat-grid" },
-        statCard("Running audits", overview.running_audits, `${overview.audits} total audit${overview.audits === 1 ? "" : "s"}`, overview.running_audits ? "warn" : "good"),
+        h(
+          "div",
+          { class: "stat-card record-lead" },
+          h("div", { class: "stat-label" }, runningAudit ? "Audit in progress" : "Audits recorded"),
+          runningAudit
+            ? h("div", { class: "record-body" },
+                h("a", { class: "record-name", href: `#/audits/${runningAudit.id}` }, runningAudit.project_name),
+                h("div", { class: "record-reading" },
+                  h("span", { class: "record-unit" }, "Phase"),
+                  h("span", { class: "record-phase" }, `${String(runningAudit.current_phase).padStart(2, "0")} / 06`),
+                ),
+                h("div", { class: "mono tiny muted" }, `${runningAudit.commit_sha?.slice(0, 10) ?? "no commit"}, ${timeAgo(runningAudit.created_at)}`),
+              )
+            : h("div", { class: "record-body" },
+                h("div", { class: "stat-value" }, String(overview.audits)),
+                h("div", { class: "stat-detail" }, `${overview.running_audits} running now`),
+              ),
+        ),
         statCard("Active agents", overview.agents.active_sessions, `${overview.agents.sessions} historical sessions`),
-        statCard("Verified findings", verified, unresolved ? `${unresolved} unresolved` : "independent retest complete", verified ? "bad" : "good"),
-        statCard("Pending approvals", overview.pending_approvals, "Shell / destructive actions", overview.pending_approvals ? "warn" : "good"),
+        statCard("Verified findings", verified, unresolved ? `${unresolved} unresolved` : "independent retest complete", "good"),
+        statCard("Pending approvals", overview.pending_approvals, "Shell and destructive actions", overview.pending_approvals ? "warn" : "good"),
       ),
       h(
         "div",
-        { class: "grid grid-main", style: { marginTop: "14px" } },
+        { class: "grid grid-main" },
         h(
           "div",
           { class: "stack" },
@@ -199,10 +219,13 @@ export async function renderDashboard(root: HTMLElement): Promise<void> {
                 "div",
                 { class: "chip-row" },
                 ...["PENDING", "RUNNING", "COMPLETED", "BLOCKED", "FAILED", "NOT_APPLICABLE"].map((status) =>
-                  h("span", { class: `chip ${status === "COMPLETED" ? "on" : ""}` }, `${status.replaceAll("_", " ")} · ${overview.coverage[status] ?? 0}`),
+                  h("span", { class: `chip ${status === "COMPLETED" ? "on" : ""}` },
+                    status.replaceAll("_", " ").toLowerCase(),
+                    h("span", { class: "mono" }, String(overview.coverage[status] ?? 0)),
+                  ),
                 ),
               ),
-              h("p", { class: "tiny muted", style: { margin: "2px 0 0" } },
+              h("p", { class: "tiny muted" },
                 "Completed tasks do not prove exhaustive vulnerability discovery. Unmapped files and blocked areas remain explicit limitations.",
               ),
             ),
@@ -213,14 +236,13 @@ export async function renderDashboard(root: HTMLElement): Promise<void> {
           { class: "stack" },
           section("Runtime health", h("div", {}, ...harnesses)),
           section("Verified severity mix", verified ? h("div", { class: "stack" }, ...findingMix) : emptyState("No verified findings", "Findings only appear here after independent reverification.")),
-          approvalsPanel,
         ),
       ),
-      h("div", { style: { height: "14px" } }),
+      ...(approvalsPanel ? [approvalsPanel] : []),
       section("Live activity", events, h("a", { class: "btn btn-ghost btn-sm", href: "#/tasks" }, "Task queue")),
       h(
         "div",
-        { class: "row", style: { marginTop: "14px" } },
+        { class: "row" },
         h("span", { class: "hint" }, `Signed in as ${session.user?.name ?? ""} (${session.user?.role ?? ""}).`),
         h("a", { class: "hint", href: "#/settings" }, "Runtime settings"),
       ),
@@ -240,5 +262,5 @@ function eventDetail(event: { type: string; payload: Record<string, unknown>; au
     }
   }
   if (parts.length === 0) parts.push(`audit ${event.audit_id.slice(0, 8)}`);
-  return parts.join(" · ");
+  return parts.join(", ");
 }

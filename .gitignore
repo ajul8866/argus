@@ -19,6 +19,7 @@ bootstrap-admin.txt
 /tmp/
 /demo-output/
 /tasks/
+/.hallmark/
 /PRD.md
 /docs/DEBUGGING_REVIEW.md
 /docs/REFACTOR_REVIEW.md

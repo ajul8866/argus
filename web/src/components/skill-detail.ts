@@ -41,7 +41,7 @@ export async function renderSkillDetail(root: HTMLElement, skill: LocalSkill, ca
       h("p", { class: "small muted" }, "Only enabled servers linked to a loaded skill are included in the session."),
       catalog.servers.length ? h("div", { class: "local-check-grid" }, ...catalog.servers.map((server) => checkbox(server.name,
         draft.mcp_ids.includes(server.id), (value) => { draft.mcp_ids = toggle(draft.mcp_ids, server.id, value); },
-        `${!server.present ? "Missing locally" : server.error ? server.error : !server.source_enabled ? "Disabled in source" : server.transport}${catalog.servers.filter((item) => item.name === server.name).length > 1 ? ` · ${server.sources[0]?.split("/").slice(-2).join("/") ?? ""}` : ""}`)))
+        `${!server.present ? "Missing locally" : server.error ? server.error : !server.source_enabled ? "Disabled in source" : server.transport}${catalog.servers.filter((item) => item.name === server.name).length > 1 ? `, ${server.sources[0]?.split("/").slice(-2).join("/") ?? ""}` : ""}`)))
         : h("p", { class: "small muted" }, "No local MCP configuration detected."),
     );
     const saveAccess = async () => {

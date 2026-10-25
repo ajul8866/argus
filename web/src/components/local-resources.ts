@@ -40,7 +40,7 @@ export function usagePanel(usage: Usage, kind: "skill" | "mcp"): HTMLElement {
 
 export function discoveryDetails(view: CatalogView): HTMLElement {
   return h("details", { class: "local-discovery" },
-    h("summary", {}, `Automatic local discovery · ${formatDate(view.scan.scanned_at)}${view.scan.errors.length ? ` · ${view.scan.errors.length} source issue(s)` : ""}`),
+    h("summary", {}, `Automatic local discovery, ${formatDate(view.scan.scanned_at)}${view.scan.errors.length ? `, ${view.scan.errors.length} source issues` : ""}`),
     h("p", { class: "small muted" }, "The catalog refreshes automatically every 30 seconds while this page is open. Local files remain the source of truth."),
     sourceList(view.scan.roots),
     ...view.scan.errors.map((error) => h("p", { class: "small local-warning" }, h("span", { class: "mono tiny" }, error.source), h("br"), error.message)),

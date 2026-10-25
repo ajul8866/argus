@@ -54,7 +54,7 @@ export async function renderMcp(root: HTMLElement, params: URLSearchParams): Pro
           )),
           section("Linked skills", linked.length ? h("ul", { class: "local-links" }, ...linked.map((skill) => h("li", {},
             h("a", { href: `#/skills?skill_id=${encodeURIComponent(skill.id)}` }, skill.name),
-            h("span", { class: "small muted" }, ` · ${skill.roles.length} agent role(s)`))))
+            h("span", { class: "small muted" }, `, ${skill.roles.length} agent roles`))))
             : h("p", { class: "muted small" }, "No skills linked. Open a skill to grant access to this MCP server.")),
           h("div", { "data-local-usage": server.id }, usagePanel(data.usage, "mcp")),
         );

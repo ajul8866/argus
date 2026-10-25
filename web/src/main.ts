@@ -3,7 +3,6 @@ import { api, clearCsrf, connectEvents, disconnectEvents, loadSession, session }
 import {
   button,
   h,
-  icon,
   input,
   loading,
   toast,
@@ -23,33 +22,33 @@ import { renderSkills } from "./pages/skills.ts";
 import { renderMcp } from "./pages/mcp.ts";
 import { openAuditCreate } from "./components/audit-create.ts";
 
-const NAV_GROUPS: Array<{ label: string; items: Array<{ route: string; label: string; icon: string }> }> = [
+const NAV_GROUPS: Array<{ label: string; items: Array<{ route: string; label: string }> }> = [
   {
     label: "Operate",
     items: [
-      { route: "dashboard", label: "Overview", icon: "dashboard" },
-      { route: "projects", label: "Projects", icon: "projects" },
-      { route: "audits", label: "Audits", icon: "audits" },
-      { route: "explorer", label: "Explorer", icon: "explorer" },
+      { route: "dashboard", label: "Overview" },
+      { route: "projects", label: "Projects" },
+      { route: "audits", label: "Audits" },
+      { route: "explorer", label: "Explorer" },
     ],
   },
   {
     label: "Execution",
     items: [
-      { route: "harnesses", label: "Harnesses", icon: "harnesses" },
-      { route: "agents", label: "Agents", icon: "agents" },
-      { route: "skills", label: "Skills", icon: "skills" },
-      { route: "mcp", label: "MCP servers", icon: "mcp" },
-      { route: "tasks", label: "Tasks", icon: "tasks" },
-      { route: "approvals", label: "Approvals", icon: "approvals" },
+      { route: "harnesses", label: "Harnesses" },
+      { route: "agents", label: "Agents" },
+      { route: "skills", label: "Skills" },
+      { route: "mcp", label: "MCP servers" },
+      { route: "tasks", label: "Tasks" },
+      { route: "approvals", label: "Approvals" },
     ],
   },
   {
     label: "Assurance",
     items: [
-      { route: "findings", label: "Findings", icon: "findings" },
-      { route: "reports", label: "Reports", icon: "reports" },
-      { route: "settings", label: "Settings", icon: "settings" },
+      { route: "findings", label: "Findings" },
+      { route: "reports", label: "Reports" },
+      { route: "settings", label: "Settings" },
     ],
   },
 ];
@@ -86,7 +85,6 @@ function shell(): void {
       h("div", { class: "nav-label" }, group.label),
       ...group.items.map((item) =>
         h("a", { href: `#/${item.route}`, "data-route": item.route, class: item.route === currentRoute ? "active" : "" },
-          icon(item.icon),
           h("span", {}, item.label),
         ),
       ),
@@ -103,8 +101,7 @@ function shell(): void {
     h("nav", { "aria-label": "Main navigation" }, ...nav),
     h("div", { class: "sidebar-foot" },
       h("div", { class: "live-indicator", id: "live-indicator" },
-        h("span", { class: "live-dot" }),
-        h("span", { id: "live-label" }, liveConnected ? "live" : "offline"),
+        h("span", { id: "live-label" }, liveConnected ? "Live" : "Offline"),
       ),
       h("div", { class: "user-chip" },
         h("div", { class: "avatar" }, (session.user?.name ?? "?").slice(0, 2).toUpperCase()),
@@ -121,11 +118,10 @@ function shell(): void {
     h("div", { class: "topbar" },
       h("div", { class: "topbar-left" },
         h("button", {
-          class: "btn btn-ghost btn-icon mobile-toggle",
-          "aria-label": "Open navigation",
+          class: "btn btn-ghost btn-sm mobile-toggle",
           type: "button",
           onclick: () => document.body.classList.toggle("nav-open"),
-        }, "☰"),
+        }, "Menu"),
         h("div", { class: "breadcrumbs" },
           h("a", { href: "#/dashboard" }, "Argus"),
           h("span", { class: "sep" }, "/"),
@@ -134,7 +130,7 @@ function shell(): void {
       ),
       h("div", { class: "topbar-right" },
         h("a", { class: "btn btn-secondary btn-sm", href: "#/findings" }, "Findings"),
-        button("New audit", () => void openAuditCreate(), "primary", { class: "btn-sm" }),
+        button("New audit", () => void openAuditCreate(), "secondary", { class: "btn-sm" }),
       ),
     ),
     h("div", { id: "view" }),
@@ -158,7 +154,7 @@ function updateLiveIndicator(): void {
   const indicator = document.getElementById("live-indicator");
   const label = document.getElementById("live-label");
   indicator?.classList.toggle("on", liveConnected);
-  if (label) label.textContent = liveConnected ? "live" : "offline";
+  if (label) label.textContent = liveConnected ? "Live" : "Offline";
 }
 
 async function renderRoute(): Promise<void> {
@@ -169,7 +165,7 @@ async function renderRoute(): Promise<void> {
   const view = document.getElementById("view");
   if (!view) return;
   syncNav();
-  document.title = `${routeLabel(parsed.route)} · Argus`;
+  document.title = `${routeLabel(parsed.route)} | Argus`;
   try {
     switch (parsed.route) {
       case "dashboard":
@@ -281,7 +277,7 @@ function loginView(errorMessage?: string): void {
     h("label", { class: "field", style: { marginBottom: "12px" } }, h("span", { class: "field-label" }, "Email"), email),
     h("label", { class: "field", style: { marginBottom: "18px" } }, h("span", { class: "field-label" }, "Password"), password),
     submit,
-    h("div", { class: "login-foot" }, "Argus · self-hosted autonomous security audit platform"),
+    h("div", { class: "login-foot" }, "Self-hosted autonomous security audit platform"),
   );
 
   app.replaceChildren(
@@ -292,7 +288,7 @@ function loginView(errorMessage?: string): void {
           h("div", {}, h("div", { class: "brand-name" }, "Argus"), h("div", { class: "brand-sub" }, "autonomous audit")),
         ),
         h("div", { class: "login-headline" },
-          h("h1", {}, "Security review at ", h("em", {}, "agent speed"), ", with evidence you can defend."),
+          h("h1", {}, "Security review at agent speed, with evidence you can defend."),
           h("p", {}, "Six orchestrated phases. Real Pi and Claude Code execution. Independent confirmation, exact-source evidence gates, immutable findings, and deterministic reports."),
           h("div", { class: "login-points" },
             h("div", { class: "login-point" }, h("span", {}, "01"), h("span", {}, "Codebase map and attack-surface inventory")),
@@ -301,7 +297,7 @@ function loginView(errorMessage?: string): void {
             h("div", { class: "login-point" }, h("span", {}, "04"), h("span", {}, "Hash-chained evidence and professional exports")),
           ),
         ),
-        h("div", { class: "tiny muted" }, "Self-hosted · local-first · no simulated agents"),
+        h("div", { class: "tiny muted" }, "Self-hosted, local-first, no simulated agents"),
       ),
       h("main", { class: "login-panel" }, form),
     ),

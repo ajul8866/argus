@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Changed
+
+- The dashboard now uses the Console system: a graphite ground in three
+  lightness steps, hairline panels, Host Grotesk for reading and Atkinson
+  Hyperlegible Mono for measured values. Amber marks a person or a decision
+  (the current phase, a waiting approval, the primary control); cool blue marks
+  an instrument (timestamps, hashes, readings, the selected tab). Figures lead
+  each screen in the measured face, and every status label is set in sentence
+  case. Faces are self-hosted under `web/src/fonts` (SIL OFL 1.1) and inlined
+  into the built stylesheet, so the dashboard makes no font request. No API,
+  route or workflow behaviour changed.
+
 ### Fixed
 
 - Writable-workspace policy denials fail closed on the first check. A disabled

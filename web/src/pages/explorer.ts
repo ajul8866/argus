@@ -95,10 +95,11 @@ export async function renderExplorer(root: HTMLElement, params: URLSearchParams)
       "repository",
       repositories.map((repository) => ({
         value: repository.id,
-        label: `${repository.project_name} · ${repository.commit_sha?.slice(0, 8) ?? "worktree"} · ${repository.file_count} files`,
+        label: `${repository.project_name} / ${repository.commit_sha?.slice(0, 8) ?? "worktree"} / ${repository.file_count} files`,
       })),
       selected,
     );
+    repositorySelect.setAttribute("aria-label", "Repository snapshot");
     repositorySelect.addEventListener("change", () => {
       location.hash = `#/explorer?repo=${repositorySelect.value}`;
     });
@@ -160,7 +161,7 @@ export async function renderExplorer(root: HTMLElement, params: URLSearchParams)
       });
     }
 
-    root.replaceChildren(header, h("div", { class: "panel" }, tabs, content));
+    root.replaceChildren(header, h("div", { class: "panel explorer-workspace" }, tabs, content));
   } catch (error) {
     root.replaceChildren(errorState(error instanceof Error ? error.message : "Unable to load explorer", () => void renderExplorer(root, params)));
   }
@@ -174,6 +175,7 @@ function sourceTab(
 ): HTMLElement {
   const files = repo.inventory.files;
   const search = input("search", { placeholder: "Filter files…" });
+  search.setAttribute("aria-label", "Filter files");
   const treeHost = h("div", { class: "stack", style: { maxHeight: "620px", overflowY: "auto" } });
   const renderTree = (filter: string) => {
     if (filter.trim()) {
@@ -206,14 +208,14 @@ function sourceTab(
     treeHost.replaceChildren();
     fill(treeHost, [
       prefix
-        ? h("button", { class: "tree-file", onclick: () => onSelect(prefix.split("/").slice(0, -1).join("/")) }, "↑ Parent directory")
+        ? h("button", { class: "tree-file", onclick: () => onSelect(prefix.split("/").slice(0, -1).join("/")) }, "Parent directory")
         : null,
       ...list.slice(0, 200).map((entry) =>
         h("button", {
           class: `tree-file ${entry.path === currentPath ? "active" : ""}`,
           onclick: () => onSelect(entry.path),
         },
-          h("span", { class: "truncate" }, `${entry.type === "directory" ? "▸ " : "· "}${entry.path.split("/").pop()}`),
+          h("span", { class: "truncate" }, `${entry.type === "directory" ? "▸ " : ""}${entry.path.split("/").pop()}`),
           entry.type === "file" ? h("span", { class: "tiny muted nowrap" }, `${entry.lines} L`) : null,
         ),
       ),
@@ -240,15 +242,15 @@ function sourceTab(
   return h("div", { class: "explorer-grid" },
     h("aside", { class: "explorer-tree" },
       search,
-      h("div", { class: "tiny muted", style: { margin: "6px 0" } }, `${repo.inventory.files.length} files · ${(repo.total_bytes / 1024).toFixed(1)} KiB`),
+      h("div", { class: "tiny muted", style: { margin: "var(--space-xs) 0" } }, `${repo.inventory.files.length} files / ${(repo.total_bytes / 1024).toFixed(1)} KiB`),
       treeHost,
     ),
     h("div", { class: "explorer-main" },
       file
-        ? h("div", { class: "row-between", style: { marginBottom: "10px" } },
+        ? h("div", { class: "row-between", style: { marginBottom: "var(--space-sm)" } },
             h("div", {},
               h("div", { class: "mono small" }, file.path),
-              h("div", { class: "tiny muted" }, `${file.lines} lines · ${file.size} bytes${file.truncated ? " · preview truncated" : ""}`),
+              h("div", { class: "tiny muted" }, `${file.lines} lines / ${file.size} bytes${file.truncated ? " / preview truncated" : ""}`),
             ),
             badge(file.truncated ? "preview" : "read-only", file.truncated ? "warn" : "neutral"),
           )
@@ -272,7 +274,7 @@ function architectureTab(detail: RepoDetail): HTMLElement {
       h("div", {},
         h("div", { class: "section-title" }, "Languages and frameworks"),
         h("div", { class: "chip-row" }, ...Object.entries(repo.inventory.languages).map(([language, count]) => h("span", { class: "chip on mono" }, `${language} ${count}`))),
-        h("div", { class: "chip-row", style: { marginTop: "6px" } }, ...repo.inventory.frameworks.map((framework) => h("span", { class: "chip" }, framework))),
+        h("div", { class: "chip-row", style: { marginTop: "var(--space-xs)" } }, ...repo.inventory.frameworks.map((framework) => h("span", { class: "chip" }, framework))),
         h("div", { class: "section-title" }, "Entrypoints"),
         h("div", { class: "stack" }, ...(repo.inventory.entrypoints.length ? repo.inventory.entrypoints : ["No conventional entrypoints detected"]).map((entry) => h("div", { class: "mono tiny" }, entry))),
       ),
@@ -282,7 +284,7 @@ function architectureTab(detail: RepoDetail): HTMLElement {
           ? h("div", { class: "table-wrap" }, h("table", { class: "small-table" },
               h("thead", {}, h("tr", {}, h("th", {}, "Module"), h("th", {}, "Path"), h("th", {}, "Purpose"))),
               h("tbody", {}, ...map.modules.slice(0, 40).map((module) =>
-                h("tr", {}, h("td", { class: "small strong" }, module.name), h("td", { class: "mono tiny" }, module.path), h("td", { class: "small muted" }, module.purpose)),
+                h("tr", {}, h("td", { class: "small strong", "data-label": "Module" }, module.name), h("td", { class: "mono tiny", "data-label": "Path" }, module.path), h("td", { class: "small muted", "data-label": "Purpose" }, module.purpose)),
               )),
             ))
           : h("p", { class: "muted small" }, "Modules appear after Phase 1 completes."),
@@ -291,7 +293,7 @@ function architectureTab(detail: RepoDetail): HTMLElement {
           ? h("div", { class: "stack" }, ...map.areas.map((area) =>
               h("div", { class: "callout" },
                 h("div", { class: "row", style: { justifyContent: "space-between" } }, h("span", { class: "small strong" }, area.title), h("span", { class: "chip mono" }, area.id)),
-                h("div", { class: "tiny muted", style: { marginTop: "3px" } }, `${area.files.length} files · ${area.security_focus.join(", ")}`),
+                h("div", { class: "tiny muted", style: { marginTop: "var(--space-2xs)" } }, `${area.files.length} files / ${area.security_focus.join(", ")}`),
               ),
             ))
           : h("p", { class: "muted small" }, "Areas appear after Phase 1 completes."),
@@ -302,7 +304,7 @@ function architectureTab(detail: RepoDetail): HTMLElement {
       ? h("div", { class: "table-wrap" }, h("table", { class: "small-table" },
           h("thead", {}, h("tr", {}, h("th", {}, "Method"), h("th", {}, "Path"), h("th", {}, "Location"))),
           h("tbody", {}, ...repo.inventory.endpoints.slice(0, 120).map((endpoint) =>
-            h("tr", {}, h("td", { class: "mono" }, endpoint.method), h("td", { class: "mono" }, endpoint.path), h("td", { class: "mono tiny" }, `${endpoint.file}:${endpoint.line}`)),
+            h("tr", {}, h("td", { class: "mono", "data-label": "Method" }, endpoint.method), h("td", { class: "mono", "data-label": "Path" }, endpoint.path), h("td", { class: "mono tiny", "data-label": "Location" }, `${endpoint.file}:${endpoint.line}`)),
           )),
         ))
       : h("p", { class: "muted small" }, "No endpoint patterns detected."),
@@ -311,7 +313,7 @@ function architectureTab(detail: RepoDetail): HTMLElement {
       ? h("div", { class: "table-wrap", style: { maxHeight: "280px" } }, h("table", { class: "small-table" },
           h("thead", {}, h("tr", {}, h("th", {}, "From"), h("th", {}, "To"))),
           h("tbody", {}, ...repo.inventory.dependency_graph.slice(0, 80).map((edge) =>
-            h("tr", {}, h("td", { class: "mono tiny" }, edge.from), h("td", { class: "mono tiny" }, edge.to)),
+            h("tr", {}, h("td", { class: "mono tiny", "data-label": "From" }, edge.from), h("td", { class: "mono tiny", "data-label": "To" }, edge.to)),
           )),
         ))
       : h("p", { class: "muted small" }, "No internal import edges detected."),
@@ -319,12 +321,12 @@ function architectureTab(detail: RepoDetail): HTMLElement {
     repo.inventory.auth_boundaries.length
       ? h("div", { class: "stack" }, ...repo.inventory.auth_boundaries.slice(0, 50).map((boundary) =>
           h("div", { class: "row-between small" },
-            h("div", {}, h("span", { class: "strong" }, boundary.kind), h("span", { class: "muted" }, ` · ${boundary.detail}`)),
+            h("div", {}, h("span", { class: "strong" }, boundary.kind), h("span", { class: "muted" }, `: ${boundary.detail}`)),
             h("span", { class: "mono tiny muted" }, `${boundary.file}:${boundary.line}`),
           ),
         ))
       : h("p", { class: "muted small" }, "No authentication boundary signals detected."),
-    map?.limitations?.length ? h("div", { class: "callout warn" }, h("div", { class: "tiny" }, "MAP LIMITATIONS"), h("div", { class: "small" }, map.limitations.join(" · "))) : null,
+    map?.limitations?.length ? h("div", { class: "callout warn" }, h("div", { class: "tiny" }, "Map limitations"), h("div", { class: "small" }, map.limitations.join(" / "))) : null,
   );
 }
 
@@ -335,10 +337,10 @@ function coverageTab(rows: Coverage[]): HTMLElement {
       h("thead", {}, h("tr", {}, h("th", {}, "Area"), h("th", {}, "Status"), h("th", {}, "Files"), h("th", {}, "Notes"))),
       h("tbody", {}, ...rows.map((row) =>
         h("tr", {},
-          h("td", {}, h("div", { class: "table-title" }, row.title), h("div", { class: "table-sub mono" }, row.area_id)),
-          h("td", {}, statusBadge(row.status)),
-          h("td", { class: "mono small" }, String(row.files.length)),
-          h("td", { class: "small muted" }, row.notes ?? "—"),
+          h("td", { "data-label": "Area" }, h("div", { class: "table-title" }, row.title), h("div", { class: "table-sub mono" }, row.area_id)),
+          h("td", { "data-label": "Status" }, statusBadge(row.status)),
+          h("td", { class: "mono small", "data-label": "Files" }, String(row.files.length)),
+          h("td", { class: "small muted", "data-label": "Notes" }, row.notes ?? "—"),
         ),
       )),
     ),

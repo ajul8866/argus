@@ -50,15 +50,15 @@ export async function renderFindings(root: HTMLElement, params: URLSearchParams)
 
     const rows = findings.map((finding) =>
       h("tr", {},
-        h("td", {},
-          h("div", { class: "row", style: { gap: "7px" } }, h("span", { class: "mono tiny muted" }, finding.code), h("span", { class: "table-title" }, finding.title)),
-          h("div", { class: "table-sub" }, `${finding.category}${finding.cwe ? ` · ${finding.cwe}` : ""} · ${finding.files[0]?.path ?? "no location"}`),
+        h("td", { "data-label": "Finding" },
+          h("div", { class: "row", style: { gap: "var(--space-xs)" } }, h("span", { class: "mono tiny muted" }, finding.code), h("span", { class: "table-title" }, finding.title)),
+          h("div", { class: "table-sub" }, `${finding.category}${finding.cwe ? ` / ${finding.cwe}` : ""} / ${finding.files[0]?.path ?? "no location"}`),
         ),
-        h("td", {}, severityBadge(finding.severity)),
-        h("td", {}, statusBadge(finding.status)),
-        h("td", { class: "small" }, finding.retest_decision ?? finding.verification_decision ?? "—"),
-        h("td", { class: "small muted" }, formatDate(finding.updated_at)),
-        h("td", {}, h("a", { class: "btn btn-sm btn-secondary", href: `#/audits/${finding.audit_id}?tab=findings` }, "Audit")),
+        h("td", { "data-label": "Severity" }, severityBadge(finding.severity)),
+        h("td", { "data-label": "Status" }, statusBadge(finding.status)),
+        h("td", { "data-label": "Decision", class: "small" }, finding.retest_decision ?? finding.verification_decision ?? "—"),
+        h("td", { "data-label": "Updated", class: "small muted" }, formatDate(finding.updated_at)),
+        h("td", { "data-label": "Actions" }, h("a", { class: "btn btn-sm btn-secondary", href: `#/audits/${finding.audit_id}?tab=findings` }, "Audit")),
       ),
     );
 
@@ -70,7 +70,7 @@ export async function renderFindings(root: HTMLElement, params: URLSearchParams)
         statCard("Rejected", rejected, "removed by reverification", "good"),
         statCard("Total records", findings.length, "including retained false positives", "good"),
       ),
-      h("div", { style: { height: "14px" } }),
+      h("div", { style: { height: "var(--space-md)" } }),
       h("div", { class: "toolbar" },
         h("div", { class: "chip-row" }, ...FILTERS.map((filter) =>
           h("a", {
@@ -83,13 +83,14 @@ export async function renderFindings(root: HTMLElement, params: URLSearchParams)
           h("select", {
             class: "input select",
             style: { width: "260px" },
+            "aria-label": "Audit",
             onchange: (event: Event) => {
               const value = (event.target as HTMLSelectElement).value;
               location.hash = `#/findings?status=${status}${value ? `&audit=${value}` : ""}`;
             },
           },
             h("option", { value: "" }, "All audits"),
-            ...audits.map((audit) => h("option", { value: audit.id, selected: audit.id === auditId }, `${audit.project_name} · ${audit.id.slice(0, 8)} · ${audit.status}`)),
+            ...audits.map((audit) => h("option", { value: audit.id, selected: audit.id === auditId }, `${audit.project_name} / ${audit.id.slice(0, 8)} / ${audit.status}`)),
           ),
         ),
       ),

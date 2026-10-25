@@ -79,13 +79,13 @@ export async function openFindingDetail(findingId: string, onChange?: () => void
     body.replaceChildren(
       h("div", { class: "row-between" },
         h("div", {},
-          h("div", { class: "row", style: { gap: "7px" } },
+          h("div", { class: "row", style: { gap: "var(--space-xs)" } },
             h("span", { class: "mono muted" }, finding.code),
             severityBadge(finding.severity),
             statusBadge(finding.status),
           ),
-          h("h2", { style: { margin: "7px 0 3px", fontSize: "19px", letterSpacing: "-.02em" } }, finding.title),
-          h("div", { class: "tiny muted" }, `${finding.category}${finding.cwe ? ` · ${finding.cwe}` : ""} · commit ${finding.repository_commit?.slice(0, 12) ?? "n/a"}`),
+          h("h2", { style: { margin: "var(--space-xs) 0 var(--space-2xs)", fontSize: "19px", letterSpacing: "-.02em" } }, finding.title),
+          h("div", { class: "tiny muted" }, `${finding.category}${finding.cwe ? ` / ${finding.cwe}` : ""} / commit ${finding.repository_commit?.slice(0, 12) ?? "n/a"}`),
         ),
         session.user && ["admin", "auditor"].includes(session.user.role)
           ? button("Request retest", async () => {
@@ -103,11 +103,11 @@ export async function openFindingDetail(findingId: string, onChange?: () => void
       ),
       h("div", { class: "callout" },
         h("div", { class: "row", style: { justifyContent: "space-between" } },
-          h("span", { class: "tiny muted" }, "VERIFICATION DECISION"),
+          h("span", { class: "tiny muted" }, "Verification decision"),
           h("span", { class: "strong small" }, finding.verification_decision ?? "—"),
         ),
-        h("div", { class: "row", style: { justifyContent: "space-between", marginTop: "4px" } },
-          h("span", { class: "tiny muted" }, "RETEST DECISION"),
+        h("div", { class: "row", style: { justifyContent: "space-between", marginTop: "var(--space-2xs)" } },
+          h("span", { class: "tiny muted" }, "Retest decision"),
           h("span", { class: "strong small" }, finding.retest_decision ?? "pending"),
         ),
       ),
@@ -118,8 +118,8 @@ export async function openFindingDetail(findingId: string, onChange?: () => void
           sectionBlock("Reproduction reasoning", finding.reproduction.length ? h("ol", { class: "narrative" }, ...finding.reproduction.map((step) => h("li", {}, step))) : h("p", { class: "muted small" }, "No reproduction steps recorded.")),
           sectionBlock("Expected vs. observed",
             h("div", { class: "stack" },
-              h("div", { class: "callout" }, h("div", { class: "tiny muted" }, "EXPECTED"), h("div", { class: "small" }, finding.expected)),
-              h("div", { class: "callout bad" }, h("div", { class: "tiny muted" }, "OBSERVED"), h("div", { class: "small" }, finding.observed)),
+              h("div", { class: "callout" }, h("div", { class: "tiny muted" }, "Expected"), h("div", { class: "small" }, finding.expected)),
+              h("div", { class: "callout bad" }, h("div", { class: "tiny muted" }, "Observed"), h("div", { class: "small" }, finding.observed)),
             ),
           ),
           sectionBlock("Impact", h("p", { class: "narrative" }, finding.impact)),
@@ -138,10 +138,9 @@ export async function openFindingDetail(findingId: string, onChange?: () => void
           )),
           sectionBlock("Verification history", detail.verifications.length ? h("div", { class: "timeline" }, ...detail.verifications.map((verification) =>
             h("div", { class: `timeline-item ${verification.verdict === "CONFIRMED" || verification.verdict === "REVERIFIED" ? "on" : "bad"}` },
-              h("span", { class: "timeline-dot" }),
-              h("div", { class: "row", style: { gap: "6px" } }, h("span", { class: "strong small" }, verification.verdict), h("span", { class: "tiny muted" }, verification.kind)),
-              h("div", { class: "tiny muted" }, `${verification.agent_session_id.slice(0, 8)} · ${formatFullDate(verification.created_at)}`),
-              h("p", { class: "small", style: { margin: "5px 0 0", color: "var(--text-soft)" } }, truncate(verification.rationale, 800)),
+              h("div", { class: "row", style: { gap: "var(--space-2xs)" } }, h("span", { class: "strong small" }, verification.verdict), h("span", { class: "tiny muted" }, verification.kind)),
+              h("div", { class: "tiny muted" }, `${verification.agent_session_id.slice(0, 8)} / ${formatFullDate(verification.created_at)}`),
+              h("p", { class: "small", style: { margin: "var(--space-2xs) 0 0", color: "var(--text-soft)" } }, truncate(verification.rationale, 800)),
             ),
           )) : h("p", { class: "muted small" }, "No verification history.")),
           sectionBlock("Evidence", detail.evidence.length ? h("div", { class: "evidence-list" }, ...detail.evidence.map((evidence) =>
@@ -169,7 +168,7 @@ export async function openFindingDetail(findingId: string, onChange?: () => void
           sectionBlock("Sessions", detail.sessions.length ? h("div", { class: "stack" }, ...detail.sessions.map((agentSession) =>
             h("div", { class: "row-between" },
               h("div", {},
-                h("div", { class: "small" }, `${agentSession.role} · ${agentSession.harness}`),
+                h("div", { class: "small" }, `${agentSession.role} / ${agentSession.harness}`),
                 h("div", { class: "tiny muted mono" }, agentSession.id.slice(0, 12)),
               ),
               h("div", { class: "tiny muted" }, agentSession.sandbox_mode),
@@ -207,16 +206,16 @@ export async function openTaskDetail(taskId: string, onChange?: () => void): Pro
     const task = detail.task;
     fill(body, [
       h("div", {},
-        h("div", { class: "row", style: { gap: "7px" } },
+        h("div", { class: "row", style: { gap: "var(--space-xs)" } },
           h("span", { class: "mono muted" }, `phase ${String(task.phase)}`),
           statusBadge(String(task.status)),
           task.harness ? h("span", { class: "chip" }, String(task.harness)) : null,
         ),
-        h("h2", { style: { margin: "7px 0 2px", fontSize: "18px", letterSpacing: "-.02em" } }, String(task.title)),
-        h("div", { class: "tiny muted" }, `${String(task.kind)} · ${String(task.agent_role ?? "deterministic")} · attempts ${String(task.attempts)}/${String(task.max_attempts)}`),
+        h("h2", { style: { margin: "var(--space-xs) 0 var(--space-3xs)", fontSize: "18px", letterSpacing: "-.02em" } }, String(task.title)),
+        h("div", { class: "tiny muted" }, `${String(task.kind)} / ${String(task.agent_role ?? "deterministic")} / attempts ${String(task.attempts)}/${String(task.max_attempts)}`),
       ),
       String(task.error ?? "").length > 0
-        ? h("div", { class: "callout bad" }, h("div", { class: "tiny muted" }, "FAILURE"), h("div", { class: "small" }, String(task.error)), h("div", { class: "tiny muted", style: { marginTop: "4px" } }, String(task.failure_kind ?? "")))
+        ? h("div", { class: "callout bad" }, h("div", { class: "tiny muted" }, "Failure"), h("div", { class: "small" }, String(task.error)), h("div", { class: "tiny muted", style: { marginTop: "var(--space-2xs)" } }, String(task.failure_kind ?? "")))
         : null,
       h("div", { class: "action-row" },
         ["failed", "cancelled", "blocked"].includes(String(task.status))
@@ -285,5 +284,5 @@ function eventSummary(payload: Record<string, unknown>): string {
     .filter(([, value]) => value !== null && value !== undefined && value !== "")
     .slice(0, 4)
     .map(([key, value]) => `${key}: ${typeof value === "object" ? truncate(JSON.stringify(value), 120) : truncate(String(value), 160)}`)
-    .join(" · ");
+    .join(", ");
 }

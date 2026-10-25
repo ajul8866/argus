@@ -54,7 +54,7 @@ export async function renderMcp(root: HTMLElement, params: URLSearchParams): Pro
           )),
           section("Linked skills", linked.length ? h("ul", { class: "local-links" }, ...linked.map((skill) => h("li", {},
             h("a", { href: `#/skills?skill_id=${encodeURIComponent(skill.id)}` }, skill.name),
-            h("span", { class: "small muted" }, ` · ${skill.roles.length} agent role(s)`))))
+            h("span", { class: "small muted" }, `, ${skill.roles.length} agent role(s)`))))
             : h("p", { class: "muted small" }, "No skills linked. Open a skill to grant access to this MCP server.")),
           h("div", { "data-local-usage": server.id }, usagePanel(data.usage, "mcp")),
         );
@@ -68,10 +68,10 @@ export async function renderMcp(root: HTMLElement, params: URLSearchParams): Pro
       table.replaceChildren(h("table", { class: "local-mcp-table" },
         h("thead", {}, h("tr", {}, ...["Server", "Transport", "Availability", "Tool calls"].map((label) => h("th", {}, label)))),
         h("tbody", {}, ...matches.map((server) => h("tr", { class: server.id === selected ? "local-selected-row" : "" },
-          h("td", {}, button(server.name, () => void select(server), "ghost", { class: "local-server-button", "aria-pressed": server.id === selected }),
+          h("td", { "data-label": "Server" }, button(server.name, () => void select(server), "ghost", { class: "local-server-button", "aria-pressed": server.id === selected }),
             h("div", { class: "tiny muted local-endpoint" }, server.endpoint)),
-          h("td", {}, badge(server.transport)), h("td", {}, localStatus(server)),
-          h("td", { class: "mono" }, String(server.stats.total_calls)),
+          h("td", { "data-label": "Transport" }, badge(server.transport)), h("td", { "data-label": "Availability" }, localStatus(server)),
+          h("td", { "data-label": "Tool calls", class: "mono" }, String(server.stats.total_calls)),
         ))),
       ));
       if (!matches.length) table.append(h("p", { class: "muted small" }, "No MCP servers match this search."));

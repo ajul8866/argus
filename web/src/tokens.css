@@ -1,0 +1,57 @@
+/* Hallmark · shape: app screen · genre: modern-minimal · theme: brand · redesign: full · v2.0.0 */
+/* Hallmark · pre-emit critique: P4 H4 E4 S4 R5 V3 · weakest: V, the shared console shell stays while audit rows lead the screen */
+:root {
+  color-scheme: dark;
+  --space-3xs: 2px; --space-2xs: 4px; --space-xs: 8px; --space-sm: 12px; --space-md: 16px; --space-lg: 24px; --space-xl: 40px; --space-2xl: 64px; --space-3xl: 96px; --space-4xl: 144px;
+  --text-xs: 0.75rem; --text-sm: 0.875rem; --text-md: 1rem; --text-lg: 1.2rem; --text-xl: 1.44rem; --text-2xl: 1.728rem; --text-3xl: 2.074rem;
+  --text-display-s: 1.44rem; --text-display: 2.074rem; --text-section: 1.2rem; --text-title: 1rem; --text-lead: 1rem;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1); --ease-in: cubic-bezier(0.7, 0, 0.84, 0); --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-micro: 120ms; --dur-short: 220ms; --dur-long: 420ms;
+  --container: 1504px; --gutter: 40px; --gap-columns: 24px;
+  --z-base: 1; --z-raised: 10; --z-dropdown: 100; --z-sticky: 200; --z-sticky-nav: 300; --z-modal: 400; --z-toast: 500; --z-tooltip: 600;
+  --color-paper: oklch(18% 0.006 170);
+  --color-paper-2: oklch(21% 0.006 170);
+  --color-paper-3: oklch(25% 0.007 170);
+  --color-ink: oklch(94% 0.006 165);
+  --color-ink-2: oklch(82% 0.009 165);
+  --color-muted: oklch(70% 0.012 165);
+  --color-rule: oklch(31% 0.007 170);
+  --color-accent: #54dfc2;
+  --color-accent-ink: oklch(20% 0.035 170);
+  --color-focus: #54dfc2;
+  --color-error: oklch(78% 0.125 24);
+  --color-success: oklch(81% 0.115 151);
+  --color-field-edge: oklch(57% 0.009 170);
+  --color-sidebar: oklch(15% 0.006 170);
+  --color-code: oklch(16% 0.006 170);
+  --color-accent-hover: oklch(86% 0.12 171);
+  --color-accent-soft: oklch(27% 0.027 170);
+  --color-accent-border: oklch(46% 0.068 170);
+  --color-warning: oklch(84% 0.12 82);
+  --color-warning-soft: oklch(25% 0.025 82);
+  --color-danger-soft: oklch(24% 0.025 24);
+  --color-success-soft: oklch(25% 0.025 151);
+  --color-info: oklch(80% 0.09 242);
+  --color-info-soft: oklch(25% 0.02 242);
+  --color-purple: oklch(81% 0.08 298);
+  --color-overlay: oklch(10% 0.005 170 / 0.8);
+  --color-transparent: transparent;
+  --color-shadow: oklch(8% 0.005 170 / 0.24);
+  --font-body: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-display: var(--font-body);
+  --font-outlier: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --display-weight: 600;
+  --tracking-display: -0.025em;
+  --radius-card: 8px; --radius-input: 5px; --radius-pill: 999px; --rule-hair: 1px; --shadow-card: none;
+  --bg: var(--color-paper); --bg-soft: var(--color-code); --panel: var(--color-paper-2); --panel-2: var(--color-paper-3); --raised: var(--color-paper-3);
+  --line: var(--color-rule); --line-strong: var(--color-field-edge);
+  --text: var(--color-ink); --text-soft: var(--color-ink-2); --muted: var(--color-muted); --muted-2: var(--color-muted);
+  --accent: var(--color-accent); --accent-strong: var(--color-accent); --accent-soft: var(--color-accent-soft);
+  --amber: var(--color-warning); --amber-soft: var(--color-warning-soft);
+  --red: var(--color-error); --red-soft: var(--color-danger-soft);
+  --green: var(--color-success); --green-soft: var(--color-success-soft);
+  --blue: var(--color-info); --purple: var(--color-purple);
+  --radius: var(--radius-card); --radius-sm: var(--radius-input);
+  --sans: var(--font-body); --mono: var(--font-outlier);
+  --shadow: 0 12px 40px var(--color-shadow);
+}

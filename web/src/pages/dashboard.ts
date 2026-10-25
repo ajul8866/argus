@@ -75,12 +75,11 @@ export async function renderDashboard(root: HTMLElement): Promise<void> {
         "div",
         { class: "row-between" },
         h("div", { class: "row" }, severityBadge(severity), h("span", { class: "muted tiny" }, `${overview.findings.by_severity[severity] ?? 0} verified`)),
-        h("div", { class: "progress-track", style: { width: "90px" } },
+        h("div", { class: "progress-track severity-track" },
           h("div", {
-            class: "progress-fill",
+            class: `progress-fill severity-fill-${severity}`,
             style: {
               width: `${Math.min(100, ((overview.findings.by_severity[severity] ?? 0) / Math.max(1, verified)) * 100)}%`,
-              background: severity === "critical" || severity === "high" ? "var(--red)" : severity === "medium" ? "var(--amber)" : "var(--blue)",
             },
           }),
         ),
@@ -90,9 +89,9 @@ export async function renderDashboard(root: HTMLElement): Promise<void> {
     const harnesses = overview.harnesses.map((harness) =>
       h(
         "div",
-        { class: "row-between", style: { padding: "9px 0", borderBottom: "1px solid rgba(30,46,60,.55)" } },
+        { class: "row-between runtime-row" },
         h("div", {},
-          h("div", { class: "row", style: { gap: "7px" } },
+          h("div", { class: "row" },
             h("span", { class: "strong small" }, harness.label),
             statusBadge(harness.status),
           ),
@@ -108,12 +107,13 @@ export async function renderDashboard(root: HTMLElement): Promise<void> {
             "div",
             { class: "audit-list-item" },
             h("div", { class: "truncate" },
-              h("div", { class: "row", style: { gap: "7px" } },
+              h("div", { class: "row" },
                 h("a", { class: "table-title", href: `#/audits/${audit.id}` }, audit.project_name),
                 statusBadge(audit.status),
               ),
-              h("div", { class: "table-sub" },
-                `Phase ${audit.current_phase} · ${phaseLabel(audit.current_phase)} · ${audit.commit_sha?.slice(0, 10) ?? "no commit"}`,
+              h("div", { class: "table-sub audit-row-meta" },
+                h("span", {}, `Phase ${audit.current_phase}: ${phaseLabel(audit.current_phase)}`),
+                h("span", { class: "mono" }, audit.commit_sha?.slice(0, 10) ?? "no commit"),
               ),
             ),
             h("div", { class: "tiny muted nowrap" }, timeAgo(audit.created_at)),
@@ -180,15 +180,20 @@ export async function renderDashboard(root: HTMLElement): Promise<void> {
       ),
       h(
         "div",
-        { class: "grid grid-main", style: { marginTop: "14px" } },
+        { class: "dashboard-workspace" },
         h(
           "div",
-          { class: "stack" },
+          { class: "stack dashboard-lead" },
           section(
             "Recent audits",
             h("div", {}, ...auditRows),
             h("a", { class: "btn btn-ghost btn-sm", href: "#/audits" }, "All audits"),
           ),
+          section("Live activity", events, h("a", { class: "btn btn-ghost btn-sm", href: "#/tasks" }, "Task queue")),
+        ),
+        h(
+          "div",
+          { class: "stack" },
           section(
             "Coverage matrix",
             h(
@@ -197,30 +202,27 @@ export async function renderDashboard(root: HTMLElement): Promise<void> {
               progress(coverageCompleted, coverageTotal, `${coverageCompleted} completed / ${coverageTotal} total areas`),
               h(
                 "div",
-                { class: "chip-row" },
+                { class: "coverage-statuses" },
                 ...["PENDING", "RUNNING", "COMPLETED", "BLOCKED", "FAILED", "NOT_APPLICABLE"].map((status) =>
-                  h("span", { class: `chip ${status === "COMPLETED" ? "on" : ""}` }, `${status.replaceAll("_", " ")} · ${overview.coverage[status] ?? 0}`),
+                  h("span", { class: `chip ${status === "COMPLETED" ? "on" : ""}` },
+                    h("span", {}, status.toLowerCase().replaceAll("_", " ")),
+                    h("span", { class: "coverage-count" }, overview.coverage[status] ?? 0),
+                  ),
                 ),
               ),
-              h("p", { class: "tiny muted", style: { margin: "2px 0 0" } },
+              h("p", { class: "tiny muted" },
                 "Completed tasks do not prove exhaustive vulnerability discovery. Unmapped files and blocked areas remain explicit limitations.",
               ),
             ),
           ),
-        ),
-        h(
-          "div",
-          { class: "stack" },
           section("Runtime health", h("div", {}, ...harnesses)),
           section("Verified severity mix", verified ? h("div", { class: "stack" }, ...findingMix) : emptyState("No verified findings", "Findings only appear here after independent reverification.")),
           approvalsPanel,
         ),
       ),
-      h("div", { style: { height: "14px" } }),
-      section("Live activity", events, h("a", { class: "btn btn-ghost btn-sm", href: "#/tasks" }, "Task queue")),
       h(
         "div",
-        { class: "row", style: { marginTop: "14px" } },
+        { class: "row dashboard-footer" },
         h("span", { class: "hint" }, `Signed in as ${session.user?.name ?? ""} (${session.user?.role ?? ""}).`),
         h("a", { class: "hint", href: "#/settings" }, "Runtime settings"),
       ),
@@ -240,5 +242,5 @@ function eventDetail(event: { type: string; payload: Record<string, unknown>; au
     }
   }
   if (parts.length === 0) parts.push(`audit ${event.audit_id.slice(0, 8)}`);
-  return parts.join(" · ");
+  return parts.join(", ");
 }

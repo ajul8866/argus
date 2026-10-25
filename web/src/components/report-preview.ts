@@ -13,7 +13,7 @@ export async function previewReport(reportId: string, format: string, title: str
           ? body.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "")
           : body;
     modal(
-      `${title} · ${format.toUpperCase()} preview`,
+      `${title} / ${format.toUpperCase()} preview`,
       h("pre", {
         class: "json-block",
         style: { maxHeight: "65vh", whiteSpace: "pre-wrap", fontFamily: "var(--mono)", fontSize: "11px" },

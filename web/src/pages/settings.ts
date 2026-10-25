@@ -96,6 +96,7 @@ export async function renderSettings(root: HTMLElement): Promise<void> {
         controls.set(definition.key, element);
         control = element;
       }
+      control.setAttribute("aria-label", definition.label);
       return h("div", { class: "setting-row" },
         h("div", {}, h("div", { class: "setting-name" }, definition.label), h("div", { class: "setting-desc" }, definition.description)),
         h("div", { class: "setting-control" }, control),
@@ -158,11 +159,11 @@ export async function renderSettings(root: HTMLElement): Promise<void> {
           section("Security model", h("div", { class: "narrative" },
             h("p", {}, "All assessments are restricted to authorized repositories. Scope is enforced by copying only in-scope files into isolated workspaces; agent prompts never define authorization."),
             h("p", {}, "Harness tools are read-only by default. Shell access is globally disabled, requires administrator enablement, and remains blocked per task until approval is recorded."),
-            h("p", { class: "muted small" }, "Credentials are encrypted at rest with AES-256-GCM. Values are write-only through the API and are injected only into harness child processes."),
+            h("p", { class: "muted small" }, "Credentials are encrypted at rest with AES-256-GCM. Values are write-only through the API and are injected only into harness child processes.")
           )),
-          isAdmin ? auditLogSection(entries) : null,
         ),
       ),
+      ...(isAdmin ? [h("div", { class: "settings-audit" }, auditLogSection(entries))] : []),
     );
   } catch (error) {
     root.replaceChildren(errorState(error instanceof Error ? error.message : "Unable to load settings", () => void renderSettings(root)));
@@ -228,11 +229,11 @@ function credentialsSection(settings: SettingsResponse, root: HTMLElement): HTML
             h("thead", {}, h("tr", {}, h("th", {}, "Provider"), h("th", {}, "Variable"), h("th", {}, "Last four"), h("th", {}, "Updated"), h("th", {}, ""))),
             h("tbody", {}, ...settings.credentials.map((credential) =>
               h("tr", {},
-                h("td", { class: "small" }, credential.provider),
-                h("td", { class: "mono tiny" }, credential.env_var),
-                h("td", { class: "mono" }, `••••${credential.last4}`),
-                h("td", { class: "small muted" }, formatDate(credential.updated_at)),
-                h("td", {}, h("div", { class: "table-actions" }, button("Delete", async () => {
+                h("td", { "data-label": "Provider", class: "small" }, credential.provider),
+                h("td", { "data-label": "Variable", class: "mono tiny" }, credential.env_var),
+                h("td", { "data-label": "Last four", class: "mono" }, `••••${credential.last4}`),
+                h("td", { "data-label": "Updated", class: "small muted" }, formatDate(credential.updated_at)),
+                h("td", { "data-label": "Actions" }, h("div", { class: "table-actions" }, button("Delete", async () => {
                   if (!(await confirmAction("Delete credential", "Harness authentication may fail until a replacement is stored.", "Delete"))) return;
                   try {
                     await api(`/api/credentials/${credential.id}`, { method: "DELETE" });
@@ -260,11 +261,11 @@ function usersSection(users: User[], root: HTMLElement): HTMLElement {
             h("thead", {}, h("tr", {}, h("th", {}, "User"), h("th", {}, "Role"), h("th", {}, "Status"), h("th", {}, "Created"), h("th", {}, ""))),
             h("tbody", {}, ...users.map((user) =>
               h("tr", {},
-                h("td", {}, h("div", { class: "small" }, user.name), h("div", { class: "tiny muted" }, user.email)),
-                h("td", {}, badge(user.role, user.role === "admin" ? "accent" : "neutral")),
-                h("td", {}, user.disabled ? badge("disabled", "bad") : badge("active", "good")),
-                h("td", { class: "small muted" }, formatDate(user.created_at)),
-                h("td", {}, canManage ? button("Manage", () => openUserManage(user, root), "ghost", { class: "btn-sm" }) : null),
+                h("td", { "data-label": "User" }, h("div", { class: "small" }, user.name), h("div", { class: "tiny muted" }, user.email)),
+                h("td", { "data-label": "Role" }, badge(user.role, user.role === "admin" ? "accent" : "neutral")),
+                h("td", { "data-label": "Status" }, user.disabled ? badge("disabled", "bad") : badge("active", "good")),
+                h("td", { "data-label": "Created", class: "small muted" }, formatDate(user.created_at)),
+                h("td", { "data-label": "Actions" }, canManage ? button("Manage", () => openUserManage(user, root), "ghost", { class: "btn-sm" }) : null),
               ),
             )),
           ))
@@ -350,15 +351,15 @@ function openUserCreate(root: HTMLElement): void {
 
 function auditLogSection(entries: AuditLog[]): HTMLElement {
   return section("Security audit log", entries.length
-    ? h("div", { class: "table-wrap", style: { maxHeight: "420px" } }, h("table", { class: "small-table" },
+    ? h("div", { class: "table-wrap" }, h("table", { class: "small-table audit-log-table" },
         h("thead", {}, h("tr", {}, h("th", {}, "Time"), h("th", {}, "Actor"), h("th", {}, "Action"), h("th", {}, "Target"), h("th", {}, "IP"))),
         h("tbody", {}, ...entries.slice(0, 100).map((entry) =>
           h("tr", {},
-            h("td", { class: "tiny muted nowrap" }, formatDate(entry.created_at)),
-            h("td", { class: "tiny" }, entry.actor ?? "system"),
-            h("td", { class: "mono tiny" }, entry.action),
-            h("td", { class: "tiny muted truncate" }, entry.target ?? "—"),
-            h("td", { class: "tiny muted" }, entry.ip ?? "—"),
+            h("td", { "data-label": "Time", class: "tiny muted nowrap" }, formatDate(entry.created_at)),
+            h("td", { "data-label": "Actor", class: "tiny" }, entry.actor ?? "system"),
+            h("td", { "data-label": "Action", class: "mono tiny" }, entry.action),
+            h("td", { "data-label": "Target", class: "tiny muted truncate" }, entry.target ?? "—"),
+            h("td", { "data-label": "IP", class: "tiny muted" }, entry.ip ?? "—"),
           ),
         )),
       ))

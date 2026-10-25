@@ -36,15 +36,15 @@ export async function renderApprovals(root: HTMLElement): Promise<void> {
     const history = approvals.filter((approval) => approval.status !== "pending");
     const rows = approvals.map((approval) =>
       h("tr", {},
-        h("td", {},
+        h("td", { "data-label": "Request" },
           h("div", { class: "table-title" }, approval.action.replaceAll("_", " ")),
           h("div", { class: "table-sub" }, approval.scope),
         ),
-        h("td", {}, statusBadge(approval.status)),
-        h("td", { class: "small" }, approval.audit_id ? h("a", { href: `#/audits/${approval.audit_id}` }, approval.audit_id.slice(0, 8)) : "—"),
-        h("td", { class: "small muted" }, formatDate(approval.created_at)),
-        h("td", { class: "small muted" }, approval.decided_by ?? "—"),
-        h("td", {}, approval.status === "pending" && canDecide
+        h("td", { "data-label": "Status" }, statusBadge(approval.status)),
+        h("td", { "data-label": "Audit", class: "small" }, approval.audit_id ? h("a", { href: `#/audits/${approval.audit_id}` }, approval.audit_id.slice(0, 8)) : "—"),
+        h("td", { "data-label": "Requested", class: "small muted" }, formatDate(approval.created_at)),
+        h("td", { "data-label": "Decided by", class: "small muted" }, approval.decided_by ?? "—"),
+        h("td", { "data-label": "Actions" }, approval.status === "pending" && canDecide
           ? h("div", { class: "action-row" },
               button("Deny", async () => decide(approval.id, false, root), "danger", { class: "btn-sm" }),
               button("Approve", async () => decide(approval.id, true, root), "secondary", { class: "btn-sm" }),
@@ -59,7 +59,7 @@ export async function renderApprovals(root: HTMLElement): Promise<void> {
         h("div", { class: "stat-card" }, h("div", { class: "stat-label" }, "Approved"), h("div", { class: "stat-value" }, String(approvals.filter((approval) => approval.status === "approved").length))),
         h("div", { class: "stat-card" }, h("div", { class: "stat-label" }, "Denied"), h("div", { class: "stat-value" }, String(approvals.filter((approval) => approval.status === "denied").length))),
       ),
-      h("div", { style: { height: "14px" } }),
+      h("div", { style: { height: "var(--space-md)" } }),
       approvals.length
         ? section("Decision queue", h("div", { class: "table-wrap" }, h("table", {},
             h("thead", {}, h("tr", {}, h("th", {}, "Request"), h("th", {}, "Status"), h("th", {}, "Audit"), h("th", {}, "Requested"), h("th", {}, "Decided by"), h("th", {}, ""))),

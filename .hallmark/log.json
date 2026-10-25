@@ -1,0 +1,22 @@
+[
+ {
+  "mode": "redesign",
+  "depth": "full",
+  "scope": "app",
+  "theme": "brand",
+  "prompt": "Argus security audit console app screens",
+  "shape": "app screen",
+  "axes": "dark/sans/green",
+  "hero": "none (app)",
+  "nav": "kept grouped sidebar with mobile menu",
+  "footer": "sidebar operator and live state",
+  "imagery": "none",
+  "entry": "flat audit workspace with restrained green accent",
+  "fingerprint": "app-screen",
+  "sections": "sign-in; dashboard; projects; audits; explorer; harnesses; agents; skills; mcp; tasks; findings; reports; settings; approvals",
+  "signature": "audit queue, coverage, and evidence workspace",
+  "waived": [],
+  "photos": [],
+  "date": "2026-10-25"
+ }
+]

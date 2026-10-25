@@ -1,0 +1,11 @@
+before/
+before-login/
+after-login/
+screenshots/
+shots/
+*.png
+*.json.tmp
+before.json
+before.txt
+compare.html
+render-*.json

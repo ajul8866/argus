@@ -197,6 +197,23 @@ type FindingRow = {
 
 const TERMINAL_TASK_STATES = new Set(["completed", "failed", "cancelled", "blocked"]);
 const DETERMINISTIC_TASK_KINDS: Record<string, true> = { "phase4.persist": true, "phase6.report": true };
+/** Terminal on the first check, including the generic fallback kind. */
+const WRITABLE_WORKSPACE_DENIALS = new Set([
+  "writable_workspace_disabled",
+  "writable_workspace_not_approved",
+  "writable_workspace_denied",
+]);
+const NON_RETRYABLE_FAILURES = new Set([
+  "cancelled",
+  "budget_exceeded",
+  "harness_missing",
+  "harness_auth",
+  "shell_tools_disabled",
+  "harness_tool_policy",
+  "audit_closed",
+  "local_resources",
+  ...WRITABLE_WORKSPACE_DENIALS,
+]);
 
 const TASK_SCHEMAS: Record<string, JsonSchema> = {
   "phase1.map": MAP_SCHEMA,
@@ -1044,7 +1061,10 @@ export class AuditEngine {
       writableWorkspace = this.resolveWritableWorkspace(task, ctx.auditConfig);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.finishTaskFailure(task.id, "writable_workspace_denied", message);
+      const failureKind = error instanceof AppError && WRITABLE_WORKSPACE_DENIALS.has(error.code)
+        ? error.code
+        : "writable_workspace_denied";
+      this.finishTaskFailure(task.id, failureKind, message);
       return;
     }
     const sessionId = uid();
@@ -2272,18 +2292,7 @@ export class AuditEngine {
       failureKind = "cancelled";
     }
     const error = redactSecrets(rawError).text;
-    const retryable = ![
-      "cancelled",
-      "budget_exceeded",
-      "harness_missing",
-      "harness_auth",
-      "shell_tools_disabled",
-      "harness_tool_policy",
-      "audit_closed",
-      "local_resources",
-      "writable_workspace_disabled",
-      "writable_workspace_not_approved",
-    ].includes(failureKind);
+    const retryable = !NON_RETRYABLE_FAILURES.has(failureKind);
     const retry = retryable && task.attempts < task.max_attempts && audit?.status === "running";
     if (retry) {
       this.store.run(

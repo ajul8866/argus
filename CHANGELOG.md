@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- Writable-workspace policy denials fail closed on the first check. A disabled
+  `security.allow_writable_workspace` setting is recorded as
+  `writable_workspace_disabled`, and a missing `allow_writable_workspace`
+  approval as `writable_workspace_not_approved`. Neither failure is retried.
+
 ### Added
 
 - Opt-in writable audit workspaces for authorized penetration testing. The

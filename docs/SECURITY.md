@@ -47,8 +47,11 @@ the audit must request `writable_workspace` when it is created, and every
 harness task in that audit is created in `waiting_approval` with an
 `allow_writable_workspace` decision. A task queues only after every pending
 decision for it is approved. At task start Argus re-checks the global setting
-and the approval; a missing or revoked grant fails the task
-(`writable_workspace_denied`) rather than silently downgrading it to read-only.
+and the approval. A disabled setting fails the task as
+`writable_workspace_disabled`, and a missing or revoked grant fails it as
+`writable_workspace_not_approved`. Either denial is terminal on the first
+check: the task is not requeued, and the workspace is not silently downgraded
+to read-only.
 Only the disposable session copy changes: files become 0600 inside a 0700
 directory, `ARGUS_SCOPE.json` stays 0400, and the Bubblewrap workspace mount
 becomes read-write. The imported repository snapshot stays read-only and quote

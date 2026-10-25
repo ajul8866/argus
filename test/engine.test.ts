@@ -707,7 +707,47 @@ test("a writable workspace task fails closed when its approval is missing", asyn
   await waitFor(() => ["failed", "cancelled"].includes(
     store.get<{ status: string }>("SELECT status FROM tasks WHERE id = ?", taskId)?.status ?? "",
   ), 8_000);
-  expect(store.get("SELECT status, failure_kind FROM tasks WHERE id = ?", taskId))
-    .toMatchObject({ status: "failed", failure_kind: "writable_workspace_denied" });
+  const failed = store.get<{ status: string; failure_kind: string; attempts: number; max_attempts: number; error: string }>(
+    "SELECT status, failure_kind, attempts, max_attempts, error FROM tasks WHERE id = ?", taskId,
+  );
+  expect(failed).toMatchObject({
+    status: "failed",
+    failure_kind: "writable_workspace_not_approved",
+    attempts: 1,
+  });
+  expect(failed!.max_attempts).toBeGreaterThan(failed!.attempts);
+  expect(failed!.error).toContain("no approved allow_writable_workspace decision");
+  expect(store.all("SELECT seq FROM execution_events WHERE task_id = ? AND type = 'task.retry'", taskId)).toHaveLength(0);
+  expect(store.all("SELECT id FROM agent_sessions WHERE task_id = ?", taskId)).toHaveLength(0);
+});
+
+test("a writable workspace task fails closed on the first check when the setting is disabled", async () => {
+  setSetting(store, "security.allow_writable_workspace", false, null);
+  const config = JSON.parse(store.get<{ config: string }>("SELECT config FROM audits WHERE id = ?", auditId)!.config);
+  store.run(
+    "UPDATE audits SET config = ?, status = 'running' WHERE id = ?",
+    toJson({ ...config, writable_workspace: true }),
+    auditId,
+  );
+  const taskId = engine.createTask({
+    auditId, phase: 1, kind: "phase1.map", taskKey: "phase1:writable-disabled",
+    title: "Writable mapper while policy is disabled", payload: {}, agentRole: "codebase_mapper",
+  });
+  store.run("DELETE FROM approvals WHERE task_id = ?", taskId);
+  store.run("UPDATE tasks SET status = 'queued', requires_approval = 0, approval_id = NULL WHERE id = ?", taskId);
+  await waitFor(() => ["failed", "cancelled"].includes(
+    store.get<{ status: string }>("SELECT status FROM tasks WHERE id = ?", taskId)?.status ?? "",
+  ), 8_000);
+  const failed = store.get<{ status: string; failure_kind: string; attempts: number; max_attempts: number; error: string }>(
+    "SELECT status, failure_kind, attempts, max_attempts, error FROM tasks WHERE id = ?", taskId,
+  );
+  expect(failed).toMatchObject({
+    status: "failed",
+    failure_kind: "writable_workspace_disabled",
+    attempts: 1,
+  });
+  expect(failed!.max_attempts).toBeGreaterThan(failed!.attempts);
+  expect(failed!.error).toContain("security.allow_writable_workspace is disabled");
+  expect(store.all("SELECT seq FROM execution_events WHERE task_id = ? AND type = 'task.retry'", taskId)).toHaveLength(0);
   expect(store.all("SELECT id FROM agent_sessions WHERE task_id = ?", taskId)).toHaveLength(0);
 });

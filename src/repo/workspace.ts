@@ -110,10 +110,14 @@ export async function createWorkspace(
   await mkdir(workspace, { recursive: true, mode: 0o700 });
   const scopeMatcher = createScopeMatcher(scope);
   for (const file of inventory.files) {
-    if (!scopeMatcher.matches(file.path)) continue;
-    const target = safeJoin(workspace, file.path);
+    // Scope and the copy destination must use the canonical path. Checking the
+    // raw inventory path would copy `nested/../secret.js` or `././secret.js`
+    // through an exclude on `secret.js`.
+    const normalized = canonicalRelativePath(file.path);
+    if (!scopeMatcher.matches(normalized)) continue;
+    const target = safeJoin(workspace, normalized);
     await mkdir(dirname(target), { recursive: true, mode: 0o700 });
-    const opened = await openRegularFileWithin(repositoryPath, file.path);
+    const opened = await openRegularFileWithin(repositoryPath, normalized);
     try {
       await writeFile(target, Buffer.from(await opened.handle.readFile()), { mode: 0o400 });
     } finally {

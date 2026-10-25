@@ -259,6 +259,39 @@ describe("inventory and evidence gates", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test("workspace copies scope-check the canonical path", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "argus-ws-scope-"));
+    try {
+      const root = join(dir, "repo");
+      await mkdir(join(root, "nested"), { recursive: true });
+      await writeFile(join(root, "secret.js"), "EXCLUDED-SECRET");
+      await writeFile(join(root, "nested", "ok.js"), "visible-file");
+      const scope = { include: ["**/*"], exclude: ["secret.js"] };
+      const workspace = join(dir, "workspace");
+      await createWorkspace(root, {
+        files: [
+          { path: "nested/../secret.js", size: 15, lines: 1, language: "JavaScript", sha256: "abc" },
+          { path: "././secret.js", size: 15, lines: 1, language: "JavaScript", sha256: "abc" },
+          { path: "foo/./../secret.js", size: 15, lines: 1, language: "JavaScript", sha256: "abc" },
+          { path: "nested/../nested/ok.js", size: 12, lines: 1, language: "JavaScript", sha256: "def" },
+        ],
+        skipped: [],
+        languages: {},
+        frameworks: [],
+        endpoints: [],
+        auth_boundaries: [],
+        dependency_graph: [],
+        entrypoints: [],
+        total_bytes: 57,
+        truncated: false,
+      }, scope, workspace, {});
+      await expect(lstat(join(workspace, "secret.js"))).rejects.toThrow();
+      expect(await Bun.file(join(workspace, "nested", "ok.js")).text()).toBe("visible-file");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("repository import", () => {

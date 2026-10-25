@@ -14,6 +14,7 @@ import {
   section,
   statusBadge,
   timeAgo,
+  timelineEntry,
   toast,
 } from "../ui.ts";
 
@@ -124,7 +125,7 @@ export async function renderProjects(root: HTMLElement): Promise<void> {
               ["Run the six phases", "Mapping, discovery, confirmation, findings, retest, reports."],
               ["Review and export", "Inspect provenance, evidence, and limitations."],
             ].map(([title, detail], index) =>
-              h("div", { class: "timeline-item on" },
+              timelineEntry("on",
                 h("div", { class: "small strong" }, `${index + 1}. ${title}`),
                 h("div", { class: "tiny muted" }, detail),
               ),

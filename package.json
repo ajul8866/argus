@@ -1,0 +1,36 @@
+{
+  "name": "argus-audit",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Self-hosted source code security audits with Pi, Claude Code, local Skills, and MCP.",
+  "license": "AGPL-3.0-only",
+  "author": "ajultect and Argus contributors",
+  "homepage": "https://github.com/ajul8866/argus#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ajul8866/argus.git"
+  },
+  "bugs": "https://github.com/ajul8866/argus/issues",
+  "engines": {
+    "bun": ">=1.3.14"
+  },
+  "packageManager": "bun@1.3.14",
+  "type": "module",
+  "scripts": {
+    "start": "bun run scripts/start.ts",
+    "dev": "bun run --watch scripts/start.ts",
+    "build:web": "bun run scripts/build-web.ts",
+    "build": "bun run build:web",
+    "test": "bun test test/unit.test.ts test/auth.test.ts test/engine.test.ts test/local-resources.test.ts test/install.test.ts",
+    "typecheck": "tsc --noEmit",
+    "demo": "bun run scripts/e2e-real.ts",
+    "e2e": "bun run scripts/e2e-real.ts",
+    "harness:check": "bun run scripts/check-harnesses.ts",
+    "check": "bun run typecheck && bun run test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "playwright-core": "^1.64.1",
+    "typescript": "latest"
+  }
+}

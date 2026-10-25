@@ -1,0 +1,42 @@
+services:
+  argus:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: argus
+    init: true
+    ports:
+      - "8787:8787"
+    environment:
+      ARGUS_HOST: 0.0.0.0
+      ARGUS_PORT: 8787
+      ARGUS_DATA_DIR: /data
+      ARGUS_ALLOWED_ROOTS: /srv/authorized-repos:/data/repos
+      ARGUS_ADMIN_EMAIL: ${ARGUS_ADMIN_EMAIL:-admin@argus.local}
+      ARGUS_ADMIN_PASSWORD: ${ARGUS_ADMIN_PASSWORD:?set ARGUS_ADMIN_PASSWORD in .env}
+      ARGUS_SESSION_TTL_HOURS: ${ARGUS_SESSION_TTL_HOURS:-12}
+      ARGUS_MAX_AGENTS: ${ARGUS_MAX_AGENTS:-4}
+      # The container is the isolation boundary in this deployment profile.
+      # Use ARGUS_SANDBOX=bwrap only if the host/container grants user namespaces.
+      ARGUS_SANDBOX: ${ARGUS_SANDBOX:-none}
+      ARGUS_SECURE_COOKIES: ${ARGUS_SECURE_COOKIES:-0}
+      # Harness authentication (preferred in containers). Do not mount whole
+      # host config directories into a workspace-copy container.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+      MCODE_PROVIDER_API_KEY: ${MCODE_PROVIDER_API_KEY:-}
+    volumes:
+      - argus-data:/data
+      - ${ARGUS_REPOS_DIR:-../test/fixtures}:/srv/authorized-repos:ro
+      # Pi model catalog is not a secret. Provider credentials should come from
+      # the environment above or Argus Settings → Credentials.
+      - ${HOME}/.pi/agent/models.json:/root/.pi/agent/models.json:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+volumes:
+  argus-data:

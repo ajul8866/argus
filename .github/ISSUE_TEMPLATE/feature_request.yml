@@ -1,0 +1,17 @@
+name: Feature request
+description: Propose an improvement and the problem it solves.
+title: 'feature: '
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Include an example workflow and any alternatives you considered.
+    validations:
+      required: true

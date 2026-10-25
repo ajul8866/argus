@@ -950,6 +950,11 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
           if (key === "security.allow_shell_tools" && value === true && body.confirm_shell !== true) {
             throw badRequest("Enabling shell tools requires confirm_shell: true and task-level approval");
           }
+          if (key === "security.allow_writable_workspace" && value === true && body.confirm_writable_workspace !== true) {
+            throw badRequest(
+              "Enabling writable audit workspaces requires confirm_writable_workspace: true, a per-audit request, and per-task approval",
+            );
+          }
           const validationError = validateSettingValue(key, value);
           if (validationError) throw badRequest(validationError);
         }
@@ -1376,7 +1381,14 @@ function validateSettingValue(key: string, value: unknown): string | null {
     }
     return null;
   }
-  if (["audit.require_distinct_harness_for_retest", "security.allow_shell_tools", "security.require_approval_for_shell"].includes(key)) {
+  if (
+    [
+      "audit.require_distinct_harness_for_retest",
+      "security.allow_shell_tools",
+      "security.allow_writable_workspace",
+      "security.require_approval_for_shell",
+    ].includes(key)
+  ) {
     return typeof value === "boolean" ? null : `${key} must be a boolean`;
   }
   if (key === "security.sandbox_mode") {

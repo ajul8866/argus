@@ -19,14 +19,14 @@ LLM agents. Use it only on repositories you are authorized to assess.
 
 ## Execution isolation
 
-- Each task gets a fresh read-only workspace copy containing only in-scope
-  files.
+- Each task gets a fresh workspace copy containing only in-scope files. It is
+  read-only by default; write access is an explicitly approved opt-in.
 - Each session gets a sanitized runtime home. Host credential files are not
   mounted into the sandbox.
 - With Bubblewrap available, the harness runs in new PID/IPC/UTS namespaces with
   a cleared environment, a tmpfs `/tmp`, read-only system/harness mounts, and a
-  read-only workspace. Host `$HOME`, Argus data, and other repositories are
-  hidden.
+  read-only workspace unless that task received an approved writable workspace.
+  Host `$HOME`, Argus data, and other repositories are hidden.
 - Without Bubblewrap, the session records `sandbox_mode="workspace-copy"` and a
   warning event. The host/container is then the isolation boundary.
 - Docker Compose uses the container as the boundary and sets
@@ -38,6 +38,25 @@ tool layer: no shell, web fetch/search, write, or MCP tools by default. If an
 operator enables shell tools, the task requires an explicit approval — but the
 shell can then reach anything the sandbox/container allows. Treat this as a
 deliberate high-risk expansion, not a safe default.
+
+**Writable workspaces are a gated exception.** For authorized penetration tests
+that need scratch space, an administrator can enable
+`security.allow_writable_workspace`; the API requires
+`confirm_writable_workspace: true`. Enabling the setting alone grants nothing:
+the audit must request `writable_workspace` when it is created, and every
+harness task in that audit is created in `waiting_approval` with an
+`allow_writable_workspace` decision. A task queues only after every pending
+decision for it is approved. At task start Argus re-checks the global setting
+and the approval; a missing or revoked grant fails the task
+(`writable_workspace_denied`) rather than silently downgrading it to read-only.
+Only the disposable session copy changes: files become 0600 inside a 0700
+directory, `ARGUS_SCOPE.json` stays 0400, and the Bubblewrap workspace mount
+becomes read-write. The imported repository snapshot stays read-only and quote
+verification continues to read from that snapshot, so a writable workspace
+cannot rewrite evidence an agent cites. It does not grant write/edit tools or
+shell; role tool lists and the separate shell approval still apply. Under
+`workspace-copy` mode only file permission bits differ; the host/container
+remains the isolation boundary.
 
 Local Skills/MCP discovery reads known client configuration locations without
 executing their commands. Skills have no role grants initially. Administrators
@@ -92,6 +111,10 @@ absence of vulnerabilities. Human review is required.
 - Any role with shell tools causes tasks to be created in
   `waiting_approval`; an administrator must decide. Denial cancels the task.
   There is no implicit approval and no fallback to an unrestricted mode.
+- `security.allow_writable_workspace` is false by default and follows the same
+  shape: administrator confirmation, an explicit per-audit request, and a
+  per-task `allow_writable_workspace` approval. A task that requests both shell
+  tools and write access needs both decisions before it can queue.
 - MCP access is an administrator-managed role/skill grant, separate from the
   per-task shell approval mechanism. Access changes are recorded in the audit
   log; observed tool starts retain session/task/role provenance. Discovery does

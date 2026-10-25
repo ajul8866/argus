@@ -12,7 +12,7 @@ import { AuditEngine } from "../src/orchestrator/engine.ts";
 import { EvidenceStore } from "../src/orchestrator/evidence.ts";
 import { ReportService } from "../src/reports/generator.ts";
 import { buildInventory } from "../src/repo/inventory.ts";
-import { seedDefaults } from "../src/settings.ts";
+import { seedDefaults, setSetting } from "../src/settings.ts";
 import { now, toJson, uid } from "../src/util.ts";
 import { LocalCatalog } from "../src/local/catalog.ts";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -657,3 +657,57 @@ for (const cap of [0, 1]) {
     }
   }, 30_000);
 }
+
+test("an audit cannot request a writable workspace while the policy is disabled", () => {
+  expect(() => engine.createAudit({
+    projectId: "p1", repositoryId: "r1", userId: "u1",
+    overrides: { writable_workspace: true },
+  })).toThrow("security.allow_writable_workspace is disabled");
+});
+
+test("writable workspace tasks need a dedicated approval and never inherit shell approval", () => {
+  setSetting(store, "security.allow_writable_workspace", true, null);
+  setSetting(store, "security.allow_shell_tools", true, null);
+  setSetting(store, "security.require_approval_for_shell", true, null);
+  store.run("UPDATE agent_defs SET allow_shell = 1 WHERE role = 'codebase_mapper'");
+  const config = JSON.parse(store.get<{ config: string }>("SELECT config FROM audits WHERE id = ?", auditId)!.config);
+  store.run("UPDATE audits SET config = ? WHERE id = ?", toJson({ ...config, writable_workspace: true }), auditId);
+  const taskId = engine.createTask({
+    auditId, phase: 1, kind: "phase1.map", taskKey: "phase1:writable",
+    title: "Writable mapper", payload: {}, agentRole: "codebase_mapper",
+  });
+  expect(store.get("SELECT status, requires_approval FROM tasks WHERE id = ?", taskId))
+    .toMatchObject({ status: "waiting_approval", requires_approval: 1 });
+  const approvals = store.all<{ id: string; action: string; status: string }>(
+    "SELECT id, action, status FROM approvals WHERE task_id = ? ORDER BY action", taskId,
+  );
+  expect(approvals.map((approval) => approval.action)).toEqual(["allow_shell_tools", "allow_writable_workspace"]);
+  const shell = approvals.find((approval) => approval.action === "allow_shell_tools")!;
+  const writable = approvals.find((approval) => approval.action === "allow_writable_workspace")!;
+  engine.decideApproval(shell.id, true, "u1", "shell approved");
+  expect(store.get("SELECT status FROM tasks WHERE id = ?", taskId)).toMatchObject({ status: "waiting_approval" });
+  engine.decideApproval(writable.id, true, "u1", "writes approved");
+  expect(store.get("SELECT status FROM tasks WHERE id = ?", taskId)).toMatchObject({ status: "queued" });
+});
+
+test("a writable workspace task fails closed when its approval is missing", async () => {
+  setSetting(store, "security.allow_writable_workspace", true, null);
+  const config = JSON.parse(store.get<{ config: string }>("SELECT config FROM audits WHERE id = ?", auditId)!.config);
+  store.run(
+    "UPDATE audits SET config = ?, status = 'running' WHERE id = ?",
+    toJson({ ...config, writable_workspace: true }),
+    auditId,
+  );
+  const taskId = engine.createTask({
+    auditId, phase: 1, kind: "phase1.map", taskKey: "phase1:writable-fail-closed",
+    title: "Writable mapper without approval", payload: {}, agentRole: "codebase_mapper",
+  });
+  store.run("DELETE FROM approvals WHERE task_id = ?", taskId);
+  store.run("UPDATE tasks SET status = 'queued', requires_approval = 0, approval_id = NULL WHERE id = ?", taskId);
+  await waitFor(() => ["failed", "cancelled"].includes(
+    store.get<{ status: string }>("SELECT status FROM tasks WHERE id = ?", taskId)?.status ?? "",
+  ), 8_000);
+  expect(store.get("SELECT status, failure_kind FROM tasks WHERE id = ?", taskId))
+    .toMatchObject({ status: "failed", failure_kind: "writable_workspace_denied" });
+  expect(store.all("SELECT id FROM agent_sessions WHERE task_id = ?", taskId)).toHaveLength(0);
+});

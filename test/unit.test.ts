@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
+import { stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Config } from "../src/config.ts";
@@ -10,7 +11,7 @@ import { buildFallbackPdf } from "../src/reports/pdf.ts";
 import { EvidenceStore } from "../src/orchestrator/evidence.ts";
 import { buildInventory, gitInfo } from "../src/repo/inventory.ts";
 import { importRepository } from "../src/repo/import.ts";
-import { verifyQuote } from "../src/repo/workspace.ts";
+import { createWorkspace, verifyQuote } from "../src/repo/workspace.ts";
 import { createScopeMatcher, globToRegExp, matchesScope, extractJson, sha256 } from "../src/util.ts";
 import { redactSecrets } from "../src/security/redact.ts";
 import { credentialEnvironment, decryptSecret, encryptSecret, type StoredCredential } from "../src/security/credentials.ts";
@@ -277,6 +278,23 @@ describe("repository import", () => {
     await expect(importRepository({ config, store }, { ...project, scope_include: "[]" }, null, "tester"))
       .rejects.toThrow("No in-scope files were found");
     expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+  });
+
+  test("workspaces are read-only by default and owner-writable only on explicit request", async () => {
+    const scope = { include: ["**/*.js", "**/*.json", "README.md"], exclude: ["src/routes/media.js"] };
+    const inventory = await buildInventory(fixture, { scope, maxFiles: 100, maxFileBytes: 1_000_000 });
+    const readOnly = join(dir, "workspace-read-only");
+    const writable = join(dir, "workspace-writable");
+    await createWorkspace(fixture, inventory, scope, readOnly, {});
+    await createWorkspace(fixture, inventory, scope, writable, {}, true);
+
+    expect((await stat(join(readOnly, "src/lib/db.js"))).mode & 0o777).toBe(0o400);
+    expect((await stat(join(writable, "src/lib/db.js"))).mode & 0o777).toBe(0o600);
+    expect((await stat(readOnly)).mode & 0o777).toBe(0o700);
+    expect((await stat(writable)).mode & 0o777).toBe(0o700);
+    expect((await stat(join(writable, "ARGUS_SCOPE.json"))).mode & 0o777).toBe(0o400);
+    expect((await Bun.file(join(readOnly, "ARGUS_SCOPE.json")).json()).writable).toBe(false);
+    expect((await Bun.file(join(writable, "ARGUS_SCOPE.json")).json()).writable).toBe(true);
   });
 });
 

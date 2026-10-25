@@ -57,6 +57,8 @@ export type HarnessTask = {
   resumeSessionRef?: string | null;
   metadata?: Record<string, unknown>;
   resources?: SessionResources;
+  /** Set only when an administrator-approved writable workspace was granted for this task. */
+  workspaceWritable?: boolean;
 };
 
 export type HarnessUsage = {

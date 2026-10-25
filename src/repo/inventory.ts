@@ -1,19 +1,25 @@
-import { readdir, readFile, stat } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open, readdir } from "node:fs/promises";
 import { extname, join, relative } from "node:path";
 import { createScopeMatcher, normalizePath, sha256, toJson, truncate } from "../util.ts";
 import type { Scope } from "../util.ts";
 
+// Directory and dotenv patterns match at any depth. A root-only glob such as
+// `node_modules/**` or `.env` would leave `app/node_modules` and `app/.env`
+// in the snapshot, where a wider project scope can still read them. The
+// `.env.*` file glob does not cover a directory such as `app/.env.local/token`;
+// `**/.env.*/**` does. Dotenv globs are also matched case-insensitively.
 export const DEFAULT_EXCLUDES = [
-  ".git/**",
-  "node_modules/**",
-  "vendor/**",
-  "dist/**",
-  "build/**",
-  "out/**",
-  "coverage/**",
-  "target/**",
-  ".next/**",
-  ".nuxt/**",
+  "**/.git/**",
+  "**/node_modules/**",
+  "**/vendor/**",
+  "**/dist/**",
+  "**/build/**",
+  "**/out/**",
+  "**/coverage/**",
+  "**/target/**",
+  "**/.next/**",
+  "**/.nuxt/**",
   "**/*.min.js",
   "**/*.map",
   "**/*.lock",
@@ -32,8 +38,10 @@ export const DEFAULT_EXCLUDES = [
   "**/*.dll",
   "**/*.exe",
   "**/*.bin",
-  ".env",
-  ".env.*",
+  "**/.env",
+  "**/.env.*",
+  "**/.env/**",
+  "**/.env.*/**",
 ];
 
 const LANGUAGE_BY_EXT: Record<string, string> = {
@@ -170,6 +178,7 @@ export async function buildInventory(root: string, options: InventoryOptions): P
   const languages: Record<string, number> = {};
   let totalBytes = 0;
   let truncated = false;
+  const textByPath = new Map<string, string>();
 
   const visit = async (directory: string): Promise<void> => {
     if (files.length >= options.maxFiles) {
@@ -198,20 +207,31 @@ export async function buildInventory(root: string, options: InventoryOptions): P
         truncated = true;
         break;
       }
-      const stats = await stat(absolute);
+      const stats = await lstat(absolute);
+      if (stats.isSymbolicLink()) {
+        skipped.push({ path: rel, reason: "symlink" });
+        continue;
+      }
+      if (!stats.isFile()) continue;
       if (stats.size > options.maxFileBytes) {
         skipped.push({ path: rel, reason: `larger than ${options.maxFileBytes} bytes` });
         continue;
       }
       let content: Buffer;
       try {
-        content = Buffer.from(await readFile(absolute));
+        const handle = await open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+          content = Buffer.from(await handle.readFile());
+        } finally {
+          await handle.close();
+        }
       } catch {
         skipped.push({ path: rel, reason: "unreadable" });
         continue;
       }
       const language = languageFor(rel);
       const text = isTextFile(rel) ? content.toString("utf8") : "";
+      if (isTextFile(rel)) textByPath.set(rel, text);
       const lineCount = text ? text.split("\n").length : 0;
       files.push({
         path: rel,
@@ -226,15 +246,6 @@ export async function buildInventory(root: string, options: InventoryOptions): P
   };
 
   await visit(root);
-  const textByPath = new Map<string, string>();
-  for (const file of files) {
-    if (!isTextFile(file.path)) continue;
-    try {
-      textByPath.set(file.path, await readFile(join(root, file.path), "utf8"));
-    } catch {
-      // File changed between listing and read; the hash in the inventory is authoritative.
-    }
-  }
 
   return {
     files,

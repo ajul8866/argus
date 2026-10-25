@@ -127,7 +127,14 @@ export function globToRegExp(glob: string): RegExp {
     i += 1;
   }
   out += "$";
-  return new RegExp(out);
+  return new RegExp(out, globFlags(normalized));
+}
+
+// Dotenv excludes are case-insensitive. Repositories committed on Windows or
+// written for Docker often use `.ENV` or `.Env.local`, and a case-sensitive
+// glob would leave those files in the snapshot.
+function globFlags(glob: string): string {
+  return /^(?:\*\*\/)?\.env(?:$|\.|\/)/.test(glob) ? "i" : "";
 }
 
 export type Scope = { include: string[]; exclude: string[] };

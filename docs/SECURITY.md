@@ -9,11 +9,22 @@ LLM agents. Use it only on repositories you are authorized to assess.
 - The source path is canonicalized with `realpath` and checked against
   `ARGUS_ALLOWED_ROOTS` on create/import and again when a workspace/evidence
   file is opened.
-- Scope globs are enforced before file copy, in inventory, in explorer/file
-  APIs, and in excerpt verification. Prompt text is never the authorization
-  boundary.
-- Only regular files are imported; symlinks are skipped. Files larger than the
-  cap are skipped and recorded.
+- Scope globs are enforced on the normalized relative path before file copy,
+  in inventory, in explorer/file APIs, and in excerpt verification. `.` and
+  `..` segments are resolved first, and a path that leaves the snapshot is
+  rejected, so an exclude cannot be bypassed with a dotted path. Prompt text
+  is never the authorization boundary.
+- Only regular files are imported. Symlinks are skipped during inventory and
+  removed from git-archive snapshots before that snapshot is stored. The
+  archive is then reduced to the import scope, including the built-in
+  excludes. Those excludes match nested paths, so `app/.env`, `app/.env.local`,
+  `app/.env.local/token`, and `app/node_modules/**` are removed along with the
+  same names at the repository root. Dotenv names match any capitalization, so
+  `app/.ENV` and `app/.Env.local/token` are removed as well. File reads do not follow a final symlink, and a file whose
+  resolved location differs from the normalized path is rejected. Files larger
+  than the cap are skipped and recorded. An in-scope file above that cap is
+  omitted from the inventory but can remain in a git snapshot and be read with
+  project scope; a worktree snapshot does not copy it.
 - An immutable snapshot is created at import, so later edits to the original
   worktree cannot change what the evidence refers to.
 

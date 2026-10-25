@@ -5,7 +5,7 @@ import type { Store } from "../db/index.ts";
 import { runCommand } from "../harness/process.ts";
 import { badRequest, now, parseJson, toJson, uid } from "../util.ts";
 import { DEFAULT_EXCLUDES, buildInventory, gitInfo } from "./inventory.ts";
-import { assertAuthorizedRoot, createWorkspace, removeSymlinks } from "./workspace.ts";
+import { assertAuthorizedRoot, createWorkspace, removeOutOfScope, removeSymlinks } from "./workspace.ts";
 
 export async function importRepository(
   deps: { config: Config; store: Store },
@@ -60,7 +60,11 @@ export async function importRepository(
     if (archived.code !== 0) {
       throw badRequest(`Failed to archive ${ref}: ${archived.stderr.slice(0, 500)}`);
     }
+    // Archive extracts the whole commit, including files rejected by the import
+    // scope. Remove symlinks first, then drop the remaining out-of-scope files
+    // so a later read with a wider project scope cannot recover them.
     await removeSymlinks(snapshotBase);
+    await removeOutOfScope(snapshotBase, scope);
     importRoot = snapshotBase;
     branch = ref;
   } else {

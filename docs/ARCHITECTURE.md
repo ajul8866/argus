@@ -198,9 +198,9 @@ operation, preserving include/exclude short-circuit behavior.
 2. Import builds an inventory using include/exclude globs. Only regular files
    (no symlinks) within scope and size caps are included.
 3. A snapshot is copied under `$ARGUS_DATA_DIR/repos/<project>/<id>`. A git
-   ref is archived as the resolved commit, symlinks are removed, and the
-   inventory is rebuilt from that snapshot. A worktree import copies only
-   in-scope regular files.
+   ref is archived as the resolved commit, symlinks and files outside the
+   import scope are removed, and the inventory is rebuilt from that snapshot.
+   A worktree import copies only in-scope regular files.
 4. Each task gets a fresh read-only copy under
    `$ARGUS_DATA_DIR/workspaces/<audit>/<session>`.
 5. If Bubblewrap is available, the harness runs with a new session, new PID/IPC/

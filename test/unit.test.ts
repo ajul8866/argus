@@ -409,6 +409,55 @@ describe("repository import", () => {
     await expect(readScopedFile(archived.path, "linkdir/master.key", scope)).rejects.toMatchObject({ code: "not_found" });
     expect(await readScopedFile(archived.path, "nested/ok.js", scope)).toMatchObject({ content: "visible-file" });
   });
+
+  test("git ref snapshots do not keep default-excluded files that project scope would allow", async () => {
+    const source = join(dir, "env-source");
+    await mkdir(join(source, "nested"), { recursive: true });
+    const secret = "AWS_SECRET_ACCESS_KEY=SUPERSECRETVALUE123456";
+    await writeFile(join(source, ".env"), secret);
+    await writeFile(join(source, "secret.js"), "EXCLUDED-SECRET");
+    await writeFile(join(source, "ok.js"), "visible-file");
+    await writeFile(join(source, "nested", "keep.js"), "nested-visible");
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: "Argus Test",
+      GIT_AUTHOR_EMAIL: "test@argus.local",
+      GIT_COMMITTER_NAME: "Argus Test",
+      GIT_COMMITTER_EMAIL: "test@argus.local",
+    };
+    for (const args of [["init", "-b", "main"], ["add", "-A"], ["commit", "-m", "init"]] as const) {
+      const result = await runCommand(["git", "-C", source, ...args], { env });
+      if (result.code !== 0) throw new Error(result.stderr || result.stdout);
+    }
+    const committed = await runCommand(["git", "-C", source, "ls-files"], { env });
+    expect(committed.stdout.split("\n")).toContain(".env");
+    const scoped = {
+      id: "p-env",
+      name: "Env",
+      source_path: source,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: JSON.stringify(["secret.js"]),
+    };
+    store.run(
+      `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+       VALUES (?, ?, '', ?, ?, ?, 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+      scoped.id, scoped.name, scoped.source_path, scoped.scope_include, scoped.scope_exclude,
+    );
+    const projectScope = { include: ["**/*"], exclude: ["secret.js"] };
+    const archived = await importRepository({ config, store }, scoped, "HEAD", "tester@argus.local");
+    const row = store.get<{ inventory: string }>("SELECT inventory FROM repositories WHERE id = ?", archived.id)!;
+    const inventory = JSON.parse(row.inventory) as { files: Array<{ path: string }> };
+    expect(inventory.files.map((file) => file.path).sort()).toEqual(["nested/keep.js", "ok.js"]);
+    await expect(lstat(join(archived.path, ".env"))).rejects.toThrow();
+    await expect(lstat(join(archived.path, "secret.js"))).rejects.toThrow();
+    await expect(readScopedFile(archived.path, ".env", projectScope)).rejects.toMatchObject({ code: "not_found" });
+    expect(await verifyQuote(archived.path, projectScope, { path: ".env", quote: secret })).toMatchObject({ found: false });
+    expect(await readScopedFile(archived.path, "ok.js", projectScope)).toMatchObject({ content: "visible-file" });
+    expect(await readScopedFile(archived.path, "nested/keep.js", projectScope)).toMatchObject({ content: "nested-visible" });
+    const worktree = await importRepository({ config, store }, scoped, null, "tester@argus.local");
+    await expect(lstat(join(worktree.path, ".env"))).rejects.toThrow();
+    await expect(readScopedFile(worktree.path, ".env", projectScope)).rejects.toMatchObject({ code: "not_found" });
+  });
 });
 
 describe("evidence chain", () => {

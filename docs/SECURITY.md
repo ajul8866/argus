@@ -15,8 +15,10 @@ LLM agents. Use it only on repositories you are authorized to assess.
   rejected, so an exclude cannot be bypassed with a dotted path. Prompt text
   is never the authorization boundary.
 - Only regular files are imported. Symlinks are skipped during inventory and
-  removed from git-archive snapshots before that snapshot is stored. File
-  reads do not follow a final symlink, and a file whose resolved location
+  removed from git-archive snapshots before that snapshot is stored. The
+  archive is then reduced to the import scope, including the built-in
+  excludes, so a file that was not inventoried is not left in the snapshot.
+  File reads do not follow a final symlink, and a file whose resolved location
   differs from the normalized path is rejected. Files larger than the cap are
   skipped and recorded.
 - An immutable snapshot is created at import, so later edits to the original

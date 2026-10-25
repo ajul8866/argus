@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readdir, realpath, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readdir, realpath, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { AppError, badRequest, createScopeMatcher, matchesScope, normalizePath, safeJoin } from "../util.ts";
 import type { Scope } from "../util.ts";
 import type { Inventory } from "./inventory.ts";
@@ -97,6 +97,59 @@ export async function removeSymlinks(root: string): Promise<number> {
     }
   };
   await visit(root);
+  return removed;
+}
+
+/**
+ * Delete files a git archive extracted that the import scope does not allow.
+ * The archive contains the whole commit, including built-in excludes such as
+ * `.env`. Project scope used by later reads can be wider than that import
+ * scope, so those files must not remain in the snapshot. Symlinks are
+ * unlinked and never followed.
+ */
+export async function removeOutOfScope(root: string, scope: Scope): Promise<number> {
+  const matcher = createScopeMatcher(scope);
+  let rootReal: string;
+  try {
+    rootReal = await realpath(root);
+  } catch {
+    throw new AppError(400, "invalid_repository", "Repository path does not exist");
+  }
+  let removed = 0;
+  const relativeInside = (absolute: string): string => {
+    const lexical = relative(rootReal, absolute);
+    if (!lexical || lexical === ".." || lexical.startsWith("../") || lexical.startsWith(`..${sep}`)) {
+      throw new AppError(500, "snapshot_escape", "Refusing to modify a path outside the snapshot");
+    }
+    return normalizePath(lexical);
+  };
+  const visit = async (directory: string): Promise<void> => {
+    const names = await readdir(directory);
+    for (const name of names) {
+      const absolute = join(directory, name);
+      const info = await lstat(absolute);
+      const rel = relativeInside(absolute);
+      const escaped = rel.split("/").includes("..");
+      if (info.isSymbolicLink()) {
+        await unlink(absolute);
+        removed += 1;
+        continue;
+      }
+      if (info.isDirectory()) {
+        await visit(absolute);
+        if ((await readdir(absolute)).length === 0) {
+          await rmdir(absolute);
+          removed += 1;
+        }
+        continue;
+      }
+      if (!info.isFile() || !rel || escaped || !matcher.matches(rel)) {
+        await unlink(absolute);
+        removed += 1;
+      }
+    }
+  };
+  await visit(rootReal);
   return removed;
 }
 

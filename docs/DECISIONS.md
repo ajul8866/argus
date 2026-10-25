@@ -57,11 +57,12 @@ suite asserts report creation happens after the last retest.
 
 ## Repository handling
 
-**Immutable snapshots.** Import copies only in-scope files into an immutable
-snapshot (or `git archive` for a ref) and rebuilds the inventory there. This
-prevents a later worktree edit from invalidating evidence. The original commit
-and branch are recorded; uncommitted worktree state is represented by the file
-hashes in the inventory.
+**Immutable snapshots.** Import stores only in-scope files in an immutable
+snapshot and rebuilds the inventory there. A git ref is archived, then
+symlinks and out-of-scope files are removed before that inventory is built.
+This prevents a later worktree edit from invalidating evidence. The original
+commit and branch are recorded; uncommitted worktree state is represented by
+the file hashes in the inventory.
 
 **Scope is a platform boundary.** The prompt tells the agent what it is doing,
 but the workspace, explorer, and evidence checker independently enforce scope.

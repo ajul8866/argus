@@ -9,7 +9,7 @@ import { KeyedSerialQueue } from "../src/concurrency.ts";
 import { Store } from "../src/db/index.ts";
 import { buildFallbackPdf } from "../src/reports/pdf.ts";
 import { EvidenceStore } from "../src/orchestrator/evidence.ts";
-import { buildInventory, gitInfo } from "../src/repo/inventory.ts";
+import { buildInventory, DEFAULT_EXCLUDES, gitInfo } from "../src/repo/inventory.ts";
 import { importRepository } from "../src/repo/import.ts";
 import { createWorkspace, readScopedFile, verifyQuote } from "../src/repo/workspace.ts";
 import { runCommand } from "../src/harness/process.ts";
@@ -49,6 +49,31 @@ describe("scope and parsing", () => {
     expect(globToRegExp("src/*.js").test("src/lib/db.js")).toBe(false);
     expect(matchesScope("src/server.js", { include: ["**/*.js"], exclude: ["src/lib/**"] })).toBe(true);
     expect(matchesScope("src/lib/db.js", { include: ["**/*.js"], exclude: ["src/lib/**"] })).toBe(false);
+  });
+
+  test("default excludes match nested env files and dependency directories", () => {
+    const scope = { include: ["**/*"], exclude: DEFAULT_EXCLUDES };
+    const excluded = [
+      ".env",
+      ".env.production",
+      ".env/secret",
+      "app/.env",
+      "app/.env.local",
+      "services/api/.env/token",
+      "node_modules/leftpad/index.js",
+      "app/node_modules/leftpad/index.js",
+      "app/dist/bundle.js",
+      "svc/target/secret.txt",
+      "web/.next/cache.js",
+      "pkg/vendor/lib.php",
+      "app/build/out.js",
+      "cover/coverage/lcov.info",
+    ];
+    for (const path of excluded) expect(matchesScope(path, scope)).toBe(false);
+    expect(matchesScope("src/ok.js", scope)).toBe(true);
+    expect(matchesScope("src/node_modules_utils.js", scope)).toBe(true);
+    expect(matchesScope(".environment", scope)).toBe(true);
+    expect(matchesScope("src/distribution/notes.js", scope)).toBe(true);
   });
 
   test("reusable scope matching preserves glob semantics and path normalization", () => {
@@ -457,6 +482,60 @@ describe("repository import", () => {
     const worktree = await importRepository({ config, store }, scoped, null, "tester@argus.local");
     await expect(lstat(join(worktree.path, ".env"))).rejects.toThrow();
     await expect(readScopedFile(worktree.path, ".env", projectScope)).rejects.toMatchObject({ code: "not_found" });
+  });
+
+  test("git and worktree snapshots drop nested env files and dependency directories", async () => {
+    const source = join(dir, "nested-excludes");
+    await mkdir(join(source, "app", "node_modules", "leftpad"), { recursive: true });
+    await mkdir(join(source, "app", "dist"), { recursive: true });
+    await mkdir(join(source, "src"), { recursive: true });
+    const secret = "AWS_SECRET_ACCESS_KEY=NESTEDSECRETVALUE123456";
+    await writeFile(join(source, "app", ".env"), secret);
+    await writeFile(join(source, "app", ".env.local"), "LOCAL_TOKEN=nested-local-secret");
+    await writeFile(join(source, "app", "node_modules", "leftpad", "index.js"), "module.exports=1");
+    await writeFile(join(source, "app", "dist", "bundle.js"), "DIST-BUNDLE");
+    await writeFile(join(source, "src", "ok.js"), "console.log('ok')");
+    await writeFile(join(source, "src", "node_modules_utils.js"), "export const kept = true");
+    const env = {
+      ...process.env,
+      GIT_AUTHOR_NAME: "Argus Test",
+      GIT_AUTHOR_EMAIL: "test@argus.local",
+      GIT_COMMITTER_NAME: "Argus Test",
+      GIT_COMMITTER_EMAIL: "test@argus.local",
+    };
+    for (const args of [["init", "-b", "main"], ["add", "-A"], ["commit", "-m", "init"]] as const) {
+      const result = await runCommand(["git", "-C", source, ...args], { env });
+      if (result.code !== 0) throw new Error(result.stderr || result.stdout);
+    }
+    const scoped = {
+      id: "p-nested",
+      name: "Nested",
+      source_path: source,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: JSON.stringify([]),
+    };
+    store.run(
+      `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+       VALUES (?, ?, '', ?, ?, ?, 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+      scoped.id, scoped.name, scoped.source_path, scoped.scope_include, scoped.scope_exclude,
+    );
+    const projectScope = { include: ["**/*"], exclude: [] as string[] };
+    const archived = await importRepository({ config, store }, scoped, "HEAD", "tester@argus.local");
+    const row = store.get<{ inventory: string }>("SELECT inventory FROM repositories WHERE id = ?", archived.id)!;
+    const inventory = JSON.parse(row.inventory) as { files: Array<{ path: string }> };
+    expect(inventory.files.map((file) => file.path).sort()).toEqual(["src/node_modules_utils.js", "src/ok.js"]);
+    for (const rel of ["app/.env", "app/.env.local", "app/node_modules/leftpad/index.js", "app/dist/bundle.js"]) {
+      await expect(lstat(join(archived.path, rel))).rejects.toThrow();
+      await expect(readScopedFile(archived.path, rel, projectScope)).rejects.toMatchObject({ code: "not_found" });
+    }
+    expect(await verifyQuote(archived.path, projectScope, { path: "app/.env", quote: secret })).toMatchObject({ found: false });
+    expect(await readScopedFile(archived.path, "src/ok.js", projectScope)).toMatchObject({ content: "console.log('ok')" });
+    expect(await readScopedFile(archived.path, "src/node_modules_utils.js", projectScope)).toMatchObject({ content: "export const kept = true" });
+    const worktree = await importRepository({ config, store }, scoped, null, "tester@argus.local");
+    await expect(lstat(join(worktree.path, "app", ".env"))).rejects.toThrow();
+    await expect(readScopedFile(worktree.path, "app/.env", projectScope)).rejects.toMatchObject({ code: "not_found" });
+    await expect(lstat(join(worktree.path, "app", "node_modules", "leftpad", "index.js"))).rejects.toThrow();
+    expect(await readScopedFile(worktree.path, "src/ok.js", projectScope)).toMatchObject({ content: "console.log('ok')" });
   });
 });
 

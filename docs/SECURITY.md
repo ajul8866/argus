@@ -17,10 +17,13 @@ LLM agents. Use it only on repositories you are authorized to assess.
 - Only regular files are imported. Symlinks are skipped during inventory and
   removed from git-archive snapshots before that snapshot is stored. The
   archive is then reduced to the import scope, including the built-in
-  excludes, so a file that was not inventoried is not left in the snapshot.
-  File reads do not follow a final symlink, and a file whose resolved location
-  differs from the normalized path is rejected. Files larger than the cap are
-  skipped and recorded.
+  excludes. Those excludes match nested paths, so `app/.env`, `app/.env.local`,
+  and `app/node_modules/**` are removed along with the same names at the
+  repository root. File reads do not follow a final symlink, and a file whose
+  resolved location differs from the normalized path is rejected. Files larger
+  than the cap are skipped and recorded. An in-scope file above that cap is
+  omitted from the inventory but can remain in a git snapshot and be read with
+  project scope; a worktree snapshot does not copy it.
 - An immutable snapshot is created at import, so later edits to the original
   worktree cannot change what the evidence refers to.
 

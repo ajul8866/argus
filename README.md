@@ -8,7 +8,7 @@ sessions, and export reports with source excerpts and traceable evidence.
 Your local Skills and MCP configuration are discovered automatically.
 
 [![Release](https://img.shields.io/github/v/release/ajul8866/argus?color=39c5ac)](https://github.com/ajul8866/argus/releases)
-[![CI](https://github.com/ajul8866/argus/actions/workflows/ci.yml/badge.svg)](https://github.com/ajul8866/argus/actions/workflows/ci.yml)
+[![Bun](https://img.shields.io/badge/Bun-1.3.14%2B-f9f1e1?logo=bun&logoColor=000)](https://bun.com/docs/installation)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 
 [Quick start](#quick-start) · [Skills & MCP](#local-skills-and-mcp) · [Documentation](#documentation) · [Contribute](#contributing)

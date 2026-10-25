@@ -21,7 +21,7 @@
     "dev": "bun run --watch scripts/start.ts",
     "build:web": "bun run scripts/build-web.ts",
     "build": "bun run build:web",
-    "test": "bun test test/unit.test.ts test/auth.test.ts test/engine.test.ts test/local-resources.test.ts test/install.test.ts",
+    "test": "bun test test/unit.test.ts test/auth.test.ts test/engine.test.ts test/local-resources.test.ts test/install.test.ts test/web-shell.test.ts",
     "typecheck": "tsc --noEmit",
     "demo": "bun run scripts/e2e-real.ts",
     "e2e": "bun run scripts/e2e-real.ts",

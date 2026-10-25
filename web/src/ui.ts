@@ -62,6 +62,7 @@ const iconPaths: Record<string, string> = {
   skills: "M10 5v12 M10 5C8 3 5 3 2.5 4v12c2.5-1 5.5-1 7.5 1 M10 5c2-2 5-2 7.5-1v12c-2.5-1-5.5-1-7.5 1",
   mcp: "M6 2v5 M14 2v5 M4 7h12v3a6 6 0 0 1-6 6v2 M4 7v3a6 6 0 0 0 6 6",
   tasks: "M8 4h9 M8 10h9 M8 16h9 M2 4l1 1 2-2 M2 10l1 1 2-2 M2 16l1 1 2-2",
+  menu: "M3 5h14 M3 10h14 M3 15h14",
   findings: "M4 18V3 M4 3h12l-2 4 2 4H4",
   reports: "M4 2h8l4 4v12H4z M12 2v4h4 M7 10h6 M7 14h6",
   settings: "M3 5h8 M15 5h2 M3 15h2 M9 15h8 M11 2h4v6h-4z M5 12h4v6H5z",

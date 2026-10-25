@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Config } from "../config.ts";
 import { APP_NAME, APP_VERSION, REPORT_DIR } from "../config.ts";
@@ -98,11 +98,29 @@ export class ReportService {
 
   private async renderPdf(data: ReportData, html: string, markdown: string): Promise<Uint8Array> {
     const directory = join(REPORT_DIR(this.config), data.audit.id);
-    const htmlPath = join(directory, `.render-${uid()}.html`);
-    const pdfPath = join(directory, `.render-${uid()}.pdf`);
+    const renderId = uid();
+    const htmlPath = join(directory, `.render-${renderId}.html`);
+    const pdfPath = join(directory, `.render-${renderId}.pdf`);
+    const home = join(directory, `.chrome-${renderId}`);
+    await mkdir(home, { recursive: true, mode: 0o700 });
     await writeFile(htmlPath, html, { mode: 0o600 });
+    let proc: ReturnType<typeof Bun.spawn> | null = null;
+    const stop = async (): Promise<void> => {
+      if (!proc) return;
+      const running = proc;
+      proc = null;
+      try {
+        running.kill("SIGKILL");
+      } catch {
+        // The browser already exited.
+      }
+      await running.exited.catch(() => undefined);
+    };
     try {
-      const proc = Bun.spawn(
+      // Chrome writes the PDF and then can stay alive on D-Bus or crashpad.
+      // A private profile keeps it off the operator's browser data, and the
+      // file is accepted once it is a stable complete PDF.
+      proc = Bun.spawn(
         [
           this.config.chromeBin,
           "--headless=new",
@@ -110,22 +128,56 @@ export class ReportService {
           "--no-sandbox",
           "--disable-dev-shm-usage",
           "--no-pdf-header-footer",
+          "--no-first-run",
+          "--disable-extensions",
+          "--disable-breakpad",
+          "--disable-crash-reporter",
+          "--disable-background-networking",
+          `--user-data-dir=${home}`,
           `--print-to-pdf=${pdfPath}`,
           `file://${htmlPath}`,
         ],
-        { stdout: "ignore", stderr: "ignore", env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } },
+        {
+          stdout: "ignore",
+          stderr: "ignore",
+          env: {
+            PATH: process.env.PATH ?? "/usr/bin:/bin",
+            HOME: home,
+            TMPDIR: home,
+            XDG_CONFIG_HOME: join(home, ".config"),
+            XDG_CACHE_HOME: join(home, ".cache"),
+          },
+        },
       );
-      const timer = setTimeout(() => proc.kill("SIGKILL"), 90_000);
-      const code = await proc.exited;
-      clearTimeout(timer);
-      if (code === 0) {
-        const bytes = await readFile(pdfPath);
-        if (bytes.length > 1_000 && bytes.subarray(0, 5).toString() === "%PDF-") return bytes;
+      const deadline = Date.now() + 90_000;
+      let previousSize = -1;
+      while (Date.now() < deadline) {
+        const bytes = await readPdfIfPresent(pdfPath);
+        if (bytes && isCompletePdf(bytes) && bytes.length === previousSize) {
+          const stable = new Uint8Array(bytes);
+          await stop();
+          return stable;
+        }
+        previousSize = bytes && isCompletePdf(bytes) ? bytes.length : -1;
+        const exited = await Promise.race([
+          proc.exited.then(() => true),
+          Bun.sleep(100).then(() => false),
+        ]);
+        if (exited) {
+          const finalBytes = await readPdfIfPresent(pdfPath);
+          if (finalBytes && isCompletePdf(finalBytes)) return new Uint8Array(finalBytes);
+          break;
+        }
       }
     } catch {
       // fall through to the dependency-free PDF writer
     } finally {
-      await Promise.allSettled([Bun.file(htmlPath).delete(), Bun.file(pdfPath).delete()]);
+      await stop();
+      await Promise.allSettled([
+        Bun.file(htmlPath).delete(),
+        Bun.file(pdfPath).delete(),
+        rm(home, { recursive: true, force: true }),
+      ]);
     }
     return buildFallbackPdf(this.markdownLines(markdown), `${data.project.name} — Security Audit`);
   }
@@ -777,6 +829,19 @@ ${body}
 
 function extension(format: ReportFormat): string {
   return format === "markdown" ? "md" : format;
+}
+
+async function readPdfIfPresent(path: string): Promise<Uint8Array | null> {
+  try {
+    return await readFile(path);
+  } catch {
+    return null;
+  }
+}
+
+function isCompletePdf(bytes: Uint8Array): boolean {
+  if (bytes.length <= 1_000 || Buffer.from(bytes.subarray(0, 5)).toString() !== "%PDF-") return false;
+  return Buffer.from(bytes.subarray(Math.max(0, bytes.length - 32))).toString().includes("%%EOF");
 }
 
 function escapeHtml(value: string): string {

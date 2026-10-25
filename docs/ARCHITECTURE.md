@@ -167,7 +167,9 @@ This is the step that makes two agreeing LLMs insufficient.
 - JSON with the same structured data and a stable schema identifier.
 - HTML rendered from the redacted Markdown with print styles.
 - PDF via headless Chrome when available, otherwise a dependency-free text PDF
-  writer. Report bytes are hashed and recorded.
+  writer. Chrome gets a temporary profile and is stopped once the PDF file is
+  complete, because the browser process may not exit on its own. Report bytes
+  are hashed and recorded.
 
 ## 3. Persistence and recovery
 
@@ -195,8 +197,10 @@ operation, preserving include/exclude short-circuit behavior.
    `ARGUS_ALLOWED_ROOTS`.
 2. Import builds an inventory using include/exclude globs. Only regular files
    (no symlinks) within scope and size caps are included.
-3. A snapshot is copied under `$ARGUS_DATA_DIR/repos/<project>/<id>` (or a git
-   archive for a ref) and the inventory is rebuilt from the snapshot.
+3. A snapshot is copied under `$ARGUS_DATA_DIR/repos/<project>/<id>`. A git
+   ref is archived as the resolved commit, symlinks are removed, and the
+   inventory is rebuilt from that snapshot. A worktree import copies only
+   in-scope regular files.
 4. Each task gets a fresh read-only copy under
    `$ARGUS_DATA_DIR/workspaces/<audit>/<session>`.
 5. If Bubblewrap is available, the harness runs with a new session, new PID/IPC/

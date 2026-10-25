@@ -242,6 +242,7 @@ export class ClaudeCodeHarnessAdapter implements HarnessAdapter {
       harnessConfig: this.harnessConfig,
       credentialEnv: this.credentialEnv,
       resources: task.resources,
+      workspaceWritable: task.workspaceWritable === true,
     });
 
     let proc: ReturnType<typeof Bun.spawn>;

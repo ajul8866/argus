@@ -15,11 +15,17 @@ function fileList(paths: string[], limit = MAX_PROMPT_FILES): string {
   return `${shown.join("\n")}${paths.length > limit ? `\n… ${paths.length - limit} more files omitted; use find/grep/read to inspect them` : ""}`;
 }
 
-export function mapperSystem(agentInstructions: string, workspace: string, commit: string | null): string {
+function workspaceLine(workspace: string, writable: boolean): string {
+  return writable
+    ? `- Workspace (writable copy, administrator-approved for this task): ${workspace}\n- You may create scratch files inside this workspace only. Never write outside it.`
+    : `- Workspace (read-only copy): ${workspace}`;
+}
+
+export function mapperSystem(agentInstructions: string, workspace: string, commit: string | null, writable: boolean): string {
   return `${agentInstructions}
 
 Task context:
-- Workspace (read-only copy): ${workspace}
+${workspaceLine(workspace, writable)}
 - Repository commit: ${commit ?? "unknown (non-git repository)"}
 - You are phase 1 of a six-phase audit. Do not report vulnerabilities; produce a factual map and focused areas for later research.
 - Only reference files that exist in the workspace file inventory supplied to you.`;
@@ -76,11 +82,11 @@ Rules:
 ${schemaBlock(MAP_SCHEMA)}`;
 }
 
-export function researcherSystem(agentInstructions: string, workspace: string, commit: string | null): string {
+export function researcherSystem(agentInstructions: string, workspace: string, commit: string | null, writable: boolean): string {
   return `${agentInstructions}
 
 Task context:
-- Workspace (read-only copy): ${workspace}
+${workspaceLine(workspace, writable)}
 - Repository commit: ${commit ?? "unknown"}
 - You are phase 2 of a six-phase audit. Investigate exactly one assigned area.
 - Report only concrete, evidence-backed candidates. An empty candidate list with honest limitations is an acceptable result.`;
@@ -134,11 +140,11 @@ Non-negotiable evidence rules:
 ${schemaBlock(DISCOVERY_SCHEMA)}`;
 }
 
-export function validatorSystem(agentInstructions: string, workspace: string, commit: string | null): string {
+export function validatorSystem(agentInstructions: string, workspace: string, commit: string | null, writable: boolean): string {
   return `${agentInstructions}
 
 Task context:
-- Workspace (read-only copy): ${workspace}
+${workspaceLine(workspace, writable)}
 - Repository commit: ${commit ?? "unknown"}
 - You are phase 3 of a six-phase audit and did not discover this candidate.
 - Your job is adversarial validation, not agreement. Refuting an unsupported candidate is a successful outcome.`;
@@ -201,11 +207,11 @@ Independent validation requirements:
 ${schemaBlock(CONFIRMATION_SCHEMA)}`;
 }
 
-export function retestSystem(agentInstructions: string, workspace: string, commit: string | null): string {
+export function retestSystem(agentInstructions: string, workspace: string, commit: string | null, writable: boolean): string {
   return `${agentInstructions}
 
 Task context:
-- Workspace (read-only copy): ${workspace}
+${workspaceLine(workspace, writable)}
 - Repository commit: ${commit ?? "unknown"}
 - You are phase 5 of a six-phase audit. You are independent of the discovery agent and the first validator.
 - You have not been given their verdicts. Re-derive the conclusion from the source and the original evidence.

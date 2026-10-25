@@ -74,8 +74,10 @@ the commit/ref, and rejects empty/invalid snapshots.
 
 Audit overrides: `max_areas`, `max_candidates_per_area`, `max_confirmations`,
 `max_reverifications`, `max_concurrent_agents`,
-`require_distinct_harness_for_retest`, `max_cost_usd`,
-`harness_overrides`.
+`require_distinct_harness_for_retest`, `max_cost_usd`, `harness_overrides`, and
+`writable_workspace`. `writable_workspace: true` is rejected unless
+`security.allow_writable_workspace` is already enabled; it makes every harness
+task require an `allow_writable_workspace` approval.
 
 Task result shape for agent tasks:
 
@@ -129,7 +131,7 @@ stored through `/api/credentials`, not harness env. `bypassPermissions` and
 | Method | Path | Role | Purpose |
 |---|---|---|---|
 | `GET` | `/api/settings` | any | Settings and runtime posture; credential metadata only for admins |
-| `PUT` | `/api/settings` | admin | Whitelisted settings; enabling shell requires `confirm_shell:true`; `security.sandbox_mode` accepts `auto`, `bwrap`, or `none` |
+| `PUT` | `/api/settings` | admin | Whitelisted settings; enabling shell requires `confirm_shell:true`; enabling writable workspaces requires `confirm_writable_workspace:true`; `security.sandbox_mode` accepts `auto`, `bwrap`, or `none` |
 | `GET` | `/api/credentials` | admin | Metadata only |
 | `PUT` | `/api/credentials` | admin | `{provider,env_var,value}`; encrypted |
 | `DELETE` | `/api/credentials/:id` | admin | Delete |

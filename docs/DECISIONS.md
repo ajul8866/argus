@@ -67,9 +67,18 @@ hashes in the inventory.
 but the workspace, explorer, and evidence checker independently enforce scope.
 Files outside the include globs never enter the snapshot.
 
-**Read-only workspaces.** Agents have no write/edit tools by default. The
-workspace is also mounted read-only under Bubblewrap. This deliberately rules
-out exploit execution and repository mutation.
+**Read-only workspaces by default.** Agents have no write/edit tools by
+default. The workspace is also mounted read-only under Bubblewrap. This
+deliberately rules out exploit execution and repository mutation. A writable
+workspace is a gated exception, not a mode switch: it requires the global
+`security.allow_writable_workspace` setting (administrator plus a second
+explicit confirmation), a `writable_workspace` request on the individual
+audit, and an `allow_writable_workspace` approval for every task. The runtime
+re-checks both the setting and the approval at task start and fails the task
+closed if either is missing. Only the disposable session copy becomes
+writable; the imported snapshot remains the quote-verification source, so
+write access cannot forge evidence. Defaults, existing audits, and the
+`workspace-copy` host/container boundary are unchanged.
 
 ## Harnesses
 

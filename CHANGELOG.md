@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Writable-workspace policy denials fail closed on the first check. A disabled
+  `security.allow_writable_workspace` setting is recorded as
+  `writable_workspace_disabled`, and a missing `allow_writable_workspace`
+  approval as `writable_workspace_not_approved`. Neither failure is retried.
+
+### Added
+
+- Opt-in writable audit workspaces for authorized penetration testing. The
+  default stays read-only; enabling requires `security.allow_writable_workspace`
+  with `confirm_writable_workspace`, a per-audit `writable_workspace` request,
+  and a per-task `allow_writable_workspace` approval. The dashboard exposes the
+  policy as a confirmation-gated toggle and offers the per-audit request in the
+  New audit dialog when enabled. The imported snapshot and quote verification
+  remain read-only.
+
 ## [0.0.1](https://github.com/ajul8866/argus/releases/tag/v0.0.1) — 2026-10-25
 
 First public release of Argus.

@@ -225,6 +225,7 @@ export class PiHarnessAdapter implements HarnessAdapter {
       harnessConfig: { ...this.harnessConfig, model: task.model || this.harnessConfig.model },
       credentialEnv: this.credentialEnv,
       resources: task.resources,
+      workspaceWritable: task.workspaceWritable === true,
     });
 
     let proc: ReturnType<typeof Bun.spawn>;

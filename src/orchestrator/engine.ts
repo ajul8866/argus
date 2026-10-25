@@ -196,6 +196,24 @@ type FindingRow = {
 };
 
 const TERMINAL_TASK_STATES = new Set(["completed", "failed", "cancelled", "blocked"]);
+const DETERMINISTIC_TASK_KINDS: Record<string, true> = { "phase4.persist": true, "phase6.report": true };
+/** Terminal on the first check, including the generic fallback kind. */
+const WRITABLE_WORKSPACE_DENIALS = new Set([
+  "writable_workspace_disabled",
+  "writable_workspace_not_approved",
+  "writable_workspace_denied",
+]);
+const NON_RETRYABLE_FAILURES = new Set([
+  "cancelled",
+  "budget_exceeded",
+  "harness_missing",
+  "harness_auth",
+  "shell_tools_disabled",
+  "harness_tool_policy",
+  "audit_closed",
+  "local_resources",
+  ...WRITABLE_WORKSPACE_DENIALS,
+]);
 
 const TASK_SCHEMAS: Record<string, JsonSchema> = {
   "phase1.map": MAP_SCHEMA,
@@ -418,6 +436,14 @@ export class AuditEngine {
         "Import an authorized repository for this project before starting an audit",
       );
     }
+    const writableWorkspace = input.overrides?.writable_workspace === true;
+    if (writableWorkspace && !getSetting(this.store, "security.allow_writable_workspace", false)) {
+      throw new AppError(
+        409,
+        "writable_workspace_disabled",
+        "security.allow_writable_workspace is disabled. An administrator must enable it with explicit confirmation before an audit can request a writable workspace.",
+      );
+    }
     const maxAreas = clamp(
       Number(input.overrides?.max_areas ?? getSetting(this.store, "audit.max_areas", 4)),
       1,
@@ -449,6 +475,7 @@ export class AuditEngine {
         input.overrides?.require_distinct_harness_for_retest ??
           getSetting(this.store, "audit.require_distinct_harness_for_retest", true),
       ),
+      writable_workspace: writableWorkspace,
       max_cost_usd: input.overrides?.max_cost_usd ? Number(input.overrides.max_cost_usd) : null,
       harness_overrides:
         input.overrides?.harness_overrides && typeof input.overrides.harness_overrides === "object"
@@ -635,13 +662,25 @@ export class AuditEngine {
         approvalId,
       );
       if (approval.task_id && approved) {
-        this.store.run(
-          "UPDATE tasks SET status = 'queued' WHERE id = ? AND status = 'waiting_approval'",
+        const pending = this.store.get<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM approvals WHERE task_id = ? AND status = 'pending'",
           approval.task_id,
-        );
+        )?.count ?? 0;
+        if (pending === 0) {
+          this.store.run(
+            "UPDATE tasks SET status = 'queued' WHERE id = ? AND status = 'waiting_approval'",
+            approval.task_id,
+          );
+        }
       }
     });
     if (approval.task_id && !approved) {
+      this.store.run(
+        "UPDATE approvals SET status = 'denied', reason = COALESCE(reason, ?), decided_at = COALESCE(decided_at, ?) WHERE task_id = ? AND status = 'pending'",
+        `Approval denied by ${userId ?? "administrator"}`,
+        now(),
+        approval.task_id,
+      );
       this.finishTaskFailure(approval.task_id, "cancelled", `Approval denied by ${userId ?? "administrator"}`);
     }
     if (approval.audit_id) {
@@ -683,6 +722,7 @@ export class AuditEngine {
     let model: string | null = options.model ?? null;
     let maxAttempts = options.maxAttempts ?? 2;
     let requiresApproval = options.requiresApproval ?? false;
+    const approvalRequests: Array<{ action: string; scope: string }> = [];
     if (options.agentRole) {
       const definition = agentDefinition(this.store, options.agentRole);
       const audit = this.store.get<{ config: string }>("SELECT config FROM audits WHERE id = ?", options.auditId);
@@ -757,9 +797,28 @@ export class AuditEngine {
             `Agent ${definition.role} requests shell tools, but security.allow_shell_tools is disabled. Enable it explicitly and approve the task.`,
           );
         }
-        requiresApproval = requiresApproval || Boolean(getSetting(this.store, "security.require_approval_for_shell", true));
+        if (Boolean(getSetting(this.store, "security.require_approval_for_shell", true))) {
+          requiresApproval = true;
+          approvalRequests.push({
+            action: "allow_shell_tools",
+            scope: `Task ${id} (${options.kind}) requests shell tool execution`,
+          });
+        }
+      }
+      if (DETERMINISTIC_TASK_KINDS[options.kind] !== true && auditConfig.writable_workspace === true) {
+        approvalRequests.push({
+          action: "allow_writable_workspace",
+          scope: `Task ${id} (${options.kind}) requests a writable audit workspace`,
+        });
       }
     }
+    if (requiresApproval && approvalRequests.length === 0) {
+      approvalRequests.push({
+        action: "allow_shell_tools",
+        scope: `Task ${id} (${options.kind}) requests task-level approval`,
+      });
+    }
+    requiresApproval = requiresApproval || approvalRequests.length > 0;
     this.store.transaction(() => {
       this.store.run(
         `INSERT INTO tasks (id, audit_id, phase, kind, task_key, title, status, priority, payload, agent_role, harness, model, attempts, max_attempts, requires_approval, created_at)
@@ -788,17 +847,22 @@ export class AuditEngine {
         );
       }
       if (requiresApproval) {
-        const approvalId = uid();
-        this.store.run(
-          `INSERT INTO approvals (id, audit_id, task_id, action, scope, status, requested_by, created_at)
-           VALUES (?, ?, ?, 'allow_shell_tools', ?, 'pending', NULL, ?)`,
-          approvalId,
-          options.auditId,
-          id,
-          `Task ${id} (${options.kind}) requests shell tool execution`,
-          timestamp,
-        );
-        this.store.run("UPDATE tasks SET approval_id = ? WHERE id = ?", approvalId, id);
+        let primaryApprovalId: string | null = null;
+        for (const request of approvalRequests) {
+          const approvalId = uid();
+          this.store.run(
+            `INSERT INTO approvals (id, audit_id, task_id, action, scope, status, requested_by, created_at)
+             VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?)`,
+            approvalId,
+            options.auditId,
+            id,
+            request.action,
+            request.scope,
+            timestamp,
+          );
+          primaryApprovalId = primaryApprovalId ?? approvalId;
+        }
+        this.store.run("UPDATE tasks SET approval_id = ? WHERE id = ?", primaryApprovalId, id);
       }
     });
     this.events.append({
@@ -992,6 +1056,17 @@ export class AuditEngine {
       this.finishTaskFailure(task.id, "internal", `Agent role ${definition.role} is disabled`);
       return;
     }
+    let writableWorkspace: boolean;
+    try {
+      writableWorkspace = this.resolveWritableWorkspace(task, ctx.auditConfig);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const failureKind = error instanceof AppError && WRITABLE_WORKSPACE_DENIALS.has(error.code)
+        ? error.code
+        : "writable_workspace_denied";
+      this.finishTaskFailure(task.id, failureKind, message);
+      return;
+    }
     const sessionId = uid();
     const timestamp = now();
     const workspace = join(WORKSPACE_DIR(this.config), task.audit_id, sessionId);
@@ -1058,13 +1133,20 @@ export class AuditEngine {
 
     try {
       const workspaceRoot = await assertAuthorizedRoot(ctx.repository.path, this.config.allowedRoots);
-      await createWorkspace(workspaceRoot, ctx.inventory, ctx.scope, workspace, {
-        audit_id: task.audit_id,
-        task_id: task.id,
-        session_id: sessionId,
-        commit: ctx.repository.commit_sha,
-        scope: ctx.scope,
-      });
+      await createWorkspace(
+        workspaceRoot,
+        ctx.inventory,
+        ctx.scope,
+        workspace,
+        {
+          audit_id: task.audit_id,
+          task_id: task.id,
+          session_id: sessionId,
+          commit: ctx.repository.commit_sha,
+          scope: ctx.scope,
+        },
+        writableWorkspace,
+      );
       this.events.append({
         auditId: task.audit_id,
         taskId: task.id,
@@ -1072,6 +1154,7 @@ export class AuditEngine {
         type: "agent.workspace_ready",
         payload: {
           workspace,
+          writable: writableWorkspace,
           file_count: ctx.inventory.files.length,
           summary: inventorySummary(ctx.inventory),
         },
@@ -1120,8 +1203,12 @@ export class AuditEngine {
     }
 
     const schema = TASK_SCHEMAS[task.kind] ?? null;
+    const shellApproval = this.store.get<{ status: string }>(
+      "SELECT status FROM approvals WHERE task_id = ? AND action = 'allow_shell_tools' ORDER BY created_at DESC LIMIT 1",
+      task.id,
+    );
     const tools = this.toolsForHarness(
-      task.requires_approval === 1 && task.approval_id
+      shellApproval?.status === "approved"
         ? [...definition.allowed_tools, harness === "pi" ? "bash" : "Bash"]
         : definition.allowed_tools,
       harness,
@@ -1271,7 +1358,7 @@ export class AuditEngine {
           taskId: task.id,
           role: definition.role,
           prompt,
-          systemPrompt: this.systemPrompt(task, definition, ctx.scope, ctx.repository.commit_sha, workspace) + localResourcePrompt(this.config, sessionId, resources),
+          systemPrompt: this.systemPrompt(task, definition, ctx.scope, ctx.repository.commit_sha, workspace, writableWorkspace) + localResourcePrompt(this.config, sessionId, resources),
           workspace,
           model: task.model,
           provider: harnessConfig(this.store, harness).provider,
@@ -1281,6 +1368,7 @@ export class AuditEngine {
           maxBudgetUsd: definition.budget_usd,
           metadata: { attempt: task.attempts },
           resources,
+          workspaceWritable: writableWorkspace,
         },
         { onEvent, signal },
       );
@@ -1411,18 +1499,43 @@ export class AuditEngine {
     };
   }
 
+  /** Fail closed unless the audit requested writes and an administrator approved this task. */
+  private resolveWritableWorkspace(task: TaskRow, auditConfig: Record<string, unknown>): boolean {
+    if (auditConfig.writable_workspace !== true) return false;
+    if (!getSetting(this.store, "security.allow_writable_workspace", false)) {
+      throw new AppError(
+        409,
+        "writable_workspace_disabled",
+        "security.allow_writable_workspace is disabled; refusing to run this task with write access.",
+      );
+    }
+    const approval = this.store.get<{ status: string }>(
+      "SELECT status FROM approvals WHERE task_id = ? AND action = 'allow_writable_workspace' ORDER BY created_at DESC LIMIT 1",
+      task.id,
+    );
+    if (approval?.status !== "approved") {
+      throw new AppError(
+        409,
+        "writable_workspace_not_approved",
+        "This audit requests a writable workspace, but this task has no approved allow_writable_workspace decision.",
+      );
+    }
+    return true;
+  }
+
   private systemPrompt(
     task: TaskRow,
     definition: AgentDefinition,
     scope: Scope,
     commit: string | null,
     workspace: string,
+    writable: boolean,
   ): string {
-    if (task.kind === "phase1.map") return mapperSystem(definition.system_instructions, workspace, commit);
-    if (task.kind === "phase2.discover") return researcherSystem(definition.system_instructions, workspace, commit);
-    if (task.kind === "phase3.confirm") return validatorSystem(definition.system_instructions, workspace, commit);
-    if (task.kind === "phase5.reverify") return retestSystem(definition.system_instructions, workspace, commit);
-    return `${definition.system_instructions}\nWorkspace: ${workspace}\nScope: ${scope.include.join(", ")}`;
+    if (task.kind === "phase1.map") return mapperSystem(definition.system_instructions, workspace, commit, writable);
+    if (task.kind === "phase2.discover") return researcherSystem(definition.system_instructions, workspace, commit, writable);
+    if (task.kind === "phase3.confirm") return validatorSystem(definition.system_instructions, workspace, commit, writable);
+    if (task.kind === "phase5.reverify") return retestSystem(definition.system_instructions, workspace, commit, writable);
+    return `${definition.system_instructions}\nWorkspace (${writable ? "writable copy, administrator-approved for this task" : "read-only copy"}): ${workspace}\nScope: ${scope.include.join(", ")}`;
   }
 
   private async buildPrompt(task: TaskRow, ctx: ReturnType<AuditEngine["context"]>): Promise<string | null> {
@@ -2179,9 +2292,7 @@ export class AuditEngine {
       failureKind = "cancelled";
     }
     const error = redactSecrets(rawError).text;
-    const retryable = !["cancelled", "budget_exceeded", "harness_missing", "harness_auth", "shell_tools_disabled", "harness_tool_policy", "audit_closed", "local_resources"].includes(
-      failureKind,
-    );
+    const retryable = !NON_RETRYABLE_FAILURES.has(failureKind);
     const retry = retryable && task.attempts < task.max_attempts && audit?.status === "running";
     if (retry) {
       this.store.run(
@@ -2216,10 +2327,10 @@ export class AuditEngine {
     });
     if (task.approval_id) {
       this.store.run(
-        "UPDATE approvals SET status = 'denied', reason = COALESCE(reason, ?), decided_at = COALESCE(decided_at, ?) WHERE id = ? AND status = 'pending'",
+        "UPDATE approvals SET status = 'denied', reason = COALESCE(reason, ?), decided_at = COALESCE(decided_at, ?) WHERE task_id = ? AND status = 'pending'",
         failureKind === "cancelled" ? "Task cancelled before approval was decided" : "Task failed before approval was decided",
         now(),
-        task.approval_id,
+        task.id,
       );
     }
     if (task.kind === "phase3.confirm" || task.kind === "phase4.persist") {

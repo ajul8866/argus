@@ -63,15 +63,55 @@ let renderToken = 0;
 let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 let liveConnected = false;
 
-function setNavOpen(open: boolean, focusFirstLink = false): void {
-  document.body.classList.toggle("nav-open", open);
-  const toggle = document.querySelector<HTMLButtonElement>(".mobile-toggle");
-  toggle?.setAttribute("aria-expanded", String(open));
-  toggle?.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
-  if (open && focusFirstLink) {
-    requestAnimationFrame(() => document.querySelector<HTMLAnchorElement>("#sidebar .nav a")?.focus({ preventScroll: true }));
+const drawerMedia = window.matchMedia("(max-width: 960px)");
+const drawerInertSelectors = ["#view", ".breadcrumbs", ".topbar-right"];
+let sidebarHeldFocus = false;
+
+document.addEventListener("focusin", () => {
+  const sidebar = document.getElementById("sidebar");
+  if (sidebar?.contains(document.activeElement)) sidebarHeldFocus = true;
+  else if (!document.body.classList.contains("nav-open")) sidebarHeldFocus = false;
+});
+
+function setDrawerInert(inert: boolean): void {
+  for (const selector of drawerInertSelectors) {
+    const element = document.querySelector(selector);
+    if (!element) continue;
+    if (inert) element.setAttribute("inert", "");
+    else element.removeAttribute("inert");
   }
 }
+
+function setNavOpen(open: boolean, focusFirstLink = false): void {
+  const sidebar = document.getElementById("sidebar");
+  const toggle = document.querySelector<HTMLButtonElement>(".mobile-toggle");
+  const restoreFocus = !open && drawerMedia.matches && (!!sidebar?.contains(document.activeElement) || sidebarHeldFocus);
+  document.body.classList.toggle("nav-open", open);
+  toggle?.setAttribute("aria-expanded", String(open));
+  toggle?.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
+  if (toggle) toggle.replaceChildren(icon(open ? "close" : "menu"));
+  setDrawerInert(open && drawerMedia.matches);
+  if (open && focusFirstLink) {
+    requestAnimationFrame(() => {
+      if (!document.body.classList.contains("nav-open")) return;
+      sidebar?.querySelector<HTMLAnchorElement>(".nav a")?.focus({ preventScroll: true });
+    });
+  } else if (restoreFocus) {
+    sidebarHeldFocus = false;
+    toggle?.focus({ preventScroll: true });
+  }
+}
+
+drawerMedia.addEventListener("change", () => {
+  if (!drawerMedia.matches) {
+    setNavOpen(false);
+    return;
+  }
+  const sidebar = document.getElementById("sidebar");
+  if (sidebar?.contains(document.activeElement)) {
+    document.querySelector<HTMLButtonElement>(".mobile-toggle")?.focus({ preventScroll: true });
+  }
+});
 
 function parseRoute(): { route: string; id: string | null; params: URLSearchParams } {
   const raw = location.hash.replace(/^#\/?/, "");
@@ -142,7 +182,7 @@ function shell(): void {
             setNavOpen(open, open);
             if (!open) document.querySelector<HTMLButtonElement>(".mobile-toggle")?.focus();
           },
-        }, icon("tasks")),
+        }, icon("menu")),
         h("div", { class: "breadcrumbs" },
           h("a", { href: "#/dashboard" }, "Argus"),
           h("span", { class: "sep" }, "/"),
@@ -375,15 +415,20 @@ window.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible" && session.user) void renderRoute();
 });
 
+function overlayOpen(): boolean {
+  return document.querySelector(".modal-overlay, .drawer-overlay") !== null;
+}
+
 document.addEventListener("click", (event) => {
-  const target = event.target as HTMLElement;
-  if (document.body.classList.contains("nav-open") && !target.closest("#sidebar") && !target.closest(".mobile-toggle")) {
-    setNavOpen(false);
-  }
+  if (!document.body.classList.contains("nav-open") || overlayOpen()) return;
+  const target = event.target instanceof Element ? event.target : null;
+  if (!target || target.closest("#sidebar") || target.closest(".mobile-toggle")) return;
+  setNavOpen(false);
 });
 
 document.addEventListener("keydown", (event) => {
-  if (event.key !== "Escape" || !document.body.classList.contains("nav-open")) return;
+  if (event.key !== "Escape" || !document.body.classList.contains("nav-open") || overlayOpen()) return;
+  event.preventDefault();
   setNavOpen(false);
   document.querySelector<HTMLButtonElement>(".mobile-toggle")?.focus();
 });

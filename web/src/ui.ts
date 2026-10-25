@@ -72,6 +72,7 @@ const iconPaths: Record<string, string> = {
   stop: "M4 4h12v12H4z",
   download: "M10 2v10 M6 8l4 4 4-4 M3 13v4h14v-4",
   close: "M5 5l10 10 M15 5L5 15",
+  menu: "M3 5h14 M3 10h14 M3 15h14",
   chevron: "M7 4l6 6-6 6",
   search: "M14 8a6 6 0 1 1-12 0 6 6 0 0 1 12 0 M12.5 12.5L18 18",
 };

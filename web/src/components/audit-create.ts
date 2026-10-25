@@ -24,6 +24,13 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
     location.hash = "#/projects";
     return null;
   }
+  let writablePolicy = false;
+  try {
+    const policy = await api<{ settings: Record<string, unknown> }>("/api/settings");
+    writablePolicy = policy.settings["security.allow_writable_workspace"] === true;
+  } catch {
+    // Best-effort; the server rejects a writable request when the policy is off.
+  }
   let repositories: RepositoryRow[] = [];
   const projectSelect = select(
     "project_id",
@@ -39,6 +46,11 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
   const maxCost = input("max_cost_usd", { type: "number", min: 0, step: 0.5, placeholder: "optional" });
   const distinctHarness = h("input", { type: "checkbox", name: "distinct_harness", checked: true }) as HTMLInputElement;
   const startNow = h("input", { type: "checkbox", name: "start_now", checked: true }) as HTMLInputElement;
+  const writableWorkspace = h("input", {
+    type: "checkbox",
+    name: "writable_workspace",
+    disabled: !writablePolicy,
+  }) as HTMLInputElement;
   const errorBox = h("div", { class: "login-error hidden" });
 
   async function loadRepositories(): Promise<void> {
@@ -95,6 +107,7 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
                 max_concurrent_agents: Number(maxConcurrent.value),
                 max_cost_usd: maxCost.value.trim() === "" ? null : Number(maxCost.value),
                 require_distinct_harness_for_retest: distinctHarness.checked,
+                writable_workspace: writablePolicy && writableWorkspace.checked,
               },
             },
           });
@@ -127,6 +140,14 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
       field("Cost budget (USD)", maxCost, "Optional audit-wide ceiling; checked after each session"),
       h("label", { class: "checkbox full" }, distinctHarness, "Prefer a distinct harness for retest when configured"),
       h("label", { class: "checkbox full" }, startNow, "Start the six-phase workflow immediately"),
+      h(
+        "label",
+        { class: "checkbox full" },
+        writableWorkspace,
+        writablePolicy
+          ? "Request a writable workspace (every task still needs administrator approval)"
+          : "Writable workspace is disabled by administrator policy",
+      ),
     ),
     h("div", { class: "form-actions" },
       button("Cancel", () => instance.close(), "secondary"),

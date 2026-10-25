@@ -8,8 +8,9 @@
   default stays read-only; enabling requires `security.allow_writable_workspace`
   with `confirm_writable_workspace`, a per-audit `writable_workspace` request,
   and a per-task `allow_writable_workspace` approval. The dashboard exposes the
-  setting as a confirmation-gated toggle. The imported snapshot and quote
-  verification remain read-only.
+  policy as a confirmation-gated toggle and offers the per-audit request in the
+  New audit dialog when enabled. The imported snapshot and quote verification
+  remain read-only.
 
 ## [0.0.1](https://github.com/ajul8866/argus/releases/tag/v0.0.1) — 2026-10-25
 

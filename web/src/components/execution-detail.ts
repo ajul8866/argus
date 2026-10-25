@@ -11,8 +11,10 @@ import {
   modal,
   severityBadge,
   statusBadge,
+  timelineEntry,
   toast,
   truncate,
+  verificationTimelineTone,
 } from "../ui.ts";
 
 type Evidence = {
@@ -137,7 +139,7 @@ export async function openFindingDetail(findingId: string, onChange?: () => void
             h("dt", {}, "Updated"), h("dd", {}, formatFullDate(finding.updated_at)),
           )),
           sectionBlock("Verification history", detail.verifications.length ? h("div", { class: "timeline" }, ...detail.verifications.map((verification) =>
-            h("div", { class: `timeline-item ${verification.verdict === "CONFIRMED" || verification.verdict === "REVERIFIED" ? "on" : "bad"}` },
+            timelineEntry(verificationTimelineTone(verification.verdict),
               h("div", { class: "row", style: { gap: "var(--space-2xs)" } }, h("span", { class: "strong small" }, verification.verdict), h("span", { class: "tiny muted" }, verification.kind)),
               h("div", { class: "tiny muted" }, `${verification.agent_session_id.slice(0, 8)} / ${formatFullDate(verification.created_at)}`),
               h("p", { class: "small", style: { margin: "var(--space-2xs) 0 0", color: "var(--text-soft)" } }, truncate(verification.rationale, 800)),

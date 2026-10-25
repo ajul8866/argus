@@ -228,6 +228,14 @@ export function section(title: string, content: Child, actions?: Child): HTMLEle
   );
 }
 
+export function verificationTimelineTone(verdict: string): "on" | "bad" {
+  return verdict === "CONFIRMED" || verdict === "REVERIFIED" ? "on" : "bad";
+}
+
+export function timelineEntry(tone: "on" | "bad", ...children: Child[]): HTMLElement {
+  return h("div", { class: `timeline-item ${tone}` }, h("span", { class: "timeline-dot", "aria-hidden": "true" }), ...children);
+}
+
 export function emptyState(title: string, detail: string, action?: Child): HTMLElement {
   return h(
     "div",

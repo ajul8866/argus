@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 type OverlayServer = { port: number | undefined; stop(closeActiveConnections?: boolean): void };
-type TestWindow = Window & { __lastConfirm?: boolean | null };
+type TestWindow = Window & { __lastConfirm?: boolean | null; __overlayCloses?: { count: number } };
 
 const root = resolve(import.meta.dir, "..");
 const fixture = join(root, "test", "fixtures", "overlay", "entry.ts");
@@ -97,6 +97,7 @@ try {
   const activeId = () => page.evaluate(() => document.activeElement?.id ?? null);
   const activeText = () => page.evaluate(() => document.activeElement?.textContent?.trim() ?? null);
   const lastConfirm = () => page.evaluate(() => (window as TestWindow).__lastConfirm);
+  const overlayCloseCount = () => page.evaluate(() => (window as TestWindow).__overlayCloses?.count ?? -1);
   const overlayCounts = () => page.evaluate(() => ({
     drawers: document.querySelectorAll(".drawer-overlay").length,
     modals: document.querySelectorAll(".modal-overlay").length,
@@ -104,6 +105,13 @@ try {
   }));
 
   await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "load" });
+  await page.evaluate(() => {
+    const record = { count: 0 };
+    (window as TestWindow).__overlayCloses = record;
+    window.addEventListener("argus:overlays-closed", () => {
+      record.count += 1;
+    });
+  });
   await page.waitForSelector("#open-drawer");
 
   await page.click("#open-drawer");
@@ -121,6 +129,7 @@ try {
   check((await overlayCounts()).drawers === 1, "Escape should close only the top confirmation");
   check(await lastConfirm() === false, "Escape should resolve the confirmation as false");
   check(await activeId() === "confirm-trigger", "focus should return to the confirmation trigger inside the drawer");
+  check(await overlayCloseCount() === 0, "closing a nested dialog should not signal that the overlay stack is clear");
 
   await page.click("#confirm-trigger");
   await page.waitForSelector(".modal-overlay");
@@ -134,12 +143,14 @@ try {
   await page.waitForSelector(".drawer-overlay", { state: "detached" });
   check((await overlayCounts()).appInert === false, "closing the last overlay should clear app inert");
   check(await activeId() === "open-drawer", "closing the drawer should restore focus to its trigger");
+  check(await overlayCloseCount() === 1, "closing the last overlay should notify listeners once");
 
   await page.click("#open-drawer");
   await page.waitForSelector(".drawer-overlay");
   await page.evaluate(() => { location.hash = "#changed"; });
   await page.waitForSelector(".drawer-overlay", { state: "detached" });
   check((await overlayCounts()).modals === 0, "hash changes should close open overlays");
+  check(await overlayCloseCount() === 2, "hash changes should notify listeners when the last overlay closes");
 
   await page.click("#open-drawer");
   await page.waitForSelector(".drawer-overlay");
@@ -149,7 +160,7 @@ try {
   }
 
   check(errors.length === 0, `browser errors: ${errors.join("; ")}`);
-  console.log("overlay regression passed: nested Escape, backdrop dismissal, hash cleanup, focus restoration, and Tab trap");
+  console.log("overlay regression passed: nested Escape, backdrop dismissal, hash cleanup, focus restoration, Tab trap, and overlay-close signal");
 } catch (error) {
   console.error("overlay regression failed:", error);
   failed = true;

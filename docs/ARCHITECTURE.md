@@ -220,7 +220,9 @@ Tasks, Approvals, Findings, Reports, Settings, Login.
 
 All data is fetched from implemented APIs. The UI never fabricates a finding,
 task state, harness status, or report. SSE events trigger debounced refresh;
-SSE is not the source of truth.
+SSE is not the source of truth. A refresh for a live route is held while a
+dialog or drawer is open and runs when the last overlay closes, so the audit
+shows its current phase after a task drawer closes.
 
 ## 6. Request flow example (confirmation)
 

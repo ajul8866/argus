@@ -1,6 +1,6 @@
 import "./styles.css";
 import { api, clearCsrf, connectEvents, disconnectEvents, loadSession, session } from "./api.ts";
-import { shouldRefreshOnReturn } from "./refresh-policy.ts";
+import { createLiveRefresh } from "./live-refresh.ts";
 import {
   button,
   closeOverlays,
@@ -59,8 +59,8 @@ const app = document.getElementById("app")!;
 let currentRoute = "dashboard";
 let currentParams = new URLSearchParams();
 let renderToken = 0;
-let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 let liveConnected = false;
+let focusRestore: (() => void) | null = null;
 const mobileNav = window.matchMedia("(max-width: 900px)");
 let navListenersInstalled = false;
 let loggingOut = false;
@@ -211,13 +211,57 @@ function updateLiveIndicator(): void {
   if (label) label.textContent = liveConnected ? "Live" : "Offline";
 }
 
+function captureViewFocus(): () => void {
+  const view = document.getElementById("view");
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement) || !view?.contains(active) || active === view) return () => {};
+  const label = active.getAttribute("aria-label");
+  const id = active.id;
+  const text = (active.textContent ?? "").trim();
+  const tag = active.tagName;
+  return () => {
+    if (hasOpenOverlay()) return;
+    const root = document.getElementById("view");
+    if (!root) return;
+    const current = document.activeElement;
+    if (
+      current instanceof HTMLElement &&
+      current !== document.body &&
+      current !== document.documentElement &&
+      current !== root
+    ) return;
+    if (id) {
+      const byId = root.querySelector<HTMLElement>(`#${CSS.escape(id)}`);
+      if (byId) {
+        byId.focus();
+        return;
+      }
+    }
+    if (label) {
+      const match = [...root.querySelectorAll<HTMLElement>("[aria-label]")]
+        .find((element) => element.getAttribute("aria-label") === label);
+      if (match) {
+        match.focus();
+        return;
+      }
+    }
+    if (!text) return;
+    const matches = [...root.querySelectorAll<HTMLElement>(tag)].filter((element) => (element.textContent ?? "").trim() === text);
+    const only = matches.length === 1 ? matches[0] : undefined;
+    only?.focus();
+  };
+}
+
 async function renderRoute(): Promise<void> {
   const parsed = parseRoute();
   currentRoute = parsed.route;
   currentParams = parsed.params;
   const token = ++renderToken;
+  const restoreFocus = focusRestore;
+  focusRestore = null;
   const view = document.getElementById("view");
   if (!view) return;
+  liveRefresh.onRendered();
   const target = document.createElement("div");
   target.style.display = "contents";
   view.replaceChildren(target);
@@ -281,6 +325,7 @@ async function renderRoute(): Promise<void> {
       target.remove();
       return;
     }
+    restoreFocus?.();
   } catch (error) {
     if (token !== renderToken) {
       target.remove();
@@ -301,15 +346,15 @@ function hasOpenOverlay(): boolean {
   return Boolean(document.querySelector(".modal-overlay, .drawer-overlay"));
 }
 
-function scheduleRefresh(): void {
-  if (!shouldRefreshOnReturn(currentRoute, hasOpenOverlay())) return;
-  if (refreshTimer) clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(() => {
-    if (document.visibilityState === "visible" && shouldRefreshOnReturn(currentRoute, hasOpenOverlay())) {
-      void renderRoute();
-    }
-  }, 1_100);
-}
+const liveRefresh = createLiveRefresh({
+  getRoute: () => currentRoute,
+  isOverlayOpen: hasOpenOverlay,
+  isVisible: () => document.visibilityState === "visible",
+  isActive: () => Boolean(session.user) && !loggingOut,
+  render: () => {
+    void renderRoute();
+  },
+});
 
 function loginView(errorMessage?: string): void {
   closeOverlays();
@@ -393,14 +438,14 @@ async function enterApp(): Promise<void> {
   connectEvents((event) => {
     const type = String(event.type ?? "");
     if (type.startsWith("agent.text") || type.startsWith("agent.thinking") || type === "agent.usage") return;
-    scheduleRefresh();
+    liveRefresh.request();
   });
   await renderRoute();
 }
 
 async function logout(): Promise<void> {
   loggingOut = true;
-  clearTimeout(refreshTimer ?? undefined);
+  liveRefresh.dispose();
   renderToken++;
   disconnectEvents();
   try {
@@ -430,9 +475,12 @@ window.addEventListener("argus:unauthorized", () => {
 });
 
 window.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && session.user && shouldRefreshOnReturn(currentRoute, hasOpenOverlay())) {
-    void renderRoute();
-  }
+  if (document.visibilityState === "visible") liveRefresh.onVisible();
+});
+
+window.addEventListener("argus:overlays-closed", () => {
+  focusRestore = captureViewFocus();
+  if (!liveRefresh.onOverlaysClosed()) focusRestore = null;
 });
 
 document.addEventListener("click", (event) => {

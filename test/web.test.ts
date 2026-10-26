@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { ApiError, api, loadSession, session } from "../web/src/api.ts";
 import { classifyExplorerPath } from "../web/src/pages/explorer.ts";
-import { shouldRefreshOnReturn } from "../web/src/refresh-policy.ts";
+import { createLiveRefresh, LIVE_REFRESH_DEBOUNCE_MS } from "../web/src/live-refresh.ts";
+import { shouldDeferRefresh, shouldRefreshOnReturn } from "../web/src/refresh-policy.ts";
 
 type Dispatched = { type: string };
 
@@ -148,5 +149,241 @@ describe("dashboard refresh policy", () => {
     expect(shouldRefreshOnReturn("audits", false)).toBe(true);
     expect(shouldRefreshOnReturn("dashboard", true)).toBe(false);
     expect(shouldRefreshOnReturn("settings", true)).toBe(false);
+  });
+
+  test("defers a missed refresh on live routes and never on local form routes", () => {
+    for (const route of ["dashboard", "projects", "audits", "tasks", "findings", "reports", "approvals"]) {
+      expect(shouldDeferRefresh(route, true)).toBe(true);
+      expect(shouldDeferRefresh(route, false)).toBe(false);
+      expect(shouldRefreshOnReturn(route, true)).toBe(false);
+    }
+    for (const route of ["settings", "skills", "explorer", "mcp", "harnesses", "agents"]) {
+      expect(shouldDeferRefresh(route, true)).toBe(false);
+      expect(shouldRefreshOnReturn(route, false)).toBe(false);
+    }
+  });
+});
+
+describe("deferred refresh while a dialog is open", () => {
+  type Clock = {
+    schedule: (run: () => void, delayMs: number) => { cancel: () => void };
+    fire: () => void;
+    readonly scheduled: boolean;
+    readonly delayMs: number | null;
+  };
+
+  function clock(): Clock {
+    let queued: { run: () => void; delayMs: number } | null = null;
+    return {
+      schedule(run, delayMs) {
+        const entry = { run, delayMs };
+        queued = entry;
+        return { cancel: () => { if (queued === entry) queued = null; } };
+      },
+      fire() {
+        const entry = queued;
+        queued = null;
+        entry?.run();
+      },
+      get scheduled() { return queued !== null; },
+      get delayMs() { return queued?.delayMs ?? null; },
+    };
+  }
+
+  function harness(initial: { route?: string; overlayOpen?: boolean; visible?: boolean; active?: boolean } = {}) {
+    let route = initial.route ?? "audits";
+    let overlayOpen = initial.overlayOpen ?? false;
+    let visible = initial.visible ?? true;
+    let active = initial.active ?? true;
+    let renders = 0;
+    const timer = clock();
+    const refresh = createLiveRefresh({
+      getRoute: () => route,
+      isOverlayOpen: () => overlayOpen,
+      isVisible: () => visible,
+      isActive: () => active,
+      render: () => { renders += 1; },
+      schedule: timer.schedule,
+    });
+    return {
+      refresh,
+      timer,
+      renders: () => renders,
+      setRoute: (value: string) => { route = value; },
+      setOverlayOpen: (value: boolean) => { overlayOpen = value; },
+      setVisible: (value: boolean) => { visible = value; },
+      setActive: (value: boolean) => { active = value; },
+    };
+  }
+
+  test("events that arrive while a task drawer is open refresh the audit when it closes", () => {
+    const page = harness({ overlayOpen: true });
+    page.refresh.request();
+    page.refresh.request();
+    page.timer.fire();
+    expect(page.renders()).toBe(0);
+    expect(page.timer.scheduled).toBe(false);
+    page.setOverlayOpen(false);
+    expect(page.refresh.onOverlaysClosed()).toBe(true);
+    expect(page.renders()).toBe(1);
+    expect(page.refresh.onOverlaysClosed()).toBe(false);
+    expect(page.renders()).toBe(1);
+  });
+
+  test("a refresh already waiting is replayed when a dialog opens before it fires", () => {
+    const page = harness();
+    page.refresh.request();
+    expect(page.timer.delayMs).toBe(LIVE_REFRESH_DEBOUNCE_MS);
+    page.setOverlayOpen(true);
+    page.timer.fire();
+    expect(page.renders()).toBe(0);
+    page.setOverlayOpen(false);
+    expect(page.refresh.onOverlaysClosed()).toBe(true);
+    expect(page.renders()).toBe(1);
+  });
+
+  test("a later event during the dialog cancels the waiting refresh and keeps a single catch-up", () => {
+    const page = harness();
+    page.refresh.request();
+    page.setOverlayOpen(true);
+    page.refresh.request();
+    expect(page.timer.scheduled).toBe(false);
+    page.timer.fire();
+    expect(page.renders()).toBe(0);
+    page.setOverlayOpen(false);
+    expect(page.refresh.onOverlaysClosed()).toBe(true);
+    expect(page.renders()).toBe(1);
+  });
+
+  test("an event while the tab is hidden and a dialog is open refreshes after both clear", () => {
+    const page = harness({ overlayOpen: true, visible: false });
+    page.refresh.request();
+    page.setVisible(true);
+    page.refresh.onVisible();
+    expect(page.renders()).toBe(0);
+    page.setOverlayOpen(false);
+    expect(page.refresh.onOverlaysClosed()).toBe(true);
+    expect(page.renders()).toBe(1);
+  });
+
+  test("a visibility return behind an open dialog waits until the dialog closes", () => {
+    const page = harness({ overlayOpen: true });
+    page.refresh.onVisible();
+    expect(page.renders()).toBe(0);
+    page.setOverlayOpen(false);
+    expect(page.refresh.onOverlaysClosed()).toBe(true);
+    expect(page.renders()).toBe(1);
+  });
+
+  test("returning to a visible live route still refreshes immediately when nothing is open", () => {
+    const page = harness();
+    page.refresh.request();
+    expect(page.timer.scheduled).toBe(true);
+    page.refresh.onVisible();
+    expect(page.renders()).toBe(1);
+    expect(page.timer.scheduled).toBe(false);
+    page.timer.fire();
+    expect(page.renders()).toBe(1);
+  });
+
+  test("a settings dialog does not defer a refresh onto local drafts", () => {
+    const page = harness({ route: "settings", overlayOpen: true });
+    page.refresh.request();
+    page.refresh.onVisible();
+    page.setOverlayOpen(false);
+    expect(page.refresh.onOverlaysClosed()).toBe(false);
+    expect(page.renders()).toBe(0);
+  });
+
+  test("visibility on a form route does not become a catch-up after navigation", () => {
+    const page = harness({ route: "settings", overlayOpen: true });
+    page.refresh.onVisible();
+    page.setRoute("audits");
+    page.setOverlayOpen(false);
+    expect(page.refresh.onOverlaysClosed()).toBe(false);
+    expect(page.renders()).toBe(0);
+  });
+
+  test("a deferred refresh waits if the dialog closes while the tab is hidden", () => {
+    const page = harness({ overlayOpen: true });
+    page.refresh.request();
+    page.setVisible(false);
+    page.setOverlayOpen(false);
+    expect(page.refresh.onOverlaysClosed()).toBe(false);
+    expect(page.renders()).toBe(0);
+    page.setVisible(true);
+    page.refresh.onVisible();
+    expect(page.renders()).toBe(1);
+  });
+
+  test("a debounced refresh that elapses in a hidden tab runs when the tab returns", () => {
+    const page = harness();
+    page.refresh.request();
+    page.setVisible(false);
+    page.timer.fire();
+    expect(page.renders()).toBe(0);
+    page.setVisible(true);
+    page.refresh.onVisible();
+    expect(page.renders()).toBe(1);
+  });
+
+  test("live events on an open route collapse into one debounced refresh", () => {
+    const page = harness();
+    page.refresh.request();
+    page.refresh.request();
+    expect(page.timer.scheduled).toBe(true);
+    expect(page.timer.delayMs).toBe(LIVE_REFRESH_DEBOUNCE_MS);
+    page.timer.fire();
+    expect(page.renders()).toBe(1);
+    page.timer.fire();
+    expect(page.renders()).toBe(1);
+  });
+
+  test("a debounced refresh does not rewrite a local form route", () => {
+    const page = harness();
+    page.refresh.request();
+    page.setRoute("explorer");
+    page.timer.fire();
+    expect(page.renders()).toBe(0);
+  });
+
+  test("closing a dialog does not refresh when no live update was missed", () => {
+    const page = harness({ overlayOpen: true });
+    page.setOverlayOpen(false);
+    expect(page.refresh.onOverlaysClosed()).toBe(false);
+    expect(page.renders()).toBe(0);
+  });
+
+  test("a catch-up does not run while another dialog is still open", () => {
+    const page = harness({ overlayOpen: true });
+    page.refresh.request();
+    expect(page.refresh.onOverlaysClosed()).toBe(false);
+    expect(page.renders()).toBe(0);
+  });
+
+  test("a route render consumes a deferred refresh so closing the dialog does not render twice", () => {
+    const page = harness({ overlayOpen: true });
+    page.refresh.request();
+    page.refresh.onRendered();
+    page.setOverlayOpen(false);
+    expect(page.refresh.onOverlaysClosed()).toBe(false);
+    expect(page.renders()).toBe(0);
+  });
+
+  test("a deferred refresh does not render after sign-out", () => {
+    const page = harness({ overlayOpen: true });
+    page.refresh.request();
+    page.setActive(false);
+    page.setOverlayOpen(false);
+    expect(page.refresh.onOverlaysClosed()).toBe(false);
+    expect(page.renders()).toBe(0);
+  });
+
+  test("dispose cancels a debounced refresh", () => {
+    const page = harness();
+    page.refresh.request();
+    page.refresh.dispose();
+    page.timer.fire();
+    expect(page.renders()).toBe(0);
   });
 });

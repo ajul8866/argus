@@ -321,6 +321,9 @@ function removeOverlay(entry: OverlayEntry): void {
     document.getElementById("view")?.focus();
   }
   entry.onClose?.();
+  if (overlayStack.length === 0) {
+    window.dispatchEvent(new CustomEvent("argus:overlays-closed"));
+  }
 }
 
 function closeAllOverlays(): void {

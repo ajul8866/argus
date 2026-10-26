@@ -18,8 +18,9 @@ can also configure harnesses/settings/credentials/users and decide approvals.
 | `POST` | `/api/auth/logout` | Revoke current session |
 | `POST` | `/api/auth/password` | `{current_password,new_password}` |
 
-Login failures are rate limited per IP+email (15-minute window, lock after six
-failures).
+Login failures are rate limited per socket peer address and email (15-minute
+window, lock after six failures). `x-forwarded-for` and `x-real-ip` do not
+change the throttle bucket.
 
 ## Overview
 
@@ -93,15 +94,20 @@ the commit/ref, and rejects empty/invalid snapshots.
 | `POST` | `/api/audits/:id/reports` | auditor | `{formats?}`; default all four |
 | `GET` | `/api/tasks?audit_id=&status=` | any | Cross-audit task queue |
 | `GET` | `/api/tasks/:id` | any | Full task, result, dependencies, events, session, evidence |
-| `POST` | `/api/tasks/:id/retry` | auditor | Requeue failed/cancelled/blocked |
+| `POST` | `/api/tasks/:id/retry` | auditor | Requeue failed/cancelled/blocked while its audit is running |
 | `POST` | `/api/tasks/:id/cancel` | auditor | Cancel queued or active task |
 
 Audit overrides: `max_areas`, `max_candidates_per_area`, `max_confirmations`,
-`max_reverifications`, `max_concurrent_agents`,
+`max_reverifications`, `max_concurrent_agents`, `task_timeout_ms`,
 `require_distinct_harness_for_retest`, `max_cost_usd`, `harness_overrides`, and
 `writable_workspace`. `writable_workspace: true` is rejected unless
 `security.allow_writable_workspace` is already enabled; it makes every harness
 task require an `allow_writable_workspace` approval.
+
+Project `max_concurrent_agents` must be `null` or an integer from 1 through 16.
+Audit concurrency, confirmation, and timeout overrides are validated before
+persistence. A task retry against a closed audit returns `409 audit_not_running`;
+create a new audit to repeat a closed assessment.
 
 The dashboard inherits server audit defaults and only submits edited overrides.
 For a project with no snapshot, it imports files before creating the audit.

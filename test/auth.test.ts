@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuthService } from "../src/auth.ts";
@@ -50,7 +50,7 @@ async function projectClient() {
   const api = createApi({ config: settings, store, auth, events, manager, evidence, reports, engine });
   const login = await auth.login(settings.adminEmail, settings.adminPassword!, "local", "test");
   const headers = { cookie: `argus_session=${login.token}`, "x-csrf-token": login.csrf, "content-type": "application/json" };
-  return { api, headers, userId: login.user.id };
+  return { api, headers, userId: login.user.id, engine };
 }
 
 beforeEach(async () => {
@@ -80,6 +80,9 @@ test("bootstrap admin is stored with an argon2id hash and can sign in", async ()
   expect(context?.user).not.toHaveProperty("password_hash");
   expect(auth.verifyCsrf(context!.session, result.csrf)).toBe(true);
   expect(auth.verifyCsrf(context!.session, "wrong")).toBe(false);
+  expect(auth.authenticate(new Request("http://localhost/api/auth/me", {
+    headers: { cookie: "argus_session=%E0%A4%A" },
+  }))).toBeNull();
 });
 
 test("invalid credentials fail and repeated attempts trigger a temporary lock", async () => {
@@ -92,6 +95,146 @@ test("invalid credentials fail and repeated attempts trigger a temporary lock", 
     }
   }
   expect(lastError).toContain("Too many failed sign-in attempts");
+});
+
+test("retry rejects closed audits and only requeues tasks in a running audit", async () => {
+  const { api, headers, engine, userId } = await projectClient();
+  const timestamp = new Date().toISOString();
+  store.run(
+    `INSERT INTO projects (id, name, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+     VALUES ('retry-project', 'Retry', ?, '["**/*"]', '[]', '', '', ?, ?)`, dir, timestamp, timestamp,
+  );
+  store.run(
+    `INSERT INTO repositories (id, project_id, path, languages, frameworks, inventory, graph, file_count, total_bytes, imported_at)
+     VALUES ('retry-repo', 'retry-project', ?, '{}', '[]', '{}', '{}', 0, 0, ?)`, dir, timestamp,
+  );
+  const auditId = engine.createAudit({ projectId: "retry-project", repositoryId: "retry-repo", userId });
+  const invalidCursor = await api(new Request(`http://localhost/api/audits/${auditId}/events?after=invalid`, {
+    headers,
+  }));
+  expect(invalidCursor.status).toBe(400);
+  const taskId = engine.createTask({
+    auditId, phase: 1, kind: "phase1.map", taskKey: "mapper", title: "Mapper", payload: {}, agentRole: "codebase_mapper",
+  });
+  store.run("UPDATE tasks SET status = 'failed', attempts = 1, error = 'Previous failure' WHERE id = ?", taskId);
+  for (const status of ["queued", "failed", "cancelled", "completed_with_errors"]) {
+    store.run("UPDATE audits SET status = ? WHERE id = ?", status, auditId);
+    const response = await api(new Request(`http://localhost/api/tasks/${taskId}/retry`, { method: "POST", headers }));
+    expect(response.status).toBe(409);
+    expect(store.get("SELECT status, attempts, error FROM tasks WHERE id = ?", taskId))
+      .toMatchObject({ status: "failed", attempts: 1, error: "Previous failure" });
+  }
+  store.run("UPDATE audits SET status = 'running' WHERE id = ?", auditId);
+  const response = await api(new Request(`http://localhost/api/tasks/${taskId}/retry`, { method: "POST", headers }));
+  expect(response.status).toBe(200);
+  expect(store.get("SELECT status, attempts, error FROM tasks WHERE id = ?", taskId))
+    .toMatchObject({ status: "queued", attempts: 1, error: null });
+});
+
+test("project concurrency must be a positive integer or null", async () => {
+  const { api, headers } = await projectClient();
+  for (const maximum of [-1, 0, 1.5, "invalid", {}]) {
+    const response = await api(new Request("http://localhost/api/projects", {
+      method: "POST", headers,
+      body: JSON.stringify({ name: "Invalid limit", source_path: dir, max_concurrent_agents: maximum }),
+    }));
+    expect(response.status).toBe(400);
+  }
+  expect(store.all("SELECT id FROM projects")).toHaveLength(0);
+  for (const maximum of [null, 1, 16]) {
+    const response = await api(new Request("http://localhost/api/projects", {
+      method: "POST", headers,
+      body: JSON.stringify({ name: "Valid limit", source_path: dir, max_concurrent_agents: maximum }),
+    }));
+    expect(response.status).toBe(201);
+  }
+});
+
+test("invalid project scope patterns are rejected without partially updating the project", async () => {
+  const { api, headers } = await projectClient();
+  const created = await api(new Request("http://localhost/api/projects", {
+    method: "POST", headers,
+    body: JSON.stringify({ name: "Original", source_path: dir, scope_include: ["**/*"] }),
+  }));
+  expect(created.status).toBe(201);
+  expect((await api(new Request("http://localhost/api/projects", {
+    method: "POST", headers,
+    body: JSON.stringify({ name: "Invalid", source_path: dir, scope_exclude: ["[z-a]"] }),
+  }))).status).toBe(400);
+  expect(store.all("SELECT id FROM projects")).toHaveLength(1);
+
+  const project = (await created.json()).project;
+  const updated = await api(new Request(`http://localhost/api/projects/${project.id}`, {
+    method: "PUT", headers,
+    body: JSON.stringify({ name: "Changed", scope_include: ["[z-a]"] }),
+  }));
+  expect(updated.status).toBe(400);
+  expect(store.get("SELECT name, scope_include FROM projects WHERE id = ?", project.id)).toMatchObject({
+    name: "Original",
+    scope_include: JSON.stringify(["**/*"]),
+  });
+});
+
+test("forwarded headers cannot change the login throttle bucket for one socket peer", async () => {
+  const { api } = await projectClient();
+  const login = (password: string, spoofed: string) => api(new Request("http://localhost/api/auth/login", {
+    method: "POST", headers: { "content-type": "application/json", "x-forwarded-for": spoofed, "x-real-ip": spoofed },
+    body: JSON.stringify({ email: "admin@test.local", password }),
+  }), "192.0.2.1");
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    expect((await login("wrong-password", `198.51.100.${attempt}`)).status).toBe(401);
+  }
+  const response = await login("test-admin-password", "203.0.113.99");
+  expect(response.status).toBe(401);
+  expect((await response.json()).error.message).toContain("Too many failed sign-in attempts");
+});
+
+test("login accepts the exact whitespace-bearing password stored by the auth service", async () => {
+  const password = "  a-valid-password  ";
+  await auth.createUser("spaces@test.local", "Spaces", password, "auditor");
+  const { api } = await projectClient();
+  const login = (value: string) => api(new Request("http://localhost/api/auth/login", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email: "spaces@test.local", password: value }),
+  }));
+  expect((await login(password)).status).toBe(200);
+  expect((await login(password.trim())).status).toBe(401);
+});
+
+test("user creation and password changes preserve password whitespace", async () => {
+  const { api, headers } = await projectClient();
+  const password = "  a-valid-password  ";
+  const created = await api(new Request("http://localhost/api/users", {
+    method: "POST", headers, body: JSON.stringify({ email: "new@test.local", role: "auditor", password }),
+  }));
+  expect(created.status).toBe(201);
+  const row = store.get<{ password_hash: string }>("SELECT password_hash FROM users WHERE email = 'new@test.local'")!;
+  expect(await Bun.password.verify(password, row.password_hash)).toBe(true);
+  expect(await Bun.password.verify(password.trim(), row.password_hash)).toBe(false);
+  const signedIn = await auth.login("new@test.local", password, "local", "test");
+  const changedPassword = "  another-password  ";
+  const changed = await api(new Request("http://localhost/api/auth/password", {
+    method: "POST", headers: { "content-type": "application/json", cookie: `argus_session=${signedIn.token}`, "x-csrf-token": signedIn.csrf },
+    body: JSON.stringify({ current_password: password, new_password: changedPassword }),
+  }));
+  expect(changed.status).toBe(200);
+  const updated = store.get<{ password_hash: string }>("SELECT password_hash FROM users WHERE email = 'new@test.local'")!;
+  expect(await Bun.password.verify(changedPassword, updated.password_hash)).toBe(true);
+  expect(await Bun.password.verify(changedPassword.trim(), updated.password_hash)).toBe(false);
+});
+
+test("repository import rejects malformed JSON instead of importing with default options", async () => {
+  const { api, headers } = await projectClient();
+  const created = await api(new Request("http://localhost/api/projects", {
+    method: "POST", headers, body: JSON.stringify({ name: "JSON boundary", source_path: dir, scope_include: ["**/*.ts"] }),
+  }));
+  const projectId = (await created.json()).project.id;
+  const response = await api(new Request(`http://localhost/api/projects/${projectId}/import`, {
+    method: "POST", headers, body: '{"ref":',
+  }));
+  expect(response.status).toBe(400);
+  expect((await response.json()).error.code).toBe("invalid_json");
+  expect(store.all("SELECT id FROM repositories")).toHaveLength(0);
 });
 
 test("session cookie and password rotation revoke other sessions", async () => {
@@ -116,6 +259,69 @@ test("role hierarchy and user administration", async () => {
   await expect(auth.login("auditor@test.local", "auditor-password-1", "127.0.0.1", "test")).rejects.toThrow();
   const metadata = auth.listUsers();
   expect(metadata.every((user) => !("password_hash" in user))).toBe(true);
+});
+
+test("invalid user updates are rejected before a partial role or name change", async () => {
+  const user = await auth.createUser("unchanged@test.local", "Original", "auditor-password-1", "auditor");
+  const { api, headers } = await projectClient();
+  for (const body of [
+    { role: "owner" },
+    { disabled: "true" },
+    { name: { value: "Changed" } },
+    { role: "viewer", name: { value: "Changed" } },
+  ]) {
+    const response = await api(new Request(`http://localhost/api/users/${user.id}`, {
+      method: "PATCH", headers, body: JSON.stringify(body),
+    }));
+    expect(response.status).toBe(400);
+    expect(auth.listUsers().find((entry) => entry.id === user.id)).toMatchObject({
+      role: "auditor",
+      name: "Original",
+      disabled: 0,
+    });
+  }
+});
+
+test("audit log details redact supplied credentials", async () => {
+  const { api, headers } = await projectClient();
+  const created = await api(new Request("http://localhost/api/projects", {
+    method: "POST", headers,
+    body: JSON.stringify({ name: "Audit log", source_path: dir }),
+  }));
+  const project = (await created.json()).project;
+  await api(new Request(`http://localhost/api/projects/${project.id}`, {
+    method: "PUT", headers,
+    body: JSON.stringify({ name: "Updated", password: "private-password-value" }),
+  }));
+  const entry = store.get<{ detail: string }>(
+    "SELECT detail FROM audit_log WHERE action = 'project.updated' ORDER BY id DESC LIMIT 1",
+  )!;
+  expect(entry.detail).toContain("[REDACTED]");
+  expect(entry.detail).not.toContain("private-password-value");
+});
+
+test("report downloads fail closed when the stored bytes no longer match the recorded hash", async () => {
+  const { api, headers, engine, userId } = await projectClient();
+  const timestamp = new Date().toISOString();
+  store.run(
+    `INSERT INTO projects (id, name, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+     VALUES ('report-project', 'Report', ?, '["**/*"]', '[]', '', '', ?, ?)`,
+    dir, timestamp, timestamp,
+  );
+  store.run(
+    `INSERT INTO repositories (id, project_id, path, languages, frameworks, inventory, graph, file_count, total_bytes, imported_at)
+     VALUES ('report-repo', 'report-project', ?, '{}', '[]', '{}', '{}', 0, 0, ?)`,
+    dir, timestamp,
+  );
+  const auditId = engine.createAudit({ projectId: "report-project", repositoryId: "report-repo", userId });
+  const service = new ReportService(config(dir), store, new EvidenceStore(config(dir), store), new EventLog(store));
+  const [report] = await service.generate(auditId, ["markdown"], "test");
+  const download = () => api(new Request(`http://localhost/api/reports/${report!.id}/download`, { headers }));
+  expect((await download()).status).toBe(200);
+  writeFileSync(report!.path, "tampered report\n");
+  const rejected = await download();
+  expect(rejected.status).toBe(409);
+  expect(await rejected.json()).toMatchObject({ error: { code: "conflict" } });
 });
 
 test("a project needs only a name and repository path while access controls still apply", async () => {

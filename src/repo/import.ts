@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { Config } from "../config.ts";
 import type { Store } from "../db/index.ts";
@@ -37,44 +37,58 @@ export async function importRepository(
     project.id,
     `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`,
   );
-  if (ref) {
-    if (!git.commit) throw badRequest("Git refs require a git repository");
-    if (!/^[A-Za-z0-9][A-Za-z0-9._/@^~:-]{0,199}$/.test(ref)) {
-      throw badRequest("Invalid git ref");
+  let staging: string | null = null;
+  try {
+    if (ref) {
+      if (!git.commit) throw badRequest("Git refs require a git repository");
+      if (!/^[A-Za-z0-9][A-Za-z0-9._/@^~:-]{0,199}$/.test(ref)) {
+        throw badRequest("Invalid git ref");
+      }
+      const resolved = await runCommand(
+        ["git", "-C", sourceRoot, "rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`],
+        { timeoutMs: 20_000 },
+      );
+      if (resolved.code !== 0) throw badRequest(`Unknown git ref: ${ref}`);
+      commit = resolved.stdout.trim();
+      staging = await mkdtemp(join(deps.config.dataDir, "repo-import-"));
+      const archivePath = join(staging, "snapshot.tar");
+      const extractedRoot = join(staging, "source");
+      await mkdir(extractedRoot, { mode: 0o700 });
+      const archived = await runCommand(
+        ["git", "-C", sourceRoot, "archive", "--format=tar", "--output", archivePath, commit],
+        { timeoutMs: 180_000 },
+      );
+      if (archived.code !== 0 || archived.timedOut) {
+        throw badRequest(`Failed to archive ${ref}: ${archived.stderr.slice(0, 500)}`);
+      }
+      const extracted = await runCommand(["tar", "-xf", archivePath, "-C", extractedRoot], { timeoutMs: 180_000 });
+      if (extracted.code !== 0 || extracted.timedOut) {
+        throw badRequest(`Failed to extract ${ref}: ${extracted.stderr.slice(0, 500)}`);
+      }
+      importRoot = extractedRoot;
+      branch = ref;
     }
-    const resolved = await runCommand(
-      ["git", "-C", sourceRoot, "rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`],
-      { timeoutMs: 20_000 },
-    );
-    if (resolved.code !== 0) throw badRequest(`Unknown git ref: ${ref}`);
-    commit = resolved.stdout.trim();
-    await mkdir(snapshotBase, { recursive: true, mode: 0o700 });
-    const archived = await runCommand(
-      ["sh", "-c", 'git -C "$1" archive --format=tar "$2" | tar -xf - -C "$3"', "argus", sourceRoot, ref, snapshotBase],
-      { timeoutMs: 180_000 },
-    );
-    if (archived.code !== 0) {
-      throw badRequest(`Failed to archive ${ref}: ${archived.stderr.slice(0, 500)}`);
-    }
-    importRoot = snapshotBase;
-    branch = ref;
-  } else {
     // Snapshot the current worktree so later edits cannot silently change the
     // code that evidence quotes and findings refer to.
-    const sourceInventory = await buildInventory(sourceRoot, {
+    const sourceInventory = await buildInventory(importRoot, {
       scope,
       maxFiles: 6_000,
       maxFileBytes: 512_000,
     });
     if (sourceInventory.files.length === 0) throw badRequest("No in-scope files were found in the repository");
     await mkdir(snapshotBase, { recursive: true, mode: 0o700 });
-    await createWorkspace(sourceRoot, sourceInventory, scope, snapshotBase, {
+    await createWorkspace(importRoot, sourceInventory, scope, snapshotBase, {
       project_id: project.id,
       source_root: sourceRoot,
       commit,
       imported_by: importedBy,
     });
     importRoot = snapshotBase;
+  } catch (error) {
+    await rm(snapshotBase, { recursive: true, force: true });
+    throw error;
+  } finally {
+    if (staging) await rm(staging, { recursive: true, force: true });
   }
   const inventory = await buildInventory(importRoot, {
     scope,

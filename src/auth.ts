@@ -5,6 +5,7 @@ import type { Config } from "./config.ts";
 import { SESSION_COOKIE } from "./config.ts";
 import type { Store } from "./db/index.ts";
 import { now, sha256, uid } from "./util.ts";
+import { redactObject } from "./security/redact.ts";
 
 export type User = {
   id: string;
@@ -49,7 +50,11 @@ export function parseCookies(header: string | null): Record<string, string> {
     const key = part.slice(0, index).trim();
     const value = part.slice(index + 1).trim();
     if (!key) continue;
-    result[key] = decodeURIComponent(value);
+    try {
+      result[key] = decodeURIComponent(value);
+    } catch {
+      // Ignore malformed cookie values instead of turning them into a 500.
+    }
   }
   return result;
 }
@@ -271,7 +276,7 @@ export class AuthService {
       actor,
       action,
       target,
-      detail === undefined ? null : JSON.stringify(detail),
+      detail === undefined ? null : JSON.stringify(redactObject(detail)),
       ip,
       now(),
     );

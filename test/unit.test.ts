@@ -20,8 +20,22 @@ import { detectRepositoryRoots, listRepositoryFolders } from "../src/repo/direct
 import { Database } from "bun:sqlite";
 import { migrations } from "../src/db/migrations.ts";
 import { DEFAULT_AGENTS } from "../src/settings.ts";
+import { readJson } from "../src/api/http.ts";
 
 const fixture = join(import.meta.dir, "fixtures", "vulnerable-app");
+
+describe("HTTP JSON size limits", () => {
+  for (const length of [undefined, "1"]) {
+    test(`oversized JSON is rejected when Content-Length is ${length ?? "absent"}`, async () => {
+      const headers = new Headers({ "content-type": "application/json" });
+      if (length) headers.set("content-length", length);
+      const request = new Request("http://localhost/api/test", {
+        method: "POST", headers, body: JSON.stringify({ data: "x".repeat(2_000_000) }),
+      });
+      await expect(readJson(request)).rejects.toMatchObject({ status: 413, code: "body_too_large" });
+    });
+  }
+});
 
 function testConfig(dataDir: string): Config {
   return {
@@ -115,6 +129,29 @@ describe("host repository folders", () => {
       expect(roots).toEqual([detectRepositoryRoots([join(directory, "repositories")])[0]!]);
     } finally {
       rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("invalid runtime environment values fail instead of silently changing safety modes", () => {
+    const names = ["ARGUS_SANDBOX", "ARGUS_LOG_LEVEL", "ARGUS_SESSION_TTL_HOURS", "ARGUS_PORT", "ARGUS_MAX_AGENTS"];
+    const original = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    try {
+      for (const [name, value] of [
+        ["ARGUS_SANDBOX", "bwarp"],
+        ["ARGUS_LOG_LEVEL", "verbose"],
+        ["ARGUS_SESSION_TTL_HOURS", "0"],
+        ["ARGUS_PORT", "not-a-port"],
+        ["ARGUS_MAX_AGENTS", "17"],
+      ]) {
+        for (const key of names) delete process.env[key];
+        process.env[name!] = value!;
+        expect(() => loadConfig()).toThrow(name!);
+      }
+    } finally {
+      for (const name of names) {
+        if (original[name] === undefined) delete process.env[name];
+        else process.env[name] = original[name];
+      }
     }
   });
 
@@ -418,6 +455,11 @@ describe("repository import", () => {
     expect(imported.branch).toBe("HEAD");
     expect(imported.file_count).toBe(9);
     expect(await Bun.file(join(imported.path, "src/lib/db.js")).text()).toContain("SELECT id");
+    expect(await Bun.file(join(imported.path, "src/routes/media.js")).exists()).toBe(false);
+    expect((await stat(join(imported.path, "src/lib/db.js"))).mode & 0o777).toBe(0o400);
+    const metadata = await Bun.file(join(imported.path, "ARGUS_SCOPE.json")).json();
+    expect(metadata.commit).toBe(git.commit);
+    expect(metadata.imported_by).toBe("tester@argus.local");
   });
 
   test("rejects unauthorized roots, unknown refs, and empty scope without persisting a repository", async () => {
@@ -500,6 +542,19 @@ describe("evidence chain", () => {
     const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "one", content: "alpha" });
     expect(() => store.run("UPDATE evidence SET title = 'changed' WHERE id = ?", row.id)).toThrow();
     expect(() => store.run("DELETE FROM evidence WHERE id = ?", row.id)).toThrow();
+  });
+
+  test("evidence verification detects sidecar metadata tampering", async () => {
+    const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "original", content: "alpha" });
+    const parsed = await Bun.file(row.content_path).json();
+    parsed.title = "tampered";
+    await Bun.write(row.content_path, `${JSON.stringify(parsed, null, 2)}\n`);
+    const broken = await evidence.verifyChain("a1");
+    expect(broken).toMatchObject({
+      ok: false,
+      broken_at: row.id,
+      reason: "Evidence file metadata does not match the database record",
+    });
   });
 
   test("concurrent appends preserve every link in the audit chain", async () => {

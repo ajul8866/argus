@@ -127,7 +127,15 @@ export function globToRegExp(glob: string): RegExp {
     i += 1;
   }
   out += "$";
-  return new RegExp(out);
+  try {
+    return new RegExp(out);
+  } catch {
+    throw badRequest(`Invalid scope pattern: ${glob.slice(0, 200)}`);
+  }
+}
+
+export function validateScopeGlobs(globs: string[]): void {
+  for (const glob of globs) globToRegExp(glob);
 }
 
 export type Scope = { include: string[]; exclude: string[] };

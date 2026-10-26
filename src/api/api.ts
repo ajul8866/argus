@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import type { Config } from "../config.ts";
 import { APP_NAME, APP_VERSION, PHASE_NAMES } from "../config.ts";
 import { DEFAULT_SETTINGS } from "../settings.ts";
@@ -19,7 +20,7 @@ import { assertAuthorizedRoot, readScopedFile } from "../repo/workspace.ts";
 import { listRepositoryFolders } from "../repo/directories.ts";
 import { agentDefinition, getSetting, harnessConfig, listAgents, listSettings, saveHarnessConfig, setSetting } from "../settings.ts";
 import { decryptSecret, encryptSecret, type StoredCredential } from "../security/credentials.ts";
-import { redactObject } from "../security/redact.ts";
+import { redactObject, redactSecrets } from "../security/redact.ts";
 import {
   AppError,
   badRequest,
@@ -33,6 +34,7 @@ import {
   sha256,
   toJson,
   uid,
+  validateScopeGlobs,
 } from "../util.ts";
 import { clientIp, errorResponse, json, optionalString, readJson, requireString, requireStringArray } from "./http.ts";
 import { sseResponse } from "./sse.ts";
@@ -53,9 +55,9 @@ type ApiDeps = {
 
 type AuthUser = AuthContext["user"];
 
-export function createApi(deps: ApiDeps): (request: Request) => Promise<Response> {
+export function createApi(deps: ApiDeps): (request: Request, peerAddress?: string) => Promise<Response> {
   const catalog = deps.catalog ?? new LocalCatalog(deps.store);
-  return async (request: Request): Promise<Response> => {
+  return async (request: Request, peerAddress?: string): Promise<Response> => {
     const url = new URL(request.url);
     if (!url.pathname.startsWith("/api/")) return json({ error: "not_found" }, 404);
     try {
@@ -72,7 +74,7 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
           return json({ error: { code: "csrf_invalid", message: "Missing or invalid CSRF token" } }, 403);
         }
       }
-      const ip = clientIp(request);
+      const ip = clientIp(peerAddress);
       const user = authContext?.user ?? null;
       const requireUser = (): AuthUser => {
         if (!user) throw new AppError(401, "unauthorized", "Authentication required");
@@ -91,7 +93,7 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
       if (path === "/api/auth/login" && method === "POST") {
         const body = await readJson(request);
         const email = requireString(body, "email", 320);
-        const password = requireString(body, "password", 512);
+        const password = requireString(body, "password", 512, false);
         try {
           const result = await deps.auth.login(
             email,
@@ -126,8 +128,8 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
       if (path === "/api/auth/password" && method === "POST") {
         const current = requireUser();
         const body = await readJson(request);
-        const currentPassword = requireString(body, "current_password", 512);
-        const newPassword = requireString(body, "new_password", 512);
+        const currentPassword = requireString(body, "current_password", 512, false);
+        const newPassword = requireString(body, "new_password", 512, false);
         try {
           await deps.auth.changePassword(current, currentPassword, newPassword, authContext!.session.id);
         } catch (error) {
@@ -243,8 +245,15 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
         const sourcePath = requireString(body, "source_path", 2_000);
         const authorizedBy = optionalString(body, "authorized_by", 300) ?? "";
         const authorizationRef = optionalString(body, "authorization_ref", 500) ?? "";
+        const maximumAgents = body.max_concurrent_agents;
+        if (maximumAgents !== undefined && maximumAgents !== null &&
+            (typeof maximumAgents !== "number" || !Number.isInteger(maximumAgents) || maximumAgents < 1 || maximumAgents > 16)) {
+          throw badRequest("max_concurrent_agents must be an integer between 1 and 16 or null");
+        }
         const include = requireStringArray(body, "scope_include", ["**/*"]);
         const exclude = requireStringArray(body, "scope_exclude", DEFAULT_EXCLUDES);
+        validateScopeGlobs(include);
+        validateScopeGlobs(exclude);
         const realPath = await assertAuthorizedRoot(resolve(sourcePath), deps.config.allowedRoots);
         const id = uid();
         const timestamp = now();
@@ -260,7 +269,7 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
           toJson(exclude),
           authorizedBy,
           authorizationRef,
-          body.max_concurrent_agents ? Number(body.max_concurrent_agents) : null,
+          maximumAgents ?? null,
           current.id,
           timestamp,
           timestamp,
@@ -297,33 +306,45 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
           );
           if (!project) throw notFound("Project not found");
           const body = await readJson(request);
+          const name = body.name === undefined ? undefined : requireString(body, "name", 200);
+          const description = body.description === undefined
+            ? undefined
+            : optionalString(body, "description", 4_000) ?? "";
+          const scopeInclude = body.scope_include === undefined
+            ? undefined
+            : requireStringArray(body, "scope_include");
+          const scopeExclude = body.scope_exclude === undefined
+            ? undefined
+            : requireStringArray(body, "scope_exclude");
+          if (scopeInclude) validateScopeGlobs(scopeInclude);
+          if (scopeExclude) validateScopeGlobs(scopeExclude);
+          const status = body.status === undefined ? undefined : requireString(body, "status", 20);
+          if (status && !["active", "archived"].includes(status)) throw badRequest("status must be active or archived");
           if (body.name !== undefined) {
-            deps.store.run("UPDATE projects SET name = ? WHERE id = ?", requireString(body, "name", 200), project.id);
+            deps.store.run("UPDATE projects SET name = ? WHERE id = ?", name, project.id);
           }
           if (body.description !== undefined) {
             deps.store.run(
               "UPDATE projects SET description = ? WHERE id = ?",
-              optionalString(body, "description", 4_000) ?? "",
+              description,
               project.id,
             );
           }
           if (body.scope_include !== undefined) {
             deps.store.run(
               "UPDATE projects SET scope_include = ? WHERE id = ?",
-              toJson(requireStringArray(body, "scope_include")),
+              toJson(scopeInclude),
               project.id,
             );
           }
           if (body.scope_exclude !== undefined) {
             deps.store.run(
               "UPDATE projects SET scope_exclude = ? WHERE id = ?",
-              toJson(requireStringArray(body, "scope_exclude")),
+              toJson(scopeExclude),
               project.id,
             );
           }
           if (body.status !== undefined) {
-            const status = requireString(body, "status", 20);
-            if (!["active", "archived"].includes(status)) throw badRequest("status must be active or archived");
             deps.store.run("UPDATE projects SET status = ? WHERE id = ?", status, project.id);
           }
           deps.store.run("UPDATE projects SET updated_at = ? WHERE id = ?", now(), project.id);
@@ -355,7 +376,7 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
           scope_exclude: string;
         }>("SELECT * FROM projects WHERE id = ?", importMatch[1]);
         if (!project) throw notFound("Project not found");
-        const body = await readJson(request).catch(() => ({}) as Record<string, unknown>);
+        const body = request.body === null ? {} : await readJson(request);
         const ref = optionalString(body, "ref", 200);
         const imported = await importRepository(deps, project, ref, current.email);
         deps.auth.logAction(current.email, "repository.imported", imported.id, {
@@ -534,7 +555,7 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
         const action = auditActionMatch[2]!;
         if (action === "stream" && method === "GET") {
           requireUser();
-          return streamEvents(deps, request, auditId, Number(url.searchParams.get("after") ?? 0));
+          return streamEvents(deps, request, auditId, eventCursor(url));
         }
         if (action === "start" && method === "POST") {
           const current = requireRole("auditor");
@@ -579,7 +600,7 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
         }
         if (action === "events" && method === "GET") {
           requireUser();
-          const after = Number(url.searchParams.get("after") ?? 0);
+          const after = eventCursor(url);
           return json({ events: deps.events.list(auditId, after, 500) });
         }
         if (action === "evidence" && method === "GET") {
@@ -612,7 +633,7 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
             if (!assessmentComplete && !["completed", "completed_with_errors"].includes(audit.status)) {
               throw conflict("Reports can be generated only after mapping, discovery, confirmation, findings, and reverification are complete");
             }
-            const body = await readJson(request).catch(() => ({}) as Record<string, unknown>);
+            const body = request.body === null ? {} : await readJson(request);
             const formats = body.formats === undefined ? REPORT_FORMATS : requireStringArray(body, "formats");
             for (const format of formats) {
               if (!REPORT_FORMATS.includes(format as ReportFormat)) throw badRequest(`Unsupported report format: ${format}`);
@@ -699,19 +720,7 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
         );
         if (!task) throw notFound("Task not found");
         if (taskAction[2] === "retry") {
-          if (!["failed", "cancelled", "blocked"].includes(task.status)) {
-            throw conflict("Only failed, cancelled, or blocked tasks can be retried");
-          }
-          deps.store.run(
-            "UPDATE tasks SET status = 'queued', error = NULL, failure_kind = NULL, finished_at = NULL, max_attempts = MAX(max_attempts, attempts + 1) WHERE id = ?",
-            task.id,
-          );
-          deps.events.append({
-            auditId: task.audit_id,
-            taskId: task.id,
-            type: "task.requeued",
-            payload: { by: current.email },
-          });
+          await deps.engine.retryTask(task.id, current.email);
           deps.auth.logAction(current.email, "task.retried", task.id, {}, ip);
           return json({ ok: true });
         }
@@ -801,6 +810,7 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
             const detection = detections.find((entry) => entry.kind === row.kind);
             return {
               ...row,
+              detail: redactSecrets(String(row.detail ?? "")).text,
               capabilities: parseJson(String(row.capabilities ?? "{}"), {}),
               config: redactHarnessConfig(parseJson<HarnessConfig>(String(row.config ?? "{}"), {} as HarnessConfig)),
               models: detection?.models ?? [],
@@ -833,7 +843,7 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
         if (method === "GET" && !action) {
           requireUser();
           const detection = await deps.manager.adapter(kind).detect();
-          return json({ harness: detection, config: redactHarnessConfig(harnessConfig(deps.store, kind)) });
+          return json({ harness: redactObject(detection), config: redactHarnessConfig(harnessConfig(deps.store, kind)) });
         }
         if (method === "PUT" && !action) {
           const current = requireRole("admin");
@@ -847,13 +857,13 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
         if (method === "POST" && action === "check") {
           requireRole("auditor");
           const detection = await deps.manager.health(kind, true);
-          return json({ harness: detection });
+          return json({ harness: redactObject(detection) });
         }
         if (method === "POST" && action === "test") {
           const current = requireRole("admin");
           const result = await deps.manager.testConnection(kind);
           deps.auth.logAction(current.email, "harness.tested", kind, { status: result.result?.status }, ip);
-          return json({
+          return json(redactObject({
             detection: result.detection,
             result: result.result
               ? {
@@ -865,7 +875,7 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
                   duration_ms: result.result.usage.duration_ms,
                 }
               : null,
-          });
+          }));
         }
         if (method === "GET" && action === "models") {
           requireUser();
@@ -1045,7 +1055,7 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
         const body = await readJson(request);
         const email = requireString(body, "email", 320);
         const name = optionalString(body, "name", 200) ?? email;
-        const password = requireString(body, "password", 512);
+        const password = requireString(body, "password", 512, false);
         const role = requireString(body, "role", 20) as User["role"];
         try {
           const user = await deps.auth.createUser(email, name, password, role);
@@ -1062,6 +1072,15 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
         const body = await readJson(request);
         const target = deps.auth.listUsers().find((entry) => entry.id === userMatch[1]);
         if (!target) throw notFound("User not found");
+        if (body.role !== undefined && !["admin", "auditor", "viewer"].includes(String(body.role))) {
+          throw badRequest("role must be admin, auditor, or viewer");
+        }
+        if (body.disabled !== undefined && typeof body.disabled !== "boolean") {
+          throw badRequest("disabled must be a boolean");
+        }
+        if (body.name !== undefined && (typeof body.name !== "string" || body.name.length > 200)) {
+          throw badRequest("name must be a string of at most 200 characters");
+        }
         const admins = deps.auth.listUsers().filter((entry) => entry.role === "admin" && entry.disabled === 0);
         const disablingSelf = target.id === current.id && body.disabled === true;
         const removingLastAdmin =
@@ -1129,6 +1148,10 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
         if (report.status !== "generated" || !report.path || !existsSync(report.path)) {
           throw notFound("Report file is not available");
         }
+        const bytes = await readFile(report.path);
+        if (!report.sha256 || sha256(bytes) !== report.sha256) {
+          throw conflict("Report integrity check failed; the stored file does not match its recorded hash");
+        }
         deps.auth.logAction(current.email, "report.downloaded", report.id, { audit_id: report.audit_id }, ip);
         const extension = report.format === "markdown" ? "md" : report.format;
         const mime =
@@ -1139,7 +1162,7 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
               : report.format === "pdf"
                 ? "application/pdf"
                 : "text/markdown";
-        return new Response(Bun.file(report.path), {
+        return new Response(bytes, {
           headers: {
             "content-type": mime,
             "content-disposition": `attachment; filename="argus-${report.audit_id}-${report.id}.${extension}"`,
@@ -1235,6 +1258,15 @@ function streamEvents(deps: ApiDeps, request: Request, auditId: string, after: n
       }),
     includeEventId: true,
   });
+}
+
+function eventCursor(url: URL): number {
+  const raw = url.searchParams.get("after");
+  if (raw === null) return 0;
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) {
+    throw badRequest("after must be a non-negative integer");
+  }
+  return Number(raw);
 }
 
 function streamGlobalEvents(deps: ApiDeps, request: Request): Response {
@@ -1394,8 +1426,8 @@ function validateSettingValue(key: string, value: unknown): string | null {
   };
   if (key in numberRules) {
     const [min, max] = numberRules[key]!;
-    if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max) {
-      return `${key} must be a number between ${min} and ${max}`;
+    if (typeof value !== "number" || !Number.isInteger(value) || value < min || value > max) {
+      return `${key} must be an integer between ${min} and ${max}`;
     }
     return null;
   }

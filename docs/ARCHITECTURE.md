@@ -48,7 +48,10 @@ subagent mechanism and never sends the whole workflow as one prompt.
   queued tasks. Claims use a conditional `UPDATE ... WHERE status='queued'`, so
   duplicate execution is prevented even if reconciliation races.
 - Concurrency is bounded by the global setting, the audit config, the project
-  ceiling, and each role's `concurrency_limit`.
+  ceiling, and each role's `concurrency_limit`. A configured project ceiling is
+  shared across all audits of that project; tasks still marked `running`,
+  including those in cancelling audits, occupy a slot until they finish.
+  A null project ceiling adds no limit beyond the global, audit, and role caps.
 - A process-local audit lock serializes phase transitions. Scheduler wakeups
   are coalesced, and every completion/failure triggers another reconcile.
 - Phase transitions and evidence appends use separate `KeyedSerialQueue`
@@ -168,6 +171,10 @@ This is the step that makes two agreeing LLMs insufficient.
 - HTML rendered from the redacted Markdown with print styles.
 - PDF via headless Chrome when available, otherwise a dependency-free text PDF
   writer. Report bytes are hashed and recorded.
+- Every generation uses its report UUID in the filename and exclusive file
+  creation, so simultaneous requests cannot overwrite another report even when
+  their timestamps match. Downloads recompute the stored SHA-256 and fail closed
+  when the file no longer matches its database record.
 
 ## 3. Persistence and recovery
 

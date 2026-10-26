@@ -28,20 +28,41 @@ export async function readJson(request: Request): Promise<Record<string, unknown
   if (!request.headers.get("content-type")?.includes("application/json")) {
     throw badRequest("Expected application/json");
   }
-  const body = (await request.json()) as unknown;
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  let size = 0;
+  if (request.body) {
+    const reader = request.body.getReader();
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > 2_000_000) {
+          await reader.cancel();
+          throw new AppError(413, "body_too_large", "Request body exceeds 2 MB");
+        }
+        chunks.push(decoder.decode(value, { stream: true }));
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+  chunks.push(decoder.decode());
+  const body: unknown = JSON.parse(chunks.join(""));
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     throw badRequest("Expected a JSON object");
   }
   return body as Record<string, unknown>;
 }
 
-export function requireString(body: Record<string, unknown>, key: string, max = 20_000): string {
+export function requireString(body: Record<string, unknown>, key: string, max = 20_000, trim = true): string {
   const value = body[key];
-  if (typeof value !== "string" || value.trim().length === 0) {
+  if (typeof value !== "string" || (trim ? value.trim() : value).length === 0) {
     throw badRequest(`${key} is required`);
   }
   if (value.length > max) throw badRequest(`${key} exceeds ${max} characters`);
-  return value.trim();
+  return trim ? value.trim() : value;
 }
 
 export function optionalString(body: Record<string, unknown>, key: string, max = 20_000): string | null {
@@ -64,8 +85,6 @@ export function requireStringArray(body: Record<string, unknown>, key: string, f
   return [...new Set(value.map((entry) => String(entry).trim()).filter(Boolean))];
 }
 
-export function clientIp(request: Request): string {
-  const forwarded = request.headers.get("x-forwarded-for");
-  if (forwarded) return forwarded.split(",")[0]!.trim();
-  return request.headers.get("x-real-ip") ?? "local";
+export function clientIp(peerAddress?: string): string {
+  return peerAddress ?? "local";
 }

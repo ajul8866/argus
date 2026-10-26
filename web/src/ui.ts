@@ -1,6 +1,44 @@
 type Child = Node | string | number | null | undefined | false;
 type Attrs = Record<string, unknown>;
 
+const ICON_PATHS = {
+  overview: "M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z",
+  projects: "M3 7V5a1 1 0 0 1 1-1h5l2 3h9a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7z",
+  audits: "M8 3H5v18h14V3h-3 M8 2h8v4H8z M8 11h8 M8 15h5",
+  explorer: "M8 5 2 12l6 7 M16 5l6 7-6 7 M14 3l-4 18",
+  harnesses: "M5 3v6 M10 3v6 M3 9h9v3a5 5 0 0 1-5 5v4 M17 4h4v16h-7v-4",
+  agents: "M8 3h8v4H8z M5 11h14v9H5z M8 15h.01 M16 15h.01 M12 7v4 M2 14v3 M22 14v3",
+  skills: "M13 2 4 14h7l-1 8 10-13h-7l1-7z",
+  mcp: "M8 3h8v5H8z M2 16h7v5H2z M15 16h7v5h-7z M12 8v4 M5.5 16v-4h13v4",
+  tasks: "M3 5h2 M9 5h12 M3 12h2 M9 12h12 M3 19h2 M9 19h12",
+  approvals: "M12 2 3 6v6c0 5 9 10 9 10s9-5 9-10V6l-9-4z M8 12l3 3 5-6",
+  findings: "M12 3 2 21h20L12 3z M12 9v5 M12 17h.01",
+  reports: "M5 2h9l5 5v15H5z M14 2v6h5 M9 12h6 M9 16h6",
+  settings: "M4 7h16 M4 17h16 M8 4v6 M16 14v6",
+  logout: "M9 3H4v18h5 M9 12h12 M16 7l5 5-5 5",
+  activity: "M2 12h5l3-8 4 16 3-8h5",
+} as const;
+
+export type IconName = keyof typeof ICON_PATHS;
+
+export function icon(name: IconName): SVGSVGElement {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("width", "18");
+  svg.setAttribute("height", "18");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "1.5");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("class", "icon");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", ICON_PATHS[name]);
+  svg.append(path);
+  return svg;
+}
+
 export function h<K extends keyof HTMLElementTagNameMap>(
   tag: K,
   attrs: Attrs = {},
@@ -197,7 +235,10 @@ export function emptyState(title: string, detail: string, action?: Child): HTMLE
 }
 
 export function loading(label = "Loading"): HTMLElement {
-  return h("div", { class: "loading-state" }, h("span", { class: "spinner" }), label);
+  return h("div", { class: "loading-state", role: "status", "aria-live": "polite" },
+    h("div", { class: "loading-lines", "aria-hidden": "true" }, h("span"), h("span"), h("span")),
+    h("span", {}, label),
+  );
 }
 
 export function errorState(message: string, retry?: () => void): HTMLElement {

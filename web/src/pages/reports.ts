@@ -82,7 +82,7 @@ export async function renderReports(root: HTMLElement, params: URLSearchParams):
           h("select", {
             class: "input select",
             "aria-label": "Select audit for reports",
-            style: { minWidth: "340px" },
+            style: { width: "340px", maxWidth: "100%", minWidth: "0" },
             onchange: (event: Event) => {
               location.hash = `#/reports?audit=${(event.target as HTMLSelectElement).value}`;
             },

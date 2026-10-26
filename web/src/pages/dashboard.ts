@@ -1,10 +1,8 @@
 import { api, session } from "../api.ts";
 import {
-  badge,
   button,
   emptyState,
   errorState,
-  formatDate,
   h,
   loading,
   pageHeader,
@@ -92,7 +90,7 @@ export async function renderDashboard(root: HTMLElement): Promise<void> {
     const harnesses = overview.harnesses.map((harness) =>
       h(
         "div",
-        { class: "row-between", style: { padding: "9px 0", borderBottom: "1px solid rgba(30,46,60,.55)" } },
+        { class: "runtime-row" },
         h("div", {},
           h("div", { class: "row", style: { gap: "7px" } },
             h("span", { class: "strong small" }, harness.label),
@@ -100,7 +98,7 @@ export async function renderDashboard(root: HTMLElement): Promise<void> {
           ),
           h("div", { class: "tiny muted" }, harness.detail || "No health check yet"),
         ),
-        h("a", { class: "btn btn-ghost btn-sm", href: "#/harnesses" }, harness.version ? `v${harness.version}` : "Configure"),
+        h("a", { class: "runtime-version", href: "#/harnesses" }, harness.version ? `v${harness.version}` : "Configure"),
       ),
     );
 
@@ -175,7 +173,7 @@ export async function renderDashboard(root: HTMLElement): Promise<void> {
       ),
       h(
         "div",
-        { class: "stat-grid" },
+        { class: "stat-grid dashboard-summary" },
         h(
           "div",
           { class: "stat-card record-lead" },
@@ -198,17 +196,24 @@ export async function renderDashboard(root: HTMLElement): Promise<void> {
         statCard("Verified findings", verified, unresolved ? `${unresolved} unresolved` : "independent retest complete", "good"),
         statCard("Pending approvals", overview.pending_approvals, "Shell and destructive actions", overview.pending_approvals ? "warn" : "good"),
       ),
+      ...(approvalsPanel ? [approvalsPanel] : []),
       h(
         "div",
-        { class: "grid grid-main" },
+        { class: "dashboard-workspace" },
         h(
           "div",
-          { class: "stack" },
+          { class: "dashboard-ledger" },
           section(
             "Recent audits",
             h("div", {}, ...auditRows),
             h("a", { class: "btn btn-ghost btn-sm", href: "#/audits" }, "All audits"),
           ),
+          section("Live activity", events, h("a", { class: "btn btn-ghost btn-sm", href: "#/tasks" }, "Task queue")),
+        ),
+        h(
+          "div",
+          { class: "dashboard-rail" },
+          section("Runtime health", h("div", {}, ...harnesses)),
           section(
             "Coverage matrix",
             h(
@@ -230,16 +235,9 @@ export async function renderDashboard(root: HTMLElement): Promise<void> {
               ),
             ),
           ),
-        ),
-        h(
-          "div",
-          { class: "stack" },
-          section("Runtime health", h("div", {}, ...harnesses)),
           section("Verified severity mix", verified ? h("div", { class: "stack" }, ...findingMix) : emptyState("No verified findings", "Findings only appear here after independent reverification.")),
         ),
       ),
-      ...(approvalsPanel ? [approvalsPanel] : []),
-      section("Live activity", events, h("a", { class: "btn btn-ghost btn-sm", href: "#/tasks" }, "Task queue")),
       h(
         "div",
         { class: "row" },

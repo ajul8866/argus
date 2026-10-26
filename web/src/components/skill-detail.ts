@@ -59,7 +59,7 @@ export async function renderSkillDetail(root: HTMLElement, skill: LocalSkill, ca
         save.disabled = false;
       } finally { permissions.disabled = false; }
     };
-    const preview = h("pre", { class: "local-file-preview", tabindex: 0, "aria-label": "Skill file contents" });
+    const preview = h("textarea", { class: "local-file-preview", name: "skill_file_contents", readonly: true, spellcheck: "false", "aria-label": "Skill file contents" });
     const filename = h("span", { class: "mono small" }, "SKILL.md");
     const fileTree = h("nav", { class: "local-files", "aria-label": "Skill files" });
     let readVersion = 0;

@@ -39,5 +39,14 @@ The spacing scale, the type scale, the easings and the durations are the scaffol
 ## Motion
 - Character: still; values change over `--dur-short` with `--ease-out`, `transform` and `opacity` only, no reveal, no glow. Under reduced motion everything ends at once.
 
+## Workspace composition
+- Keep the 13-destination sidebar, using one set of line icons and an amber current selection. On small screens the existing Menu control opens the sidebar.
+- Cap the content at `--content-width` (1312px); use `--gutter` (40px desktop, 24px tablet, 16px phone). The desktop sidebar is `--sidebar-width` (224px).
+- Overview: a ruled metric strip followed by the audit ledger. Recent audits and live activity share one surface; runtime health, coverage and severity form the companion column. Existing API data supplies every figure.
+- Tables use horizontal rules. Tables, logs, empty states and usage figures inside a panel share its surface rather than gaining another card border.
+- The Skills catalog has a bounded scrolling list alongside the detail. At 1050px and below the list sits above the detail; the list keeps a bounded height so permissions remain reachable.
+- Skill source files use a read-only native text area, preserving keyboard scrolling and text selection without executing file contents.
+- Shared loading states show a static skeleton with a live status label. Error messages, retry controls and empty-state actions retain their existing behavior.
+
 ## Exports
 `web/src/tokens.css` in this project. Tailwind, DTCG or shadcn blocks are added here on request, per `export-formats.md`.

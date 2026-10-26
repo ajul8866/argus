@@ -5,9 +5,11 @@ import {
   button,
   closeOverlays,
   h,
+  icon,
   input,
   loading,
   toast,
+  type IconName,
 } from "./ui.ts";
 import { renderDashboard } from "./pages/dashboard.ts";
 import { renderProjects, renderProjectDetail } from "./pages/projects.ts";
@@ -24,33 +26,33 @@ import { renderSkills } from "./pages/skills.ts";
 import { renderMcp } from "./pages/mcp.ts";
 import { openAuditCreate } from "./components/audit-create.ts";
 
-const NAV_GROUPS: Array<{ label: string; items: Array<{ route: string; label: string }> }> = [
+const NAV_GROUPS: Array<{ label: string; items: Array<{ route: string; label: string; icon: IconName }> }> = [
   {
     label: "Operate",
     items: [
-      { route: "dashboard", label: "Overview" },
-      { route: "projects", label: "Projects" },
-      { route: "audits", label: "Audits" },
-      { route: "explorer", label: "Explorer" },
+      { route: "dashboard", label: "Overview", icon: "overview" },
+      { route: "projects", label: "Projects", icon: "projects" },
+      { route: "audits", label: "Audits", icon: "audits" },
+      { route: "explorer", label: "Explorer", icon: "explorer" },
     ],
   },
   {
     label: "Execution",
     items: [
-      { route: "harnesses", label: "Harnesses" },
-      { route: "agents", label: "Agents" },
-      { route: "skills", label: "Skills" },
-      { route: "mcp", label: "MCP servers" },
-      { route: "tasks", label: "Tasks" },
-      { route: "approvals", label: "Approvals" },
+      { route: "harnesses", label: "Harnesses", icon: "harnesses" },
+      { route: "agents", label: "Agents", icon: "agents" },
+      { route: "skills", label: "Skills", icon: "skills" },
+      { route: "mcp", label: "MCP servers", icon: "mcp" },
+      { route: "tasks", label: "Tasks", icon: "tasks" },
+      { route: "approvals", label: "Approvals", icon: "approvals" },
     ],
   },
   {
     label: "Assurance",
     items: [
-      { route: "findings", label: "Findings" },
-      { route: "reports", label: "Reports" },
-      { route: "settings", label: "Settings" },
+      { route: "findings", label: "Findings", icon: "findings" },
+      { route: "reports", label: "Reports", icon: "reports" },
+      { route: "settings", label: "Settings", icon: "settings" },
     ],
   },
 ];
@@ -118,6 +120,7 @@ function shell(): void {
       h("div", { class: "nav-label" }, group.label),
       ...group.items.map((item) =>
         h("a", { href: `#/${item.route}`, "data-route": item.route, class: item.route === currentRoute ? "active" : "" },
+          icon(item.icon),
           h("span", {}, item.label),
         ),
       ),
@@ -127,13 +130,14 @@ function shell(): void {
   const sidebar = h(
     "aside",
     { class: "sidebar", id: "sidebar" },
-    h("a", { class: "brand", href: "#/dashboard", style: { textDecoration: "none" } },
+    h("a", { class: "brand", href: "#/dashboard", "aria-label": "Argus home", style: { textDecoration: "none" } },
       h("div", { class: "brand-mark" }, "A"),
       h("div", {}, h("div", { class: "brand-name" }, "Argus"), h("div", { class: "brand-sub" }, "autonomous audit")),
     ),
     h("nav", { "aria-label": "Main navigation" }, ...nav),
     h("div", { class: "sidebar-foot" },
       h("div", { class: "live-indicator", id: "live-indicator", role: "status", "aria-live": "polite", "aria-atomic": "true" },
+        icon("activity"),
         h("span", { id: "live-label" }, liveConnected ? "Live" : "Offline"),
       ),
       h("div", { class: "user-chip" },
@@ -143,7 +147,7 @@ function shell(): void {
           h("div", { class: "user-role" }, session.user?.role ?? ""),
         ),
       ),
-      h("button", { class: "btn btn-ghost btn-sm", type: "button", onclick: logout }, "Sign out"),
+      h("button", { class: "btn btn-ghost btn-sm", type: "button", onclick: logout }, icon("logout"), "Sign out"),
     ),
   );
 
@@ -261,6 +265,7 @@ async function renderRoute(): Promise<void> {
   focusRestore = null;
   const view = document.getElementById("view");
   if (!view) return;
+  view.dataset.route = parsed.route;
   liveRefresh.onRendered();
   const target = document.createElement("div");
   target.style.display = "contents";

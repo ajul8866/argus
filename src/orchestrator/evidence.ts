@@ -208,8 +208,7 @@ export class EvidenceStore {
       const info = await handle.stat();
       if (!info.isFile()) return { ok: false, reason: "Evidence file is missing or unreadable" };
       if (info.size > limit) return { ok: false, reason: "Evidence file is larger than the recorded content" };
-      const loaded = await handle.readFile({ encoding: "utf8" });
-      const raw = typeof loaded === "string" ? loaded : loaded.toString("utf8");
+      const raw = await handle.readFile({ encoding: "utf8" });
       if (Buffer.byteLength(raw) > limit) {
         return { ok: false, reason: "Evidence file is larger than the recorded content" };
       }

@@ -100,7 +100,9 @@ the commit/ref, and rejects empty/invalid snapshots.
 Audit overrides: `max_areas`, `max_candidates_per_area`, `max_confirmations`,
 `max_reverifications`, `max_concurrent_agents`, `task_timeout_ms`,
 `require_distinct_harness_for_retest`, `max_cost_usd`, `harness_overrides`, and
-`writable_workspace`. `writable_workspace: true` is rejected unless
+`writable_workspace`. `max_cost_usd: 0` is a real ceiling: any positive reported
+session cost fails the audit. Omit the field or send `null` for no audit-level
+cost ceiling. `writable_workspace: true` is rejected unless
 `security.allow_writable_workspace` is already enabled; it makes every harness
 task require an `allow_writable_workspace` approval.
 

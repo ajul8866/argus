@@ -502,6 +502,45 @@ test("reports generated in the same millisecond preserve separate files and thei
   }
 });
 
+test("a zero cost ceiling is saved and stops the audit after reported spend", async () => {
+  const capped = engine.createAudit({
+    projectId: "p1",
+    repositoryId: "r1",
+    userId: "u1",
+    overrides: { max_cost_usd: 0 },
+  });
+  const positive = engine.createAudit({
+    projectId: "p1",
+    repositoryId: "r1",
+    userId: "u1",
+    overrides: { max_cost_usd: 1.5 },
+  });
+  const unlimited = engine.createAudit({
+    projectId: "p1",
+    repositoryId: "r1",
+    userId: "u1",
+    overrides: {},
+  });
+  const configFor = (id: string) => JSON.parse(
+    store.get<{ config: string }>("SELECT config FROM audits WHERE id = ?", id)!.config,
+  ).max_cost_usd;
+  expect(configFor(capped)).toBe(0);
+  expect(configFor(positive)).toBe(1.5);
+  expect(configFor(unlimited)).toBeNull();
+
+  const run = manager.run.bind(manager);
+  manager.run = async (...args) => {
+    const result = await run(...args);
+    return { ...result, usage: { ...result.usage, cost_usd: 0.01 } };
+  };
+  await engine.startAudit(capped, "u1");
+  await waitFor(() => store.get<{ status: string }>("SELECT status FROM audits WHERE id = ?", capped)?.status === "failed");
+  const failed = store.get<{ status: string; error: string | null }>("SELECT status, error FROM audits WHERE id = ?", capped);
+  expect(failed).toMatchObject({ status: "failed" });
+  expect(failed?.error).toContain("cost budget exceeded");
+  expect(failed?.error).toContain("$0.0000");
+});
+
 test("invalid audit overrides are rejected before an audit is saved", () => {
   for (const overrides of [
     { max_areas: "invalid" }, { max_concurrent_agents: 1.5 }, { max_confirmations: -1 },

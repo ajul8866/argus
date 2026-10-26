@@ -1,8 +1,9 @@
-import { api } from "../api.ts";
+import { api, session } from "../api.ts";
 import { importRepository, openAuditCreate, openProjectCreate } from "../components/audit-create.ts";
 import {
   button,
   emptyState,
+  disclosure,
   errorState,
   field,
   formatDate,
@@ -57,6 +58,7 @@ export async function renderProjects(root: HTMLElement): Promise<void> {
   root.replaceChildren(loading("Loading projects"));
   try {
     const { projects } = await api<{ projects: Project[] }>("/api/projects");
+    const canManage = session.user?.role === "admin" || session.user?.role === "auditor";
     const content = projects.length
       ? h(
           "div",
@@ -84,9 +86,9 @@ export async function renderProjects(root: HTMLElement): Promise<void> {
                 h("td", {},
                   h("div", { class: "table-actions" },
                     h("a", { class: "btn btn-sm btn-secondary", href: `#/projects/${project.id}` }, "Open"),
-                    button("Import", async () => {
+                    canManage ? button("Import", async () => {
                       await importRepository(project.id);
-                    }, "ghost", { class: "btn-sm" }),
+                    }, "ghost", { class: "btn-sm" }) : null,
                   ),
                 ),
               ),
@@ -95,15 +97,15 @@ export async function renderProjects(root: HTMLElement): Promise<void> {
         )
       : emptyState(
           "No projects yet",
-          "Add a repository folder, import a snapshot, and then start an audit.",
-          button("Create project", () => void openProjectCreate(), "primary"),
+          "Choose a repository folder. Argus imports its files automatically.",
+          canManage ? button("Create project", () => void openProjectCreate(), "primary") : null,
         );
 
     root.replaceChildren(
-      pageHeader("Projects", "Your repositories, snapshots, and audit history.", button("New project", () => void openProjectCreate(), "primary")),
+      pageHeader("Projects", "Your repositories, snapshots, and audit history.", canManage ? button("New project", () => void openProjectCreate(), "primary") : null),
       h("div", { class: "stack" },
         section("Project registry", content, h("span", { class: "tiny muted" }, `${projects.length} project${projects.length === 1 ? "" : "s"}`)),
-        h("div", { class: "grid grid-2" },
+        disclosure("About source snapshots", h("div", { class: "grid grid-2" },
           section("Source control", h("div", { class: "narrative" },
             h("p", {}, "Argus imports a snapshot of the repository worktree or a specific git ref. Agents only receive a read-only copy of files inside the configured include scope."),
             h("div", { class: "callout" },
@@ -114,8 +116,8 @@ export async function renderProjects(root: HTMLElement): Promise<void> {
           section("Recommended workflow", h("div", { class: "timeline" },
             ...[
               ["Add a project", "Enter a name and the repository folder."],
-              ["Import a snapshot", "Pin a commit or worktree state; the inventory is hashed."],
-              ["Assign harnesses", "Pi and Claude Code can serve different roles."],
+              ["Files are imported", "Argus saves a source snapshot automatically."],
+              ["Connect an AI runtime", "Use AI setup once to choose Pi or Claude Code."],
               ["Run the six phases", "Mapping, discovery, confirmation, findings, retest, reports."],
               ["Review and export", "Inspect provenance, evidence, and limitations."],
             ].map(([title, detail], index) =>
@@ -126,7 +128,7 @@ export async function renderProjects(root: HTMLElement): Promise<void> {
               ),
             ),
           )),
-        ),
+        )),
       ),
     );
   } catch (error) {
@@ -139,6 +141,7 @@ export async function renderProjectDetail(root: HTMLElement, projectId: string):
   try {
     const detail = await api<{ project: Project; repositories: Repository[]; audits: Audit[] }>(`/api/projects/${projectId}`);
     const project = detail.project;
+    const canManage = session.user?.role === "admin" || session.user?.role === "auditor";
 
     const repositories = detail.repositories.length
       ? h(
@@ -161,7 +164,7 @@ export async function renderProjectDetail(root: HTMLElement, projectId: string):
             )),
           ),
         )
-      : emptyState("No repository snapshot", "Import a snapshot to build the inventory and start an audit.", button("Import snapshot", () => void openImport(project.id), "primary"));
+      : emptyState("No files imported yet", "Start an audit to import the project files automatically.");
 
     const audits = detail.audits.length
       ? h(
@@ -180,15 +183,15 @@ export async function renderProjectDetail(root: HTMLElement, projectId: string):
             )),
           ),
         )
-      : emptyState("No audits", "Create the first six-phase audit for the newest snapshot.", button("New audit", () => void openAuditCreate(project.id), "primary"));
+      : emptyState("No audits", "Create the first six-phase audit for the newest snapshot.", canManage ? button("New audit", () => void openAuditCreate(project.id), "primary") : null);
 
     root.replaceChildren(
       pageHeader(
         project.name,
         project.description || "Repository snapshots and audit history.",
         h("div", { class: "row" },
-          button("Import snapshot", () => void openImport(project.id), "secondary"),
-          button("New audit", () => void openAuditCreate(project.id), "primary"),
+          canManage ? button("Refresh files", () => void importRepository(project.id), "secondary") : null,
+          canManage ? button("New audit", () => void openAuditCreate(project.id), "primary") : null,
         ),
       ),
       h("div", { class: "grid grid-main" },
@@ -206,7 +209,9 @@ export async function renderProjectDetail(root: HTMLElement, projectId: string):
             h("dt", {}, "Status"), h("dd", {}, statusBadge(project.status)),
             h("dt", {}, "Created"), h("dd", {}, formatDate(project.created_at)),
           )),
-          section("Scope", h("div", { class: "stack" },
+          disclosure("Source scope and versions",
+            canManage ? button("Import a specific git ref", () => void openImport(project.id), "secondary") : null,
+            section("Scope", h("div", { class: "stack" },
             h("div", {},
               h("div", { class: "tiny muted" }, "Include"),
               h("div", { class: "chip-row" }, ...project.scope_include.map((glob) => h("span", { class: "chip on mono" }, glob))),
@@ -215,7 +220,7 @@ export async function renderProjectDetail(root: HTMLElement, projectId: string):
               h("div", { class: "tiny muted" }, "Exclude"),
               h("div", { class: "chip-row" }, ...project.scope_exclude.map((glob) => h("span", { class: "chip mono" }, glob))),
             ),
-          )),
+          ))),
         ),
       ),
     );

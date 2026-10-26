@@ -3,6 +3,7 @@ import { ApiError, api, loadSession, session } from "../web/src/api.ts";
 import { classifyExplorerPath } from "../web/src/pages/explorer.ts";
 import { createLiveRefresh, LIVE_REFRESH_DEBOUNCE_MS } from "../web/src/live-refresh.ts";
 import { shouldDeferRefresh, shouldRefreshOnReturn } from "../web/src/refresh-policy.ts";
+import { createAuditWithSnapshot, createProjectWithSnapshot } from "../web/src/components/audit-setup.ts";
 
 type Dispatched = { type: string };
 
@@ -56,6 +57,69 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
   if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow);
   else Reflect.deleteProperty(globalThis, "window");
+});
+
+describe("project and audit setup", () => {
+  function script(results: Array<{ status?: number; body: unknown }>) {
+    const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ path: String(input), body: init?.body ? JSON.parse(String(init.body)) : {} });
+      const next = results.shift();
+      if (!next) throw new Error("Unexpected extra request");
+      return response(next.status ?? 200, next.body);
+    }) as typeof fetch;
+    return calls;
+  }
+
+  test("adding a project imports its files without a second user action", async () => {
+    const calls = script([{ body: { project: { id: "p1" } } }, { body: { repository: { id: "r1" } } }]);
+    expect(await createProjectWithSnapshot({ name: "App", source_path: "/host/app" })).toEqual({ id: "p1", importError: null });
+    expect(calls.map((call) => call.path)).toEqual(["/api/projects", "/api/projects/p1/import"]);
+  });
+
+  test("an import failure retains the newly created project for recovery", async () => {
+    const calls = script([{ body: { project: { id: "p1" } } }, { status: 400, body: { error: { message: "No source files" } } }]);
+    expect(await createProjectWithSnapshot({ name: "App", source_path: "/host/app" })).toEqual({ id: "p1", importError: "No source files" });
+    expect(calls.filter((call) => call.path === "/api/projects")).toHaveLength(1);
+  });
+
+  test("a project creation failure never attempts to import files", async () => {
+    const calls = script([{ status: 403, body: { error: { message: "Access denied" } } }]);
+    await expect(createProjectWithSnapshot({ name: "App", source_path: "/host/app" })).rejects.toThrow("Access denied");
+    expect(calls).toHaveLength(1);
+  });
+
+  test("starting an audit automatically imports missing files and keeps server defaults", async () => {
+    const calls = script([{ body: { repository: { id: "r1" } } }, { body: { audit: { id: "a1" } } }, { body: { ok: true } }]);
+    expect(await createAuditWithSnapshot({ projectId: "p1", startNow: true })).toEqual({ id: "a1", startError: null });
+    expect(calls.map((call) => call.path)).toEqual(["/api/projects/p1/import", "/api/audits", "/api/audits/a1/start"]);
+    expect(calls[1]?.body).toEqual({ project_id: "p1", repository_id: "r1", overrides: {} });
+  });
+
+  test("an existing snapshot is used without an unnecessary import", async () => {
+    const calls = script([{ body: { audit: { id: "a1" } } }, { body: { ok: true } }]);
+    await createAuditWithSnapshot({ projectId: "p1", repositoryId: "r1", startNow: true });
+    expect(calls.map((call) => call.path)).toEqual(["/api/audits", "/api/audits/a1/start"]);
+  });
+
+  test("a failed automatic import never creates an unusable audit", async () => {
+    const calls = script([{ status: 400, body: { error: { message: "No source files" } } }]);
+    await expect(createAuditWithSnapshot({ projectId: "p1", startNow: true })).rejects.toThrow("No source files");
+    expect(calls.map((call) => call.path)).toEqual(["/api/projects/p1/import"]);
+  });
+
+  test("a start failure returns the saved audit instead of creating a duplicate", async () => {
+    const calls = script([{ body: { audit: { id: "a1" } } }, { status: 409, body: { error: { message: "Cannot start yet" } } }]);
+    expect(await createAuditWithSnapshot({ projectId: "p1", repositoryId: "r1", startNow: true })).toEqual({ id: "a1", startError: "Cannot start yet" });
+    expect(calls.filter((call) => call.path === "/api/audits")).toHaveLength(1);
+  });
+
+  test("saving for later preserves overrides without starting model work", async () => {
+    const calls = script([{ body: { audit: { id: "a1" } } }]);
+    await createAuditWithSnapshot({ projectId: "p1", repositoryId: "r1", startNow: false, overrides: { max_cost_usd: 5 } });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.body.overrides).toEqual({ max_cost_usd: 5 });
+  });
 });
 
 describe("web API unauthorized handling", () => {

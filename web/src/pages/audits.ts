@@ -112,13 +112,13 @@ export async function renderAudits(root: HTMLElement): Promise<void> {
       ),
     );
     root.replaceChildren(
-      pageHeader("Audits", "Six-phase autonomous assessments, execution history, and final reports.", button("New audit", () => void openAuditCreate(), "primary")),
+      pageHeader("Audits", "Six-phase autonomous assessments, execution history, and final reports.", session.user?.role !== "viewer" ? button("New audit", () => void openAuditCreate(), "primary") : null),
       audits.length
         ? section(`${audits.length} audits`, h("div", { class: "table-wrap" }, h("table", {},
             h("thead", {}, h("tr", {}, h("th", {}, "Project / audit"), h("th", { class: "col-optional" }, "Status"), h("th", { class: "col-optional" }, "Phase"), h("th", { class: "col-optional" }, "Findings"), h("th", { class: "col-optional" }, "Active"), h("th", { class: "col-optional" }, "Created"), h("th", {}, ""))),
             h("tbody", {}, ...rows),
           )))
-        : emptyState("No audits", "Create a project, import a repository, and start the first six-phase audit.", button("New audit", () => void openAuditCreate(), "primary")),
+        : emptyState("No audits", "Choose a project and start an audit. Files are imported automatically when needed.", session.user?.role !== "viewer" ? button("New audit", () => void openAuditCreate(), "primary") : null),
     );
   } catch (error) {
     root.replaceChildren(errorState(error instanceof Error ? error.message : "Unable to load audits", () => void renderAudits(root)));
@@ -151,7 +151,7 @@ export async function renderAuditDetail(root: HTMLElement, auditId: string, para
     const completedPhases = detail.phases.filter((phase) => ["completed", "skipped"].includes(phase.status)).length;
     const approvals = approvalsResult.approvals.filter((approval) => approval.audit_id === auditId);
 
-    const startButton = audit.status === "queued"
+    const startButton = session.user?.role !== "viewer" && audit.status === "queued"
       ? button("Start audit", async () => {
           try {
             await api(`/api/audits/${auditId}/start`, { method: "POST" });
@@ -162,7 +162,7 @@ export async function renderAuditDetail(root: HTMLElement, auditId: string, para
           }
         }, "primary")
       : null;
-    const cancelButton = ["running", "cancelling"].includes(audit.status)
+    const cancelButton = session.user?.role !== "viewer" && ["running", "cancelling"].includes(audit.status)
       ? button("Cancel audit", async () => {
           if (!(await confirmAction("Cancel audit", "Active harness tasks will be stopped, queued tasks cancelled, and the audit closed as cancelled.", "Cancel audit"))) return;
           try {
@@ -249,7 +249,7 @@ export async function renderAuditDetail(root: HTMLElement, auditId: string, para
           startButton,
           cancelButton,
           h("a", { class: "btn btn-secondary", href: `#/projects/${audit.project_id}` }, "Project"),
-          button("New audit", () => void openAuditCreate(audit.project_id), "ghost"),
+          session.user?.role !== "viewer" ? button("New audit", () => void openAuditCreate(audit.project_id), "ghost") : null,
         ),
       ),
       h("div", { class: "grid grid-main" },

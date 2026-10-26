@@ -17,9 +17,12 @@ runtime. Install the tools you plan to use separately:
 
 Make sure `pi --version` and/or `claude --version` work in the environment
 that starts Argus. Use `ARGUS_PI_BIN` and `ARGUS_CLAUDE_BIN` for custom binary
-paths. In the dashboard, open **Harnesses → Configure** and select your
-provider and model. Set each enabled role's model in **Agents** as well;
-the initial Pi preset may not exist in your provider's model catalog.
+paths. In the dashboard, open **Settings → Open AI setup → Configure** and
+select your provider and model. The initial Pi preset may not exist in your
+provider's model catalog. Press **Use for audits** to assign that runtime and
+its model to all four audit roles in one action. Only the chosen runtime is
+needed; validation still runs in separate sessions. Per-role customization is
+available under **Advanced tools → Agents**.
 
 Supply the provider's expected environment variable through Argus
 **Settings → Credentials**, or configure the supported harness environment
@@ -27,9 +30,9 @@ described below. A token stored only in a CLI's keychain or OAuth file is not
 automatically copied into an isolated agent session. Prefer a provider API key
 or supported environment token for this release.
 
-Use the default mixed workflow after configuring both harnesses, or explicitly
-assign the enabled roles and independence settings to the runtimes you have.
-Check/Test actions and audit tasks can call the provider and consume credits.
+The default mixed workflow remains available for users who configure both
+runtimes. The connection test is under **Technical details**; it and audit
+tasks can call the provider and consume credits.
 
 ## Capability matrix
 

@@ -310,7 +310,7 @@ export function harnessConfig(store: Store, kind: HarnessKind): HarnessConfig {
     ...DEFAULT_HARNESS_CONFIG[kind],
     ...parsed,
     executable: parsed.executable || row.executable || DEFAULT_HARNESS_CONFIG[kind].executable,
-    allowed_tools: parsed.allowed_tools?.length
+    allowed_tools: Array.isArray(parsed.allowed_tools)
       ? parsed.allowed_tools
       : DEFAULT_HARNESS_CONFIG[kind].allowed_tools,
     env: parsed.env ?? {},

@@ -26,35 +26,24 @@ import { renderSkills } from "./pages/skills.ts";
 import { renderMcp } from "./pages/mcp.ts";
 import { openAuditCreate } from "./components/audit-create.ts";
 
-const NAV_GROUPS: Array<{ label: string; items: Array<{ route: string; label: string; icon: IconName }> }> = [
-  {
-    label: "Operate",
-    items: [
-      { route: "dashboard", label: "Overview", icon: "overview" },
-      { route: "projects", label: "Projects", icon: "projects" },
-      { route: "audits", label: "Audits", icon: "audits" },
-      { route: "explorer", label: "Explorer", icon: "explorer" },
-    ],
-  },
-  {
-    label: "Execution",
-    items: [
-      { route: "harnesses", label: "Harnesses", icon: "harnesses" },
-      { route: "agents", label: "Agents", icon: "agents" },
-      { route: "skills", label: "Skills", icon: "skills" },
-      { route: "mcp", label: "MCP servers", icon: "mcp" },
-      { route: "tasks", label: "Tasks", icon: "tasks" },
-      { route: "approvals", label: "Approvals", icon: "approvals" },
-    ],
-  },
-  {
-    label: "Assurance",
-    items: [
-      { route: "findings", label: "Findings", icon: "findings" },
-      { route: "reports", label: "Reports", icon: "reports" },
-      { route: "settings", label: "Settings", icon: "settings" },
-    ],
-  },
+const NAV_GROUPS: Array<{ label: string; advanced?: boolean; items: Array<{ route: string; label: string; icon: IconName }> }> = [
+  { label: "Workspace", items: [
+    { route: "dashboard", label: "Overview", icon: "overview" },
+    { route: "projects", label: "Projects", icon: "projects" },
+    { route: "audits", label: "Audits", icon: "audits" },
+    { route: "findings", label: "Findings", icon: "findings" },
+    { route: "reports", label: "Reports", icon: "reports" },
+    { route: "settings", label: "Settings", icon: "settings" },
+  ] },
+  { label: "Advanced tools", advanced: true, items: [
+    { route: "harnesses", label: "AI setup", icon: "harnesses" },
+    { route: "agents", label: "Agents", icon: "agents" },
+    { route: "skills", label: "Skills", icon: "skills" },
+    { route: "mcp", label: "MCP servers", icon: "mcp" },
+    { route: "explorer", label: "Explorer", icon: "explorer" },
+    { route: "tasks", label: "Tasks", icon: "tasks" },
+    { route: "approvals", label: "Approvals", icon: "approvals" },
+  ] },
 ];
 
 const app = document.getElementById("app")!;
@@ -113,19 +102,15 @@ function installNavListeners(): void {
 }
 
 function shell(): void {
-  const nav = NAV_GROUPS.map((group) =>
-    h(
-      "div",
-      { class: "nav" },
-      h("div", { class: "nav-label" }, group.label),
-      ...group.items.map((item) =>
-        h("a", { href: `#/${item.route}`, "data-route": item.route, class: item.route === currentRoute ? "active" : "" },
-          icon(item.icon),
-          h("span", {}, item.label),
-        ),
-      ),
-    ),
-  );
+  const nav = NAV_GROUPS.map((group) => {
+    const links = group.items.map((item) => h("a", {
+      href: `#/${item.route}`, "data-route": item.route, class: item.route === currentRoute ? "active" : "",
+    }, icon(item.icon), h("span", {}, item.label)));
+    return group.advanced
+      ? h("details", { class: "nav nav-advanced", open: group.items.some((item) => item.route === currentRoute) },
+          h("summary", { tabindex: "0" }, group.label), ...links)
+      : h("div", { class: "nav" }, h("div", { class: "nav-label" }, group.label), ...links);
+  });
 
   const sidebar = h(
     "aside",
@@ -171,7 +156,7 @@ function shell(): void {
       ),
       h("div", { class: "topbar-right" },
         h("a", { class: "btn btn-secondary btn-sm", href: "#/findings" }, "Findings"),
-        button("New audit", () => void openAuditCreate(), "secondary", { class: "btn-sm" }),
+        session.user?.role !== "viewer" ? button("New audit", () => void openAuditCreate(), "secondary", { class: "btn-sm" }) : null,
       ),
     ),
     h("div", { id: "view", tabindex: "-1" }),
@@ -201,7 +186,11 @@ function syncNav(): void {
   for (const link of document.querySelectorAll<HTMLAnchorElement>(".nav a[data-route]")) {
     const active = link.dataset.route === currentRoute;
     link.classList.toggle("active", active);
-    if (active) link.setAttribute("aria-current", "page");
+    if (active) {
+      link.setAttribute("aria-current", "page");
+      const group = link.closest("details");
+      if (group) group.open = true;
+    }
     else link.removeAttribute("aria-current");
   }
   const label = document.getElementById("breadcrumb-label");

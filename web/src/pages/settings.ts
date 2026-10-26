@@ -4,6 +4,7 @@ import {
   button,
   confirmAction,
   emptyState,
+  disclosure,
   errorState,
   field,
   formatDate,
@@ -49,12 +50,12 @@ const SETTING_DEFS: Array<{ key: string; label: string; description: string; typ
 export async function renderSettings(root: HTMLElement): Promise<void> {
   root.replaceChildren(loading("Loading settings"));
   try {
+    const isAdmin = session.user?.role === "admin";
     const [settingsResponse, { users }, { entries }] = await Promise.all([
       api<SettingsResponse>("/api/settings"),
-      api<{ users: User[] }>("/api/users").catch(() => ({ users: [] })),
-      api<{ entries: AuditLog[] }>("/api/audit-log").catch(() => ({ entries: [] })),
+      isAdmin ? api<{ users: User[] }>("/api/users") : Promise.resolve({ users: [] }),
+      isAdmin ? api<{ entries: AuditLog[] }>("/api/audit-log") : Promise.resolve({ entries: [] }),
     ]);
-    const isAdmin = session.user?.role === "admin";
     const settings = settingsResponse.settings;
     const controls = new Map<string, HTMLElement>();
 
@@ -106,7 +107,7 @@ export async function renderSettings(root: HTMLElement): Promise<void> {
         control.setAttribute("aria-labelledby", labelId);
         control.setAttribute("aria-describedby", descriptionId);
       }
-      return h("div", { class: "setting-row" },
+      return h("div", { class: "setting-row", dataset: { settingKey: definition.key } },
         h("div", {}, h("div", { id: labelId, class: "setting-name" }, definition.label), h("div", { id: descriptionId, class: "setting-desc" }, definition.description)),
         h("div", { class: "setting-control" }, control),
       );
@@ -150,6 +151,13 @@ export async function renderSettings(root: HTMLElement): Promise<void> {
             updates[definition.key] = (control as HTMLInputElement).value;
           }
         }
+        for (const key of Object.keys(updates)) {
+          if (Object.is(updates[key], settings[key])) delete updates[key];
+        }
+        if (Object.keys(updates).length === 0) {
+          toast("No changes to save.", "info");
+          return;
+        }
         if (updates["security.allow_shell_tools"] === true) {
           if (!(await confirmAction("Enable shell tools?", "This permits agents assigned shell tools to request command execution. Each task still requires explicit administrator approval, but the risk surface expands.", "Enable shell tools"))) {
             resetDangerousToggles();
@@ -175,31 +183,37 @@ export async function renderSettings(root: HTMLElement): Promise<void> {
     };
 
     root.replaceChildren(
-      pageHeader("Settings", "Authentication, runtime policy, provider credentials, users, and security audit log.", null),
+      pageHeader("Settings", "Your account, AI connection, and audit defaults.", null),
       h("div", { class: "grid grid-main" },
         h("div", { class: "stack" },
-          section("Execution policy", isAdmin
-            ? h("div", {}, ...settingRows, h("div", { class: "form-actions" }, button("Save runtime settings", () => void saveSettings(), "primary", { "data-save-settings": "" })))
-            : h("div", { class: "callout warn" }, "Only administrators can modify runtime policy. Current values are shown for transparency.")),
+          isAdmin ? section("AI connection", h("div", { class: "stack" },
+            h("p", { class: "small muted" }, "Choose your audit runtime in AI setup. Add a credential below if its environment does not already provide one."),
+            h("a", { class: "btn btn-secondary", href: "#/harnesses" }, "Open AI setup"),
+          )) : null,
+          isAdmin ? section("Audit defaults", h("div", {},
+            ...settingRows.filter((row) => ["audit.max_concurrent_agents", "reports.organization", "reports.classification"].includes(row.dataset.settingKey ?? "")),
+            disclosure("Advanced execution settings", ...settingRows.filter((row) => !["audit.max_concurrent_agents", "reports.organization", "reports.classification"].includes(row.dataset.settingKey ?? ""))),
+            h("div", { class: "form-actions" }, button("Save settings", () => void saveSettings(), "primary", { "data-save-settings": "" })),
+          )) : null,
           isAdmin ? credentialsSection(settingsResponse, root) : null,
-          isAdmin ? usersSection(users, root) : null,
+          isAdmin ? disclosure("Manage users", usersSection(users, root)) : null,
         ),
         h("div", { class: "stack" },
           section("Your account", accountSection(root)),
-          section("Runtime posture", h("dl", { class: "kv" },
+          disclosure("Runtime details", section("Runtime posture", h("dl", { class: "kv" },
             h("dt", {}, "Version"), h("dd", {}, settingsResponse.version),
             h("dt", {}, "Sandbox mode"), h("dd", {}, h("span", { class: `badge ${settingsResponse.sandbox === "none" ? "badge-warn" : "badge-good"}` }, settingsResponse.sandbox)),
             h("dt", {}, "Data directory"), h("dd", { class: "mono tiny" }, settingsResponse.data_dir),
             h("dt", {}, "Allowed roots"), h("dd", { class: "mono tiny" }, settingsResponse.allowed_roots.join("\n")),
-          )),
-          section("Security model", h("div", { class: "narrative" },
+          ))),
+          disclosure("How execution and credentials are protected", section("Security model", h("div", { class: "narrative" },
             h("p", {}, "All assessments are restricted to authorized repositories. Scope is enforced by copying only in-scope files into isolated workspaces; agent prompts never define authorization."),
             h("p", {}, "Harness tools are read-only by default. Shell access is globally disabled, requires administrator enablement, and remains blocked per task until approval is recorded. Writable workspaces are also disabled by default, require an explicit per-audit request and a per-task approval, and never make the imported snapshot writable."),
             h("p", { class: "muted small" }, "Credentials are encrypted at rest with AES-256-GCM. Values are write-only through the API and are injected only into harness child processes."),
-          )),
+          ))),
         ),
       ),
-      ...(isAdmin ? [auditLogSection(entries)] : []),
+      ...(isAdmin ? [disclosure("Security activity", auditLogSection(entries))] : []),
     );
   } catch (error) {
     root.replaceChildren(errorState(error instanceof Error ? error.message : "Unable to load settings", () => void renderSettings(root)));
@@ -233,7 +247,7 @@ function accountSection(root: HTMLElement): HTMLElement {
 }
 
 function credentialsSection(settings: SettingsResponse, root: HTMLElement): HTMLElement {
-  const provider = input("provider", { placeholder: "magpie / anthropic / global", required: true });
+  const provider = input("provider", { value: "global", placeholder: "Provider name" });
   const envVar = input("env_var", { placeholder: "MCODE_PROVIDER_API_KEY", required: true });
   const value = input("value", { type: "password", placeholder: "write-only secret", required: true });
   const form = h("form", {
@@ -243,7 +257,7 @@ function credentialsSection(settings: SettingsResponse, root: HTMLElement): HTML
       try {
         await api("/api/credentials", {
           method: "PUT",
-          body: { provider: provider.value.trim().toLowerCase(), env_var: envVar.value.trim().toUpperCase(), value: value.value },
+          body: { provider: provider.value.trim().toLowerCase() || "global", env_var: envVar.value.trim().toUpperCase(), value: value.value },
         });
         toast("Credential encrypted and stored.", "success");
         await renderSettings(root);
@@ -253,10 +267,10 @@ function credentialsSection(settings: SettingsResponse, root: HTMLElement): HTML
     },
   },
     h("div", { class: "form-grid" },
-      field("Provider", provider, "Use global for provider-independent variables"),
       field("Environment variable", envVar, "Injected only into the harness process"),
       field("Secret value", value, "Never returned by the API; only last four characters are shown"),
     ),
+    disclosure("Limit to a provider (optional)", field("Provider", provider, "Global makes this variable available to both runtimes.")),
     h("div", { class: "form-actions" }, h("button", { class: "btn btn-secondary", type: "submit" }, "Store credential")),
   );
   return section("Provider credentials",
@@ -284,7 +298,7 @@ function credentialsSection(settings: SettingsResponse, root: HTMLElement): HTML
             )),
           ))
         : h("p", { class: "muted small" }, "No platform-managed credentials. Harnesses may still use their normally configured authentication."),
-      h("details", {}, h("summary", { class: "small muted", style: { cursor: "pointer" } }, "Add credential"), form),
+      disclosure("Add credential (optional)", form),
     ),
   );
 }

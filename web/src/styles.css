@@ -59,6 +59,9 @@
 
 .nav { display: flex; flex-direction: column; gap: var(--space-3xs); }
 .nav + .nav { margin-top: var(--space-lg); }
+.nav-advanced > summary { cursor: pointer; padding: var(--space-xs) var(--space-sm); font-size: var(--text-sm); color: var(--color-ink-2); }
+.nav-advanced > summary:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
+.nav-advanced:not([open]) > :not(summary) { display: none; }
 .nav-label { padding: 0 var(--space-sm); margin: 0 0 var(--space-xs); font-size: var(--text-xs); font-weight: 400; color: var(--color-muted); }
 .nav a {
   display: flex; align-items: center; gap: var(--space-sm);

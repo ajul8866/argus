@@ -30,6 +30,18 @@ LLM agents. Use it only on repositories you are authorized to assess.
 
 ## Execution isolation
 
+The AI setup page can explicitly assign one runtime to all four audit roles.
+This uses that runtime's default model, intersects native read tools with its
+configured tool cap, clears per-role shell access, and disables the optional
+preference for a different retest runtime for future audits. Validation and
+retesting still require fresh sessions; existing audits keep their saved
+configuration. No runtime is silently substituted when a CLI is missing.
+
+Settings confirmation is required when shell or writable workspaces transition
+from disabled to enabled. Saving unrelated settings, or retaining an already
+enabled value, does not ask again. Per-audit and per-task access decisions
+continue to apply.
+
 - Each task gets a fresh workspace copy containing only in-scope files. It is
   read-only by default; write access is an explicitly approved opt-in.
 - Each session gets a sanitized runtime home. Host credential files are not

@@ -57,6 +57,10 @@ Browse folders opens a host folder picker. It starts at the host user's home
 when available, marks Git repositories, supports filtering and subfolders, and
 fills the project name from the selection when the name is empty. No manual
 environment configuration is needed with the default source locations.
+After creating a project, the dashboard imports its files automatically. An
+import failure retains the project and surfaces the error so import can be
+retried without creating another project. The raw project API remains separate
+from the import endpoint for existing clients.
 Description, file patterns, and concurrent agents are under the collapsed
 Advanced settings section. Reports omit empty authorization metadata from
 Markdown, HTML, and PDF; JSON retains the fields for compatibility.
@@ -99,6 +103,12 @@ Audit overrides: `max_areas`, `max_candidates_per_area`, `max_confirmations`,
 `security.allow_writable_workspace` is already enabled; it makes every harness
 task require an `allow_writable_workspace` approval.
 
+The dashboard inherits server audit defaults and only submits edited overrides.
+For a project with no snapshot, it imports files before creating the audit.
+When start fails after creation, the saved audit is opened for recovery rather
+than leaving a form that could create another audit. Saved snapshots, limits,
+cost, deferred start, and enabled write requests are under Advanced audit settings.
+
 Task result shape for agent tasks:
 
 ```json
@@ -138,6 +148,7 @@ excerpts were verified by the platform. Reverification history is immutable.
 | `PUT` | `/api/harnesses/:kind` | admin | Save executable/model/permissions/tools |
 | `POST` | `/api/harnesses/:kind/check` | auditor | Real auth/health check |
 | `POST` | `/api/harnesses/:kind/test` | admin | Real minimal agent invocation |
+| `POST` | `/api/harnesses/:kind/assign` | admin | Explicitly use this runtime for all four audit roles |
 | `GET` | `/api/harnesses/:kind/models` | any | Detected model list |
 | `GET` | `/api/agents` | any | Role definitions |
 | `PUT` | `/api/agents/:role` | admin | Harness/model/tools/limits/enabled |
@@ -146,12 +157,19 @@ Harness config `env` values are redacted in reads. Secret-looking values must be
 stored through `/api/credentials`, not harness env. `bypassPermissions` and
 `dangerously-skip-permissions` are rejected.
 
+`POST /api/harnesses/:kind/assign` atomically assigns the four audit roles to
+the selected runtime, clears role-specific model overrides to inherit its model,
+enables those roles, and uses only native read tools within its configured cap.
+It clears per-role shell access and sets `audit.require_distinct_harness_for_retest`
+to false for future audits. Existing sessions and audit configurations are not
+rewritten. No tool-cap expansion or runtime substitution is performed.
+
 ## Settings, users, approvals
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
 | `GET` | `/api/settings` | any | Settings and runtime posture; credential metadata only for admins |
-| `PUT` | `/api/settings` | admin | Whitelisted settings; enabling shell requires `confirm_shell:true`; enabling writable workspaces requires `confirm_writable_workspace:true`; `security.sandbox_mode` accepts `auto`, `bwrap`, or `none` |
+| `PUT` | `/api/settings` | admin | Whitelisted settings; newly enabling shell requires `confirm_shell:true`; newly enabling writable workspaces requires `confirm_writable_workspace:true`; `security.sandbox_mode` accepts `auto`, `bwrap`, or `none` |
 | `GET` | `/api/credentials` | admin | Metadata only |
 | `PUT` | `/api/credentials` | admin | `{provider,env_var,value}`; encrypted |
 | `DELETE` | `/api/credentials/:id` | admin | Delete |

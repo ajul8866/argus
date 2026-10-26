@@ -3,6 +3,7 @@ import {
   badge,
   button,
   emptyState,
+  disclosure,
   errorState,
   field,
   h,
@@ -52,9 +53,11 @@ type TestResult = {
 export async function renderHarnesses(root: HTMLElement): Promise<void> {
   root.replaceChildren(loading("Detecting harnesses"));
   try {
-    const { harnesses } = await api<{ harnesses: Harness[] }>("/api/harnesses");
+    const [{ harnesses }, { agents }] = await Promise.all([
+      api<{ harnesses: Harness[] }>("/api/harnesses"),
+      api<{ agents: Array<{ role: string; harness: string; enabled: boolean }> }>("/api/agents"),
+    ]);
     const isAdmin = session.user?.role === "admin";
-    const isAuditor = isAdmin || session.user?.role === "auditor";
 
     const cards = harnesses.map((harness) => {
       const capabilities = Object.entries(harness.capabilities).filter(([, value]) => typeof value === "boolean");
@@ -68,24 +71,20 @@ export async function renderHarnesses(root: HTMLElement): Promise<void> {
             h("div", { class: "harness-sub" }, `${harness.executable}${harness.version ? `, version ${harness.version}` : ""}`),
           ),
           h("div", { class: "row" },
-            isAuditor ? button("Check", async () => {
-              try {
-                const result = await api<{ harness: Harness }>(`/api/harnesses/${harness.kind}/check`, { method: "POST", body: {} });
-                toast(result.harness.auth.ready ? "Harness authentication verified." : result.harness.detail, result.harness.auth.ready ? "success" : "error");
-                await renderHarnesses(root);
-              } catch (error) {
-                toast(error instanceof Error ? error.message : "Health check failed", "error");
-              }
-            }, "secondary", { class: "btn-sm" }) : null,
-            isAdmin ? button("Test", async () => {
-              try {
-                const result = await api<TestResult>(`/api/harnesses/${harness.kind}/test`, { method: "POST", body: {} });
-                showTestResult(harness, result);
-                await renderHarnesses(root);
-              } catch (error) {
-                toast(error instanceof Error ? error.message : "Connection test failed", "error");
-              }
-            }, "primary", { class: "btn-sm" }) : null,
+            isAdmin && harness.status !== "missing" ? button(
+              agents.filter((agent) => ["codebase_mapper", "security_researcher", "independent_validator", "retest_auditor"].includes(agent.role)).every((agent) => agent.harness === harness.kind && agent.enabled)
+                ? "Use for all audits" : "Use for audits",
+              async (event) => {
+                const trigger = event.currentTarget as HTMLButtonElement;
+                trigger.disabled = true;
+                try {
+                  await api(`/api/harnesses/${harness.kind}/assign`, { method: "POST", body: {} });
+                  toast(`${harness.label} selected for all audit roles.`, "success");
+                  await renderHarnesses(root);
+                } catch (error) { toast(error instanceof Error ? error.message : "Unable to assign runtime", "error"); }
+                finally { trigger.disabled = false; }
+              }, "primary", { class: "btn-sm" },
+            ) : null,
             isAdmin ? button("Configure", () => openHarnessConfig(harness, () => void renderHarnesses(root)), "ghost", { class: "btn-sm" }) : null,
           ),
         ),
@@ -93,6 +92,8 @@ export async function renderHarnesses(root: HTMLElement): Promise<void> {
           h("div", { class: "small" }, harness.detail),
           h("div", { class: "tiny muted", style: { marginTop: "var(--space-2xs)" } }, harness.auth.detail),
         ),
+        h("p", { class: "small muted" }, "Use for audits selects this runtime and its default model for every audit role. Validation still uses separate sessions."),
+        disclosure("Technical details",
         h("div", {},
           h("div", { class: "tiny muted", style: { marginBottom: "var(--space-2xs)" } }, "Capabilities"),
           h("div", { class: "cap-grid" }, ...capabilities.map(([capability, supported]) =>
@@ -116,22 +117,25 @@ export async function renderHarnesses(root: HTMLElement): Promise<void> {
               ),
             )
           : null,
+          isAdmin ? button("Run connection test", async () => {
+            try {
+              const result = await api<TestResult>(`/api/harnesses/${harness.kind}/test`, { method: "POST", body: {} });
+              showTestResult(harness, result);
+            } catch (error) { toast(error instanceof Error ? error.message : "Connection test failed", "error"); }
+          }, "secondary") : null,
+          h("p", { class: "small muted" }, "A connection test calls the model and may use provider credits."),
+        ),
       );
     });
 
     root.replaceChildren(
       pageHeader(
-        "Harnesses",
-        "Pi and Claude Code are independent execution runtimes. Argus supervises their real processes, streams events, and preserves their native capabilities.",
+        "AI setup",
+        "Choose Pi or Claude Code and a model to run your audits.",
         isAdmin ? h("a", { class: "btn btn-secondary", href: "#/agents" }, "Agent assignments") : null,
       ),
       h("div", { class: "grid grid-2" }, ...cards),
-      h("div", { style: { height: "14px" } }),
-      section("Integration notes", h("div", { class: "narrative" },
-        h("p", {}, "Pi runs in RPC mode over strict JSONL. Argus correlates every command by request ID, treats prompt acceptance as acceptance only, and waits for agent_settled before declaring completion."),
-        h("p", {}, "Claude Code runs through the non-interactive CLI with stream-json output and JSON-schema structured output. Permission bypass flags are rejected by the platform."),
-        h("p", { class: "muted small" }, "A harness health check can consume provider credits. Test connections execute a real minimal agent run. Status is persisted and never silently substituted."),
-      )),
+
     );
   } catch (error) {
     root.replaceChildren(errorState(error instanceof Error ? error.message : "Unable to load harnesses", () => void renderHarnesses(root)));
@@ -162,6 +166,8 @@ function openHarnessConfig(harness: Harness, refresh: () => void): void {
   const executable = input("executable", { value: harness.config.executable });
   const provider = input("provider", { value: harness.config.provider ?? "" });
   const model = input("model", { value: harness.config.model ?? "", placeholder: "provider/model or default" });
+  provider.required = harness.kind === "pi";
+  model.required = harness.kind === "pi";
   const permission = select(
     "permission_mode",
     [
@@ -204,15 +210,14 @@ function openHarnessConfig(harness: Harness, refresh: () => void): void {
       },
     },
     errorBox,
-    h("p", { class: "modal-copy" }, "Provider credentials are separate from harness configuration. Store API keys in Settings, under Credentials; this form never accepts secret values."),
     h("div", { class: "form-grid" },
-      field("Executable", executable),
-      field("Provider", provider, "Pi provider name; ignored by Claude Code"),
-      field("Model", model, "Model ID used by this harness"),
-      field("Permission mode", permission, "Bypass modes are rejected"),
-      field("Allowed tools", tools, "Harness-native names; role tools must stay inside this policy cap"),
-      field("Extra arguments", extraArgs, "Comma-separated safe arguments"),
+      harness.kind === "pi" ? field("Provider", provider) : null,
+      field("Model", model, harness.kind === "pi" ? "Model ID from your provider." : "Leave empty to use the runtime default."),
     ),
+    disclosure("Advanced runtime settings", h("div", { class: "form-grid" },
+      field("Executable", executable), field("Permission mode", permission),
+      field("Allowed tools", tools), field("Extra arguments", extraArgs),
+    )),
     h("div", { class: "form-actions" },
       button("Cancel", () => instance.close(), "secondary"),
       h("button", { class: "btn btn-primary", type: "submit" }, "Save configuration"),

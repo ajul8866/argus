@@ -810,10 +810,29 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
         });
       }
 
-      const harnessMatch = path.match(/^\/api\/harnesses\/(pi|claude-code)(?:\/(check|test|models))?$/);
+      const harnessMatch = path.match(/^\/api\/harnesses\/(pi|claude-code)(?:\/(check|test|models|assign))?$/);
       if (harnessMatch) {
         const kind = harnessMatch[1] as HarnessKind;
         const action = harnessMatch[2];
+        if (method === "POST" && action === "assign") {
+          const current = requireRole("admin");
+          const config = harnessConfig(deps.store, kind);
+          const nativeTools = kind === "pi" ? ["read", "grep", "find", "ls"] : ["Read", "Grep", "Glob", "LS"];
+          const tools = nativeTools.filter((tool) => config.allowed_tools.includes(tool));
+          if (tools.length === 0) throw badRequest("Enable read tools in this runtime's advanced settings first");
+          const roles = ["codebase_mapper", "security_researcher", "independent_validator", "retest_auditor"];
+          deps.store.transaction(() => {
+            for (const role of roles) {
+              deps.store.run(
+                "UPDATE agent_defs SET harness = ?, model = NULL, allowed_tools = ?, allow_shell = 0, enabled = 1, updated_at = ? WHERE role = ?",
+                kind, toJson(tools), now(), role,
+              );
+            }
+            setSetting(deps.store, "audit.require_distinct_harness_for_retest", false, current.id);
+          });
+          deps.auth.logAction(current.email, "harness.assigned", kind, { roles }, ip);
+          return json({ ok: true, harness: kind, roles });
+        }
         if (method === "GET" && !action) {
           requireUser();
           const detection = await deps.manager.adapter(kind).detect();
@@ -957,10 +976,10 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
         const entries = Object.entries(updates as Record<string, unknown>);
         for (const [key, value] of entries) {
           if (!(key in DEFAULT_SETTINGS)) throw badRequest(`Unknown setting: ${key}`);
-          if (key === "security.allow_shell_tools" && value === true && body.confirm_shell !== true) {
+          if (key === "security.allow_shell_tools" && value === true && !getSetting(deps.store, key, false) && body.confirm_shell !== true) {
             throw badRequest("Enabling shell tools requires confirm_shell: true and task-level approval");
           }
-          if (key === "security.allow_writable_workspace" && value === true && body.confirm_writable_workspace !== true) {
+          if (key === "security.allow_writable_workspace" && value === true && !getSetting(deps.store, key, false) && body.confirm_writable_workspace !== true) {
             throw badRequest(
               "Enabling writable audit workspaces requires confirm_writable_workspace: true, a per-audit request, and per-task approval",
             );

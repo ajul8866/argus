@@ -3,6 +3,7 @@ import {
   badge,
   button,
   emptyState,
+  disclosure,
   errorState,
   field,
   h,
@@ -42,7 +43,8 @@ export async function renderAgents(root: HTMLElement): Promise<void> {
       api<{ harnesses: Harness[] }>("/api/harnesses"),
     ]);
     const isAdmin = session.user?.role === "admin";
-    const rows = agents.map((agent) =>
+    const auditAgents = agents.filter((agent) => ["codebase_mapper", "security_researcher", "independent_validator", "retest_auditor"].includes(agent.role));
+    const rows = auditAgents.map((agent) =>
       h("tr", {},
         h("td", {},
           h("div", { class: "row", style: { gap: "7px" } }, h("span", { class: "table-title" }, agent.label), agent.enabled ? null : badge("disabled", "bad")),
@@ -64,11 +66,11 @@ export async function renderAgents(root: HTMLElement): Promise<void> {
         "Roles, harness assignments, models, tool permissions, budgets, and concurrency limits.",
         h("a", { class: "btn btn-secondary", href: "#/harnesses" }, "Harness health"),
       ),
-      section(`${agents.length} role definitions`, h("div", { class: "table-wrap" }, h("table", { class: "agents-table" },
+      section(`${auditAgents.length} audit roles`, h("div", { class: "table-wrap" }, h("table", { class: "agents-table" },
         h("thead", {}, h("tr", {}, h("th", {}, "Role"), h("th", {}, "Harness"), h("th", {}, "Model"), h("th", {}, "Tools"), h("th", {}, "Timeout"), h("th", {}, "Budget"), h("th", {}, "Conc."), h("th", {}, ""))),
         h("tbody", {}, ...rows),
       ))),
-      h("div", { class: "grid grid-2", style: { marginTop: "14px" } },
+      disclosure("How audit roles work", h("div", { class: "grid grid-2" },
         section("Independence rules", h("div", { class: "narrative" },
           h("p", {}, "Discovery, confirmation, and reverification always run in separate agent sessions. The platform rejects a confirmation or retest executed by the session that discovered the issue."),
           h("p", {}, "The default assignments use Claude Code for independent validation and Pi for mapping, discovery, and reverification. This creates harness diversity, but independence is established by fresh contexts, immutable provenance, and exact-source evidence checks — not by the harness name alone."),
@@ -80,7 +82,7 @@ export async function renderAgents(root: HTMLElement): Promise<void> {
             statusBadge(harness.status),
           ),
         ), h("a", { class: "btn btn-ghost btn-sm", href: "#/harnesses" }, "Open harness manager"))),
-      ),
+      )),
     );
   } catch (error) {
     root.replaceChildren(errorState(error instanceof Error ? error.message : "Unable to load agents", () => void renderAgents(root)));
@@ -99,8 +101,6 @@ function openAgentEdit(agent: Agent, harnesses: Harness[], refresh: () => void):
   const retriesInput = input("max_retries", { type: "number", value: String(agent.max_retries), min: 0, max: 5 });
   const duration = input("max_duration_ms", { type: "number", value: String(Math.round(agent.max_duration_ms / 1000)), min: 10, max: 3600 });
   const budget = input("budget_usd", { type: "number", value: agent.budget_usd === null ? "" : String(agent.budget_usd), min: 0, step: 0.5 });
-  const retries = input("max_retries", { type: "number", value: String(agent.max_retries), min: 0, max: 5 });
-  const concurrency = input("concurrency_limit", { type: "number", value: String(agent.concurrency_limit), min: 1, max: 8 });
   const enabled = h("input", { type: "checkbox", checked: agent.enabled }) as HTMLInputElement;
   const errorBox = h("div", { class: "login-error hidden" });
   const models = harnesses.find((harness) => harness.kind === agent.harness)?.models ?? [];
@@ -140,14 +140,13 @@ function openAgentEdit(agent: Agent, harnesses: Harness[], refresh: () => void):
     h("div", { class: "form-grid" },
       field("Harness", harnessSelect),
       field("Model", model, `${models.length} models reported by this harness`),
-      field("Allowed tools", tools, "Use harness-native names; shell tools require global enablement and approval"),
-      field("System instructions", systemPrompt, "Role policy. The platform safety policy is always appended."),
-      field("Max retries", retriesInput, "0-5; retries use fresh sessions"),
-      field("Max duration (seconds)", duration),
-      field("Budget (USD)", budget, "Empty means no per-task budget"),
-      field("Concurrency", concurrency, "Per-role active task ceiling"),
-      h("label", { class: "checkbox full" }, enabled, "Role enabled"),
     ),
+    disclosure("Advanced role settings", h("div", { class: "form-grid" },
+      field("Allowed tools", tools), field("System instructions", systemPrompt),
+      field("Max retries", retriesInput), field("Max duration (seconds)", duration),
+      field("Budget (USD)", budget, "Empty means no per-task budget."),
+      h("label", { class: "checkbox full" }, enabled, "Role enabled"),
+    )),
     h("div", { class: "form-actions" },
       button("Cancel", () => instance.close(), "secondary"),
       h("button", { class: "btn btn-primary", type: "submit" }, "Save role"),

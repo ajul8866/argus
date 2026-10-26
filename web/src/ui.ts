@@ -284,6 +284,14 @@ export function field(
   );
 }
 
+export function disclosure(title: string, ...children: Child[]): HTMLDetailsElement {
+  const details = h("details", { class: "form-advanced" },
+    h("summary", { tabindex: "0" }, title), ...children,
+  );
+  details.addEventListener("invalid", () => { details.open = true; }, true);
+  return details;
+}
+
 export function input(name: string, options: { type?: string; value?: string; placeholder?: string; required?: boolean; min?: number; max?: number; step?: number; autocomplete?: string } = {}): HTMLInputElement {
   return h("input", {
     class: "input",

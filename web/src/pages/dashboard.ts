@@ -167,7 +167,7 @@ export async function renderDashboard(root: HTMLElement): Promise<void> {
         "Control room",
         "Autonomous source-code security auditing across Pi and Claude Code harnesses.",
         h("div", { class: "row" },
-          button("New audit", () => void openAuditCreate(), "primary"),
+          session.user?.role !== "viewer" ? button("New audit", () => void openAuditCreate(), "primary") : null,
           h("a", { class: "btn btn-secondary", href: "#/findings" }, "Review findings"),
         ),
       ),

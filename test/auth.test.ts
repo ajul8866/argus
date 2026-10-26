@@ -12,7 +12,7 @@ import { AuditEngine } from "../src/orchestrator/engine.ts";
 import { EvidenceStore } from "../src/orchestrator/evidence.ts";
 import { DEFAULT_EXCLUDES } from "../src/repo/inventory.ts";
 import { ReportService } from "../src/reports/generator.ts";
-import { seedDefaults } from "../src/settings.ts";
+import { getSetting, harnessConfig, saveHarnessConfig, seedDefaults } from "../src/settings.ts";
 
 function config(dataDir: string): Config {
   return {
@@ -174,4 +174,55 @@ test("folder discovery requires an auditor and only lists folders within configu
   expect((await api(request())).status).toBe(200);
   store.run("UPDATE users SET role = 'viewer' WHERE id = ?", userId);
   expect((await api(request())).status).toBe(403);
+});
+
+test("one explicit runtime assignment configures all audit roles without adding shell access", async () => {
+  const { api, headers } = await projectClient();
+  store.run("UPDATE agent_defs SET model = 'old/model', enabled = 0, allow_shell = 1 WHERE role = 'codebase_mapper'");
+  const beforeSystemRoles = store.all("SELECT * FROM agent_defs WHERE role IN ('findings_manager','report_writer')");
+  const response = await api(new Request("http://localhost/api/harnesses/claude-code/assign", { method: "POST", headers }));
+  expect(response.status).toBe(200);
+  const roles = store.all<{ harness: string; model: string | null; allowed_tools: string; allow_shell: number; enabled: number }>(
+    "SELECT * FROM agent_defs WHERE role IN ('codebase_mapper','security_researcher','independent_validator','retest_auditor')",
+  );
+  expect(roles).toHaveLength(4);
+  for (const role of roles) {
+    expect(role).toMatchObject({ harness: "claude-code", model: null, enabled: 1, allow_shell: 0 });
+    expect(JSON.parse(role.allowed_tools)).toEqual(["Read", "Grep", "Glob", "LS"]);
+  }
+  expect(store.all("SELECT * FROM agent_defs WHERE role IN ('findings_manager','report_writer')")).toEqual(beforeSystemRoles);
+  expect(getSetting(store, "audit.require_distinct_harness_for_retest", true)).toBe(false);
+  expect(store.get("SELECT id FROM audit_log WHERE action = 'harness.assigned'")).toBeDefined();
+});
+
+test("runtime assignment respects the tool cap and rejects unauthorized changes", async () => {
+  const { api, headers, userId } = await projectClient();
+  const request = (requestHeaders = headers) => new Request("http://localhost/api/harnesses/pi/assign", { method: "POST", headers: requestHeaders });
+  expect((await api(request({ ...headers, cookie: "" }))).status).toBe(401);
+  expect((await api(request({ ...headers, "x-csrf-token": "invalid" }))).status).toBe(403);
+  store.run("UPDATE users SET role = 'auditor' WHERE id = ?", userId);
+  expect((await api(request())).status).toBe(403);
+  store.run("UPDATE users SET role = 'admin' WHERE id = ?", userId);
+  saveHarnessConfig(store, "pi", { ...harnessConfig(store, "pi"), allowed_tools: ["read", "bash"] });
+  expect((await api(request())).status).toBe(200);
+  expect(JSON.parse(store.get<{ allowed_tools: string }>("SELECT allowed_tools FROM agent_defs WHERE role = 'independent_validator'")!.allowed_tools)).toEqual(["read"]);
+  const before = store.all("SELECT * FROM agent_defs");
+  saveHarnessConfig(store, "pi", { ...harnessConfig(store, "pi"), allowed_tools: [] });
+  expect((await api(request())).status).toBe(400);
+  expect(store.all("SELECT * FROM agent_defs")).toEqual(before);
+});
+
+test("sensitive settings require confirmation only when newly enabled", async () => {
+  const { api, headers } = await projectClient();
+  const update = (settings: Record<string, unknown>, confirmations = {}) => api(new Request("http://localhost/api/settings", {
+    method: "PUT", headers, body: JSON.stringify({ settings, ...confirmations }),
+  }));
+  const settings = { "security.allow_shell_tools": true, "security.allow_writable_workspace": true };
+  expect((await update(settings)).status).toBe(400);
+  expect(getSetting(store, "security.allow_shell_tools", false)).toBe(false);
+  expect((await update(settings, { confirm_shell: true, confirm_writable_workspace: true })).status).toBe(200);
+  expect((await update(settings)).status).toBe(200);
+  expect((await update({ "reports.organization": "My team" })).status).toBe(200);
+  expect((await update({ "security.allow_shell_tools": false, "security.allow_writable_workspace": false })).status).toBe(200);
+  expect((await update(settings)).status).toBe(400);
 });

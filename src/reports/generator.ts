@@ -231,13 +231,15 @@ export class ReportService {
       try {
         const verified = await this.evidence.content(row.id);
         if (!verified) continue;
-        const content = JSON.parse(verified.content) as {
-          path?: string;
-          start_line?: number;
-          end_line?: number;
-          quote?: string;
-        };
-        if (!content || typeof content !== "object" || Array.isArray(content) || !content.path || !content.quote) continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(verified.content);
+        } catch {
+          continue;
+        }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+        const content = parsed as { path?: string; start_line?: number; end_line?: number; quote?: string };
+        if (!content.path || !content.quote) continue;
         const list = excerptsByFinding[row.finding_id] ?? [];
         list.push({
           path: content.path,

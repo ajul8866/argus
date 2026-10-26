@@ -653,6 +653,37 @@ describe("evidence chain", () => {
     }
   });
 
+  test("reports still generate when a code excerpt is not structured JSON", async () => {
+    store.run(
+      `INSERT INTO findings (
+        id, code, audit_id, project_id, title, category, severity, status, files, root_cause,
+        preconditions, reproduction, expected, observed, impact, remediation, created_at, updated_at
+      ) VALUES (
+        'f-plain', 'ARG-2', 'a1', 'p1', 'Plain excerpt', 'injection', 'low', 'reverified', '[]',
+        'cause', '[]', '[]', 'expected', 'observed', 'impact', 'fix', '2026-01-01', '2026-01-01'
+      )`,
+    );
+    await evidence.append({
+      auditId: "a1",
+      findingId: "f-plain",
+      kind: "code_excerpt",
+      title: "note",
+      content: "not a structured excerpt",
+    });
+    const generated = await new ReportService(testConfig(dir), store, evidence, new EventLog(store)).generate(
+      "a1",
+      ["markdown", "json"],
+      "test",
+    );
+    expect(generated).toHaveLength(2);
+    const body = JSON.parse(await Bun.file(generated.find((report) => report.format === "json")!.path).text()) as {
+      evidence_chain: { ok: boolean };
+      findings: Array<{ verified_excerpts: unknown[] }>;
+    };
+    expect(body.evidence_chain.ok).toBe(true);
+    expect(body.findings[0]?.verified_excerpts).toEqual([]);
+  });
+
   test("evidence content preserves structured excerpts for later parsing", async () => {
     const row = await evidence.append({
       auditId: "a1",

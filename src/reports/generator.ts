@@ -533,8 +533,8 @@ export class ReportService {
     }
     lines.push("## Scope and authorization");
     lines.push("");
-    lines.push(`- **Authorized by:** ${data.project.authorized_by}`);
-    lines.push(`- **Authorization reference:** ${data.project.authorization_ref}`);
+    if (data.project.authorized_by) lines.push(`- **Authorized by:** ${data.project.authorized_by}`);
+    if (data.project.authorization_ref) lines.push(`- **Authorization reference:** ${data.project.authorization_ref}`);
     lines.push(`- **Source path (platform-side):** ${data.project.source_path}`);
     lines.push(`- **Include globs:** ${data.project.scope.include.join(", ")}`);
     lines.push(`- **Exclude globs:** ${data.project.scope.exclude.join(", ")}`);

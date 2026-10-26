@@ -5,6 +5,14 @@ import { join } from "node:path";
 import { AuthService } from "../src/auth.ts";
 import type { Config } from "../src/config.ts";
 import { Store } from "../src/db/index.ts";
+import { createApi } from "../src/api/api.ts";
+import { EventLog } from "../src/events.ts";
+import { HarnessManager } from "../src/harness/manager.ts";
+import { AuditEngine } from "../src/orchestrator/engine.ts";
+import { EvidenceStore } from "../src/orchestrator/evidence.ts";
+import { DEFAULT_EXCLUDES } from "../src/repo/inventory.ts";
+import { ReportService } from "../src/reports/generator.ts";
+import { seedDefaults } from "../src/settings.ts";
 
 function config(dataDir: string): Config {
   return {
@@ -30,6 +38,20 @@ function config(dataDir: string): Config {
 let dir = "";
 let store: Store;
 let auth: AuthService;
+
+async function projectClient() {
+  const settings = config(dir);
+  seedDefaults(store, settings);
+  const events = new EventLog(store);
+  const manager = new HarnessManager(settings, store);
+  const evidence = new EvidenceStore(settings, store);
+  const reports = new ReportService(settings, store, evidence, events);
+  const engine = new AuditEngine(settings, store, manager, evidence, events, reports);
+  const api = createApi({ config: settings, store, auth, events, manager, evidence, reports, engine });
+  const login = await auth.login(settings.adminEmail, settings.adminPassword!, "local", "test");
+  const headers = { cookie: `argus_session=${login.token}`, "x-csrf-token": login.csrf, "content-type": "application/json" };
+  return { api, headers, userId: login.user.id };
+}
 
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "argus-auth-"));
@@ -94,4 +116,45 @@ test("role hierarchy and user administration", async () => {
   await expect(auth.login("auditor@test.local", "auditor-password-1", "127.0.0.1", "test")).rejects.toThrow();
   const metadata = auth.listUsers();
   expect(metadata.every((user) => !("password_hash" in user))).toBe(true);
+});
+
+test("a project needs only a name and repository path while access controls still apply", async () => {
+  const { api, headers, userId } = await projectClient();
+  const body = JSON.stringify({ name: "My project", source_path: dir });
+  const request = (requestHeaders = headers, requestBody = body) => new Request("http://localhost/api/projects", {
+    method: "POST", headers: requestHeaders, body: requestBody,
+  });
+  expect((await api(request({ ...headers, cookie: "" }))).status).toBe(401);
+  expect((await api(request({ ...headers, "x-csrf-token": "invalid" }))).status).toBe(403);
+  const outside = await api(request(headers, JSON.stringify({ name: "Outside", source_path: tmpdir() })));
+  expect(outside.status).toBe(403);
+  expect(await outside.json()).toMatchObject({ error: { code: "repository_not_authorized" } });
+
+  const created = await api(request());
+  expect(created.status).toBe(201);
+  expect(await created.json()).toMatchObject({ project: {
+    name: "My project", source_path: dir, authorized_by: "", authorization_ref: "",
+    scope_include: ["**/*"], scope_exclude: DEFAULT_EXCLUDES, created_by: userId,
+  } });
+  expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM projects")?.count).toBe(1);
+
+  store.run("UPDATE users SET role = 'viewer' WHERE id = ?", userId);
+  expect((await api(request())).status).toBe(403);
+  expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM projects")?.count).toBe(1);
+});
+
+test("optional project authorization metadata remains compatible and validated", async () => {
+  const { api, headers } = await projectClient();
+  const create = (metadata: Record<string, unknown>) => api(new Request("http://localhost/api/projects", {
+    method: "POST", headers,
+    body: JSON.stringify({ name: "Existing client", source_path: dir, ...metadata }),
+  }));
+  const legacy = await create({ authorized_by: "Security owner", authorization_ref: "AUTH-123" });
+  expect(legacy.status).toBe(201);
+  expect(await legacy.json()).toMatchObject({ project: { authorized_by: "Security owner", authorization_ref: "AUTH-123" } });
+  const empty = await create({ authorized_by: "", authorization_ref: "" });
+  expect(empty.status).toBe(201);
+  expect(await empty.json()).toMatchObject({ project: { authorized_by: "", authorization_ref: "" } });
+  expect((await create({ authorized_by: 123 })).status).toBe(400);
+  expect((await create({ authorization_ref: "x".repeat(501) })).status).toBe(400);
 });

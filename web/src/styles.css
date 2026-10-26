@@ -259,6 +259,10 @@
 .form-grid .full { grid-column: 1 / -1; }
 .form-actions { display: flex; justify-content: flex-end; gap: var(--space-xs); margin-top: var(--space-md); flex-wrap: wrap; }
 .form { display: flex; flex-direction: column; gap: var(--space-sm); }
+.form-advanced { min-width: 0; border-top: var(--rule-hair) solid var(--color-rule); padding-top: var(--space-sm); }
+.form-advanced > summary { cursor: pointer; color: var(--color-ink-2); font-size: var(--text-sm); padding-block: var(--space-xs); }
+.form-advanced > summary:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
+.form-advanced[open] > summary { margin-bottom: var(--space-sm); }
 .checkbox { display: flex; align-items: center; gap: var(--space-xs); font-size: var(--text-sm); color: var(--color-ink-2); cursor: pointer; min-height: 36px; }
 .checkbox input { width: 15px; height: 15px; accent-color: var(--color-accent); flex-shrink: 0; }
 .checkbox:has(input:disabled) { opacity: 0.55; cursor: not-allowed; }

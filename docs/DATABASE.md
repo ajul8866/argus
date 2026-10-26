@@ -65,8 +65,9 @@ max duration, retries, concurrency, budget, shell flag, enabled flag.
 
 ### `projects`
 
-Authorized source path, scope include/exclude JSON, authorizing person and
-reference, project concurrency ceiling, status, creator, timestamps.
+Source path, scope include/exclude JSON, optional authorizing person and
+reference (empty strings when omitted), project concurrency ceiling, status,
+creator, timestamps.
 
 ### `repositories`
 

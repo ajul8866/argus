@@ -164,14 +164,12 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
 export async function openProjectCreate(): Promise<void> {
   const name = input("name", { placeholder: "Payments API", required: true });
   const sourcePath = input("source_path", { placeholder: "/srv/authorized/repositories/payments", required: true });
-  const description = input("description", { placeholder: "What this repository is and why it is in scope" });
+  const description = input("description", { placeholder: "What this project does" });
   const include = input("scope_include", { value: "**/*" });
   const exclude = h("textarea", {
     class: "input textarea",
     name: "scope_exclude",
   }, ".git/**,node_modules/**,vendor/**,dist/**,build/**,**/*.min.js,**/*.map");
-  const authorizedBy = input("authorized_by", { placeholder: "Security owner / engagement lead", required: true });
-  const authorizationRef = input("authorization_ref", { placeholder: "Written authorization ID or ticket", required: true });
   const maxAgents = input("max_concurrent_agents", { type: "number", value: "3", min: 1, max: 12, required: true });
   const errorBox = h("div", { class: "login-error hidden", role: "alert", tabindex: "-1" });
 
@@ -188,6 +186,8 @@ export async function openProjectCreate(): Promise<void> {
       onsubmit: async (event: Event) => {
         event.preventDefault();
         errorBox.classList.add("hidden");
+        const submitButton = (event.currentTarget as HTMLFormElement).querySelector<HTMLButtonElement>('button[type="submit"]');
+        if (submitButton) submitButton.disabled = true;
         try {
           const result = await api<{ project: { id: string } }>("/api/projects", {
             method: "POST",
@@ -197,38 +197,42 @@ export async function openProjectCreate(): Promise<void> {
               description: description.value,
               scope_include: parseGlobs(include.value),
               scope_exclude: parseGlobs((exclude as HTMLTextAreaElement).value),
-              authorized_by: authorizedBy.value,
-              authorization_ref: authorizationRef.value,
               max_concurrent_agents: Number(maxAgents.value),
             },
           });
           instance.close();
-          toast("Authorized project created. Import the repository snapshot next.", "success");
+          toast("Project created. Import the repository snapshot next.", "success");
           location.hash = `#/projects/${result.project.id}`;
         } catch (error) {
           errorBox.textContent = error instanceof Error ? error.message : "Unable to create project";
           errorBox.classList.remove("hidden");
           errorBox.focus();
+        } finally {
+          if (submitButton) submitButton.disabled = false;
         }
       },
     },
     errorBox,
-    h("div", { class: "form-grid" },
+    h("div", { class: "stack" },
       field("Project name", name),
-      field("Source path on the Argus host", sourcePath, "Must be under ARGUS_ALLOWED_ROOTS"),
-      field("Description", description, "Optional context for operators"),
-      field("Authorized by", authorizedBy),
-      field("Authorization reference", authorizationRef, "Argus records this in every report"),
-      field("Max concurrent agents", maxAgents, "Per-project ceiling"),
-      field("Scope include globs", include, "Comma or newline separated; e.g. src/**/*.ts,api/**"),
-      field("Scope exclude globs", exclude, "Comma or newline separated"),
+      field("Repository folder", sourcePath, "Full path to the repository on the machine running Argus"),
+    ),
+    h("p", { class: "modal-copy" }, "All source files are included by default. Dependencies and build outputs are excluded."),
+    h("details", { class: "form-advanced" },
+      h("summary", { tabindex: "0" }, "Advanced settings (optional)"),
+      h("div", { class: "stack" },
+        field("Description", description, "Optional"),
+        field("Concurrent agents", maxAgents, "Up to 3 at once by default"),
+        field("Files to include", include, "Leave **/* to include all files. To limit the audit, use patterns such as src/**,api/**."),
+        field("Files to exclude", exclude, "Files matching these patterns are skipped. Separate patterns with commas or new lines."),
+      ),
     ),
     h("div", { class: "form-actions" },
       button("Cancel", () => instance.close(), "secondary"),
       h("button", { class: "btn btn-primary", type: "submit" }, "Create project"),
     ),
   );
-  const instance = modal("Authorized project", content, null);
+  const instance = modal("New project", content, null);
 }
 
 export async function importRepository(projectId: string, ref?: string): Promise<void> {

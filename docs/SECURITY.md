@@ -5,7 +5,11 @@ LLM agents. Use it only on repositories you are authorized to assess.
 
 ## Authorization and scope
 
-- A project cannot be created without an authorizing person and reference.
+- Project creation requires a name and repository path. Authorizing person and
+  reference are optional metadata; existing records retain their values. The
+  dashboard does not request them, and missing values are not filled with
+  invented authorization claims. Authentication, role checks, CSRF protection,
+  and source-path boundaries still apply.
 - The source path is canonicalized with `realpath` and checked against
   `ARGUS_ALLOWED_ROOTS` on create/import and again when a workspace/evidence
   file is opened.

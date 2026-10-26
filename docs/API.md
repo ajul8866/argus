@@ -43,9 +43,15 @@ failures).
 | `GET` | `/api/repositories/:id/tree?path=` | any | Inventory-derived tree |
 | `GET` | `/api/repositories/:id/file?path=` | any | Scoped text preview |
 
-Creating a project requires `name`, `source_path`, `authorized_by`,
-`authorization_ref`; scope arrays default to `["**/*"]` and the safe exclusion
-set. The source path must resolve under `ARGUS_ALLOWED_ROOTS`.
+Creating a project requires only `name` and `source_path`. The optional
+`authorized_by` and `authorization_ref` fields remain supported for existing
+clients and default to empty strings. Scope arrays default to `["**/*"]` and
+the safe exclusion set. The source path must resolve under `ARGUS_ALLOWED_ROOTS`.
+
+The dashboard shows only the project name and repository folder initially.
+Description, file patterns, and concurrent agents are under the collapsed
+Advanced settings section. Reports omit empty authorization metadata from
+Markdown, HTML, and PDF; JSON retains the fields for compatibility.
 
 Import writes an immutable snapshot under `$ARGUS_DATA_DIR/repos/...`, records
 the commit/ref, and rejects empty/invalid snapshots.

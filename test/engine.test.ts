@@ -320,6 +320,30 @@ afterEach(async () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("reports omit empty authorization labels and retain supplied metadata", async () => {
+  const config = testConfig(dir);
+  const events = new EventLog(store);
+  const evidence = new EvidenceStore(config, store);
+  const reports = new ReportService(config, store, evidence, events);
+  const original = await reports.generate(auditId, ["markdown"], "test");
+  const originalText = readFileSync(original[0]!.path, "utf8");
+  expect(originalText).toContain("**Authorized by:** Tester");
+  expect(originalText).toContain("**Authorization reference:** TEST-AUTH");
+
+  store.run("UPDATE projects SET authorized_by = '', authorization_ref = '' WHERE id = 'p1'");
+  const generated = await reports.generate(auditId, ["markdown", "json", "html", "pdf"], "test");
+  expect(generated).toHaveLength(4);
+  for (const report of generated) {
+    const content = readFileSync(report.path, "utf8");
+    if (report.format === "json") {
+      expect(JSON.parse(content).project).toMatchObject({ authorized_by: "", authorization_ref: "" });
+    } else {
+      expect(content).not.toContain("Authorized by:");
+      expect(content).not.toContain("Authorization reference:");
+    }
+  }
+});
+
 test("six-phase workflow persists findings, verification history, evidence, and reports", async () => {
   await engine.startAudit(auditId, "u1");
   const deadline = Date.now() + 90_000;

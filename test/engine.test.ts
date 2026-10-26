@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setSystemTime, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -240,14 +240,15 @@ let dir = "";
 let store: Store;
 let engine: AuditEngine;
 let manager: HarnessManager;
+let workflowEvidence: EvidenceStore;
 let auditId = "";
 
 function createEngine(catalog?: LocalCatalog): AuditEngine {
   const config = testConfig(dir);
   const events = new EventLog(store);
-  const evidence = new EvidenceStore(config, store);
-  const reports = new ReportService(config, store, evidence, events);
-  return new AuditEngine(config, store, manager, evidence, events, reports, catalog);
+  workflowEvidence = new EvidenceStore(config, store);
+  const reports = new ReportService(config, store, workflowEvidence, events);
+  return new AuditEngine(config, store, manager, workflowEvidence, events, reports, catalog);
 }
 
 async function waitFor(condition: () => boolean, timeoutMs = 5_000): Promise<void> {
@@ -320,6 +321,352 @@ afterEach(async () => {
   store.close();
   rmSync(dir, { recursive: true, force: true });
 });
+
+describe("project concurrency limits", () => {
+  function holdHarnessUntilAbort(): void {
+    const run = manager.run.bind(manager);
+    manager.run = async (...args) => {
+      const signal = args[2].signal;
+      await new Promise<void>((resolve) => {
+        if (signal?.aborted) resolve();
+        else signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return run(...args);
+    };
+  }
+
+  async function cancelAudits(ids: string[]): Promise<void> {
+    for (const id of ids) {
+      const audit = store.get<{ status: string }>("SELECT status FROM audits WHERE id = ?", id);
+      if (audit && ["running", "queued"].includes(audit.status)) await engine.cancelAudit(id, "u1");
+    }
+    await waitFor(() => !store.get("SELECT id FROM tasks WHERE status = 'running'"));
+  }
+
+  for (const projectLimit of [1, 2]) {
+    test(`a project ceiling of ${projectLimit} is shared by its audits and queued work resumes when a slot is released`, async () => {
+      setSetting(store, "audit.max_concurrent_agents", 4, null);
+      store.run("UPDATE projects SET max_concurrent_agents = ? WHERE id = 'p1'", projectLimit);
+      store.run("UPDATE agent_defs SET concurrency_limit = 4 WHERE role = 'codebase_mapper'");
+      holdHarnessUntilAbort();
+      const secondAudit = engine.createAudit({
+        projectId: "p1", repositoryId: "r1", userId: "u1",
+        overrides: { max_concurrent_agents: 3 },
+      });
+      engine.createTask({
+        auditId: secondAudit, phase: 1, kind: "phase1.map", taskKey: "extra-mapper",
+        title: "Additional mapping task", payload: {}, agentRole: "codebase_mapper",
+      });
+      const runningCount = () => store.get<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM tasks t JOIN audits a ON a.id = t.audit_id WHERE a.project_id = 'p1' AND t.status = 'running'",
+      )!.count;
+
+      try {
+        await engine.startAudit(auditId, "u1");
+        await engine.startAudit(secondAudit, "u1");
+
+        expect(runningCount()).toBe(projectLimit);
+        expect(store.all("SELECT id FROM tasks WHERE audit_id = ? AND status = 'queued'", secondAudit))
+          .toHaveLength(3 - projectLimit);
+
+        await engine.cancelAudit(auditId, "u1");
+        await waitFor(() => store.get<{ count: number }>(
+          "SELECT COUNT(*) AS count FROM tasks WHERE audit_id = ? AND status = 'running'", secondAudit,
+        )?.count === projectLimit);
+        expect(runningCount()).toBe(projectLimit);
+        expect(store.get("SELECT status FROM audits WHERE id = ?", secondAudit)).toMatchObject({ status: "running" });
+      } finally {
+        await cancelAudits([auditId, secondAudit]);
+      }
+    });
+  }
+
+  for (const scenario of [
+    { name: "an unset project ceiling allows audits to share the global capacity", global: 4, audit: 3, role: 4, expected: 2 },
+    { name: "the global ceiling still limits audits without a project ceiling", global: 2, audit: 3, role: 4, expected: 1 },
+    { name: "the audit ceiling still limits work without a project ceiling", global: 4, audit: 1, role: 4, expected: 1 },
+    { name: "the role ceiling still limits work across audits without a project ceiling", global: 4, audit: 3, role: 1, expected: 0 },
+  ]) {
+    test(scenario.name, async () => {
+      setSetting(store, "audit.max_concurrent_agents", scenario.global, null);
+      store.run("UPDATE projects SET max_concurrent_agents = NULL WHERE id = 'p1'");
+      store.run("UPDATE agent_defs SET concurrency_limit = ? WHERE role = 'codebase_mapper'", scenario.role);
+      holdHarnessUntilAbort();
+      const secondAudit = engine.createAudit({
+        projectId: "p1", repositoryId: "r1", userId: "u1",
+        overrides: { max_concurrent_agents: scenario.audit },
+      });
+      engine.createTask({
+        auditId: secondAudit, phase: 1, kind: "phase1.map", taskKey: "extra-mapper",
+        title: "Additional mapping task", payload: {}, agentRole: "codebase_mapper",
+      });
+
+      try {
+        await engine.startAudit(auditId, "u1");
+        await engine.startAudit(secondAudit, "u1");
+
+        expect(store.all("SELECT id FROM tasks WHERE audit_id = ? AND status = 'running'", auditId)).toHaveLength(1);
+        expect(store.all("SELECT id FROM tasks WHERE audit_id = ? AND status = 'running'", secondAudit)).toHaveLength(scenario.expected);
+        expect(store.all("SELECT id FROM tasks WHERE audit_id = ? AND status = 'queued'", secondAudit)).toHaveLength(2 - scenario.expected);
+      } finally {
+        await cancelAudits([auditId, secondAudit]);
+      }
+    });
+  }
+
+  test("cancelling audits retain their project slots until their tasks finish", async () => {
+    store.run("UPDATE projects SET max_concurrent_agents = 1 WHERE id = 'p1'");
+    store.run("UPDATE agent_defs SET concurrency_limit = 4 WHERE role = 'codebase_mapper'");
+    const run = manager.run.bind(manager);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    manager.run = async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return run(...args);
+    };
+    const secondAudit = engine.createAudit({ projectId: "p1", repositoryId: "r1", userId: "u1" });
+
+    try {
+      await engine.startAudit(auditId, "u1");
+      await entered.promise;
+      await engine.cancelAudit(auditId, "u1");
+      await engine.startAudit(secondAudit, "u1");
+
+      expect(store.get("SELECT status FROM audits WHERE id = ?", auditId)).toMatchObject({ status: "cancelling" });
+      expect(store.all("SELECT id FROM tasks WHERE audit_id = ? AND status = 'running'", auditId)).toHaveLength(1);
+      expect(store.all("SELECT id FROM tasks WHERE audit_id = ? AND status = 'running'", secondAudit)).toHaveLength(0);
+      expect(store.all("SELECT id FROM tasks WHERE audit_id = ? AND status = 'queued'", secondAudit)).toHaveLength(1);
+    } finally {
+      release.resolve();
+      await cancelAudits([auditId, secondAudit]);
+    }
+  });
+
+  test("a busy project does not consume another project's ceiling", async () => {
+    setSetting(store, "audit.max_concurrent_agents", 4, null);
+    store.run("UPDATE projects SET max_concurrent_agents = 1 WHERE id = 'p1'");
+    store.run("UPDATE agent_defs SET concurrency_limit = 4 WHERE role = 'codebase_mapper'");
+    store.run(
+      `INSERT INTO projects (id, name, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, max_concurrent_agents, created_at, updated_at)
+       SELECT 'p2', 'Other project', source_path, scope_include, scope_exclude, authorized_by, authorization_ref, 1, created_at, updated_at FROM projects WHERE id = 'p1'`,
+    );
+    store.run(
+      `INSERT INTO repositories (id, project_id, path, commit_sha, branch, languages, frameworks, inventory, graph, file_count, total_bytes, imported_at)
+       SELECT 'r2', 'p2', path, commit_sha, branch, languages, frameworks, inventory, graph, file_count, total_bytes, imported_at FROM repositories WHERE id = 'r1'`,
+    );
+    holdHarnessUntilAbort();
+    const secondAudit = engine.createAudit({ projectId: "p2", repositoryId: "r2", userId: "u1" });
+
+    try {
+      await engine.startAudit(auditId, "u1");
+      await engine.startAudit(secondAudit, "u1");
+
+      for (const id of [auditId, secondAudit]) {
+        expect(store.all("SELECT id FROM tasks WHERE audit_id = ? AND status = 'running'", id)).toHaveLength(1);
+      }
+    } finally {
+      await cancelAudits([auditId, secondAudit]);
+    }
+  });
+
+  test("a legacy invalid project ceiling falls back to the global limit", async () => {
+    store.run("UPDATE projects SET max_concurrent_agents = -1 WHERE id = 'p1'");
+    holdHarnessUntilAbort();
+    await engine.startAudit(auditId, "u1");
+    await waitFor(() => Boolean(store.get(
+      "SELECT id FROM tasks WHERE audit_id = ? AND status = 'running'",
+      auditId,
+    )));
+    expect(store.all("SELECT id FROM tasks WHERE audit_id = ? AND status = 'running'", auditId)).toHaveLength(1);
+    await cancelAudits([auditId]);
+  });
+});
+
+test("reports generated in the same millisecond preserve separate files and their recorded hashes", async () => {
+  const config = testConfig(dir);
+  const evidence = new EvidenceStore(config, store);
+  const reports = new ReportService(config, store, evidence, new EventLog(store));
+  setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+  try {
+    const [first] = await reports.generate(auditId, ["json"], "test");
+    const [second] = await reports.generate(auditId, ["json"], "test");
+    expect(first).toBeDefined();
+    expect(second).toBeDefined();
+    expect(first!.path).not.toBe(second!.path);
+    for (const report of [first!, second!]) {
+      expect(new Bun.CryptoHasher("sha256").update(readFileSync(report.path)).digest("hex")).toBe(report.sha256);
+    }
+  } finally {
+    setSystemTime();
+  }
+});
+
+test("invalid audit overrides are rejected before an audit is saved", () => {
+  for (const overrides of [
+    { max_areas: "invalid" }, { max_concurrent_agents: 1.5 }, { max_confirmations: -1 },
+    { task_timeout_ms: Number.NaN }, { max_cost_usd: -5 }, { writable_workspace: "true" },
+    { harness_overrides: [] }, { harness_overrides: { codebase_mapper: { harness: "unknown" } } },
+  ]) {
+    expect(() => engine.createAudit({ projectId: "p1", repositoryId: "r1", userId: "u1", overrides })).toThrow();
+  }
+  expect(store.all("SELECT id FROM audits")).toHaveLength(1);
+});
+
+test("a legacy invalid harness override closes the audit instead of stranding it", async () => {
+  const invalid = engine.createAudit({
+    projectId: "p1",
+    repositoryId: "r1",
+    userId: "u1",
+    overrides: {},
+  });
+  store.run(
+    "UPDATE audits SET config = json_set(config, '$.harness_overrides.codebase_mapper.harness', 'invalid-kind') WHERE id = ?",
+    invalid,
+  );
+
+  await expect(engine.startAudit(invalid, "u1")).rejects.toThrow();
+  expect(store.get("SELECT status, error FROM audits WHERE id = ?", invalid)).toMatchObject({
+    status: "failed",
+    error: expect.stringContaining("could not create its initial task"),
+  });
+  expect(store.all("SELECT id FROM tasks WHERE audit_id = ?", invalid)).toHaveLength(0);
+  expect(store.get("SELECT status FROM audit_phases WHERE audit_id = ? AND phase = 1", invalid))
+    .toMatchObject({ status: "failed" });
+});
+
+test("provider diagnostics are redacted before they are returned as session errors", async () => {
+  manager.run = async (_kind, task, hooks) => {
+    const startedAt = now();
+    hooks.onEvent({ type: "session_start", at: startedAt, meta: { sandbox: "test" } });
+    return {
+      status: "failed",
+      text: "",
+      sessionRef: "redaction-test",
+      model: task.model,
+      usage: {
+        input_tokens: 0, output_tokens: 0, total_tokens: 0,
+        cache_read_tokens: 0, cost_usd: 0, turns: null, duration_ms: 1,
+      },
+      events: [],
+      startedAt,
+      endedAt: now(),
+      exitCode: 1,
+      error: "Provider rejected Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+      failureKind: "harness_auth",
+      metadata: { sandbox: "test", api_key: "must-not-be-returned" },
+    };
+  };
+
+  await engine.startAudit(auditId, "u1");
+  await waitFor(() => store.get<{ status: string }>("SELECT status FROM audits WHERE id = ?", auditId)?.status === "failed");
+  const session = store.get<{ error: string; metadata: string }>(
+    "SELECT error, metadata FROM agent_sessions WHERE audit_id = ?",
+    auditId,
+  )!;
+  expect(session.error).toContain("[REDACTED]");
+  expect(session.error).not.toContain("abcdefghijklmnopqrstuvwxyz");
+  expect(session.metadata).toContain("[REDACTED]");
+  expect(session.metadata).not.toContain("must-not-be-returned");
+});
+
+test("a persistence retry repairs evidence for a finding created by the failed attempt", async () => {
+  const append = workflowEvidence.append.bind(workflowEvidence);
+  let failed = false;
+  workflowEvidence.append = async (input) => {
+    if (!failed && input.kind === "code_excerpt") {
+      failed = true;
+      throw new Error("Injected evidence storage failure");
+    }
+    return append(input);
+  };
+
+  await engine.startAudit(auditId, "u1");
+  const deadline = Date.now() + 30_000;
+  let audit = store.get<{ status: string }>("SELECT status FROM audits WHERE id = ?", auditId);
+  while (audit && !["completed", "completed_with_errors", "failed", "cancelled"].includes(audit.status) && Date.now() < deadline) {
+    await Bun.sleep(50);
+    audit = store.get<{ status: string }>("SELECT status FROM audits WHERE id = ?", auditId);
+  }
+
+  expect(failed).toBe(true);
+  expect(audit?.status).toBe("completed");
+  const findings = store.all<{ id: string }>("SELECT id FROM findings WHERE audit_id = ?", auditId);
+  expect(findings).toHaveLength(2);
+  for (const finding of findings) {
+    expect(store.all(
+      "SELECT id FROM evidence WHERE finding_id = ? AND kind = 'code_excerpt'",
+      finding.id,
+    ).length).toBeGreaterThan(0);
+    expect(store.all(
+      "SELECT id FROM evidence WHERE finding_id = ? AND kind = 'finding_record'",
+      finding.id,
+    )).toHaveLength(1);
+  }
+}, 20_000);
+
+for (const failureKind of ["discovery_result", "verification_result", "reverification_result"]) {
+  test(`a ${failureKind} storage retry does not duplicate workflow records`, async () => {
+    const append = workflowEvidence.append.bind(workflowEvidence);
+    let failed = false;
+    workflowEvidence.append = async (input) => {
+      if (!failed && input.kind === failureKind) {
+        failed = true;
+        throw new Error(`Injected ${failureKind} storage failure`);
+      }
+      return append(input);
+    };
+
+    await engine.startAudit(auditId, "u1");
+    const deadline = Date.now() + 30_000;
+    let audit = store.get<{ status: string }>("SELECT status FROM audits WHERE id = ?", auditId);
+    while (audit && !["completed", "completed_with_errors", "failed", "cancelled"].includes(audit.status) && Date.now() < deadline) {
+      await Bun.sleep(50);
+      audit = store.get<{ status: string }>("SELECT status FROM audits WHERE id = ?", auditId);
+    }
+
+    expect(failed).toBe(true);
+    expect(audit?.status).toBe("completed");
+    expect(store.all("SELECT id FROM candidates WHERE audit_id = ?", auditId)).toHaveLength(2);
+    expect(store.all("SELECT id FROM verifications WHERE audit_id = ? AND kind = 'confirmation'", auditId)).toHaveLength(2);
+    expect(store.all("SELECT id FROM verifications WHERE audit_id = ? AND kind = 'reverification'", auditId)).toHaveLength(2);
+    expect(store.all("SELECT id FROM evidence WHERE audit_id = ? AND kind = ?", auditId, failureKind))
+      .toHaveLength(failureKind === "discovery_result" ? 1 : 2);
+    expect(store.all("SELECT id FROM execution_events WHERE audit_id = ? AND type = 'task.retry'", auditId).length)
+      .toBeGreaterThan(0);
+  }, 30_000);
+}
+
+for (const scenario of [
+  { name: "new audits save the configured task timeout", override: undefined, roleLimit: 720_000, legacy: false, expected: 10_000 },
+  { name: "audit timeout overrides reach the harness", override: 12_000, roleLimit: 720_000, legacy: false, expected: 12_000 },
+  { name: "legacy audits apply the current timeout setting", override: undefined, roleLimit: 720_000, legacy: true, expected: 10_000 },
+  { name: "role duration remains a ceiling on audit timeouts", override: 30_000, roleLimit: 20_000, legacy: false, expected: 20_000 },
+]) {
+  test(scenario.name, async () => {
+    setSetting(store, "audit.task_timeout_ms", 10_000, null);
+    store.run("UPDATE agent_defs SET max_duration_ms = ? WHERE role = 'codebase_mapper'", scenario.roleLimit);
+    const id = engine.createAudit({
+      projectId: "p1", repositoryId: "r1", userId: "u1",
+      overrides: scenario.override === undefined ? {} : { task_timeout_ms: scenario.override },
+    });
+    if (scenario.legacy) store.run("UPDATE audits SET config = json_remove(config, '$.task_timeout_ms') WHERE id = ?", id);
+    const timeouts: number[] = [];
+    const run = manager.run.bind(manager);
+    manager.run = async (...args) => {
+      timeouts.push(args[1].timeoutMs);
+      engine.cancelTask(args[1].taskId, "test");
+      return run(...args);
+    };
+    await engine.startAudit(id, "u1");
+    await waitFor(() => !store.get("SELECT id FROM tasks WHERE audit_id = ? AND status = 'running'", id));
+    expect(timeouts).toEqual([scenario.expected]);
+    if (!scenario.legacy) {
+      const audit = store.get<{ config: string }>("SELECT config FROM audits WHERE id = ?", id)!;
+      expect(JSON.parse(audit.config).task_timeout_ms).toBe(scenario.override ?? 10_000);
+    }
+  });
+}
 
 test("reports omit empty authorization labels and retain supplied metadata", async () => {
   const config = testConfig(dir);

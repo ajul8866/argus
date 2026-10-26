@@ -21,8 +21,9 @@ import {
   uid,
 } from "../util.ts";
 import { assertAuthorizedRoot, createWorkspace, verifyQuote } from "../repo/workspace.ts";
-import { redactSecrets } from "../security/redact.ts";
+import { redactObject, redactSecrets } from "../security/redact.ts";
 import { evaluateEvidence } from "./evidence-gate.ts";
+import { validateAuditOverrides } from "./options.ts";
 import type { Inventory } from "../repo/inventory.ts";
 import { inventoryForAgent, inventorySummary } from "../repo/inventory.ts";
 import {
@@ -44,7 +45,7 @@ import {
   RETEST_SCHEMA,
   validateResult,
 } from "./schemas.ts";
-import type { EvidenceStore } from "./evidence.ts";
+import type { EvidenceInput, EvidenceStore } from "./evidence.ts";
 import type { ReportService } from "../reports/generator.ts";
 import { REPORT_FORMATS } from "../reports/generator.ts";
 import type { LocalCatalog } from "../local/catalog.ts";
@@ -422,6 +423,7 @@ export class AuditEngine {
     userId: string | null;
     overrides?: Record<string, unknown>;
   }): string {
+    validateAuditOverrides(this.store, input.overrides ?? {});
     const project = this.store.get<ProjectRow>("SELECT * FROM projects WHERE id = ?", input.projectId);
     if (!project) throw new AppError(404, "project_not_found", "Project not found");
     const repository = input.repositoryId
@@ -471,6 +473,11 @@ export class AuditEngine {
         Number(input.overrides?.max_concurrent_agents ?? getSetting(this.store, "audit.max_concurrent_agents", this.config.maxConcurrentAgents)),
         1,
         12,
+      ),
+      task_timeout_ms: clamp(
+        Number(input.overrides?.task_timeout_ms ?? getSetting(this.store, "audit.task_timeout_ms", 720_000)),
+        10_000,
+        3_600_000,
       ),
       require_distinct_harness_for_retest: Boolean(
         input.overrides?.require_distinct_harness_for_retest ??
@@ -541,16 +548,44 @@ export class AuditEngine {
         );
       });
       this.events.append({ auditId, type: "audit.started", payload: { by: userId } });
-      this.createTask({
-        auditId,
-        phase: 1,
-        kind: "phase1.map",
-        taskKey: "phase1:map",
-        title: "Phase 1 — Map codebase and define assessment areas",
-        payload: {},
-        agentRole: "codebase_mapper",
-        priority: 100,
-      });
+      try {
+        this.createTask({
+          auditId,
+          phase: 1,
+          kind: "phase1.map",
+          taskKey: "phase1:map",
+          title: "Phase 1 — Map codebase and define assessment areas",
+          payload: {},
+          agentRole: "codebase_mapper",
+          priority: 100,
+        });
+      } catch (error) {
+        const message = redactSecrets(error instanceof Error ? error.message : String(error)).text;
+        this.store.transaction(() => {
+          this.store.run(
+            "UPDATE audits SET status = 'failed', finished_at = ?, error = ? WHERE id = ?",
+            now(),
+            `Audit could not create its initial task: ${message}`,
+            auditId,
+          );
+          this.store.run(
+            "UPDATE audit_phases SET status = 'failed', finished_at = ? WHERE audit_id = ? AND phase = 1",
+            now(),
+            auditId,
+          );
+          this.store.run(
+            "UPDATE audit_phases SET status = 'skipped', finished_at = ? WHERE audit_id = ? AND phase > 1",
+            now(),
+            auditId,
+          );
+        });
+        this.events.append({
+          auditId,
+          type: "audit.failed",
+          payload: { reason: "initial_task_creation_failed", error: message },
+        });
+        throw error;
+      }
     });
     await this.reconcile(auditId);
     this.schedule(auditId);
@@ -571,6 +606,28 @@ export class AuditEngine {
     this.abortAuditRuns(auditId);
     this.events.append({ auditId, type: "audit.cancelling", payload: { by: userId } });
     await this.reconcile(auditId);
+  }
+
+  async retryTask(taskId: string, actor: string | null): Promise<void> {
+    const original = this.store.get<TaskRow>("SELECT * FROM tasks WHERE id = ?", taskId);
+    if (!original) throw new AppError(404, "task_not_found", "Task not found");
+    await this.withAuditLock(original.audit_id, () => {
+      const task = this.store.get<TaskRow>("SELECT * FROM tasks WHERE id = ?", taskId)!;
+      const audit = this.store.get<AuditRow>("SELECT * FROM audits WHERE id = ?", task.audit_id);
+      if (!audit || audit.status !== "running") {
+        throw new AppError(409, "audit_not_running", "Tasks can be retried only while their audit is running. Create a new audit to repeat a closed assessment.");
+      }
+      if (!["failed", "cancelled", "blocked"].includes(task.status) || this.running.has(taskId)) {
+        throw new AppError(409, "task_not_retryable", "Only failed, cancelled, or blocked tasks that have stopped can be retried");
+      }
+      this.store.run(
+        `UPDATE tasks SET status = 'queued', error = NULL, failure_kind = NULL, result = NULL,
+         started_at = NULL, finished_at = NULL, agent_session_id = NULL, deadline_at = NULL,
+         max_attempts = MAX(max_attempts, attempts + 1) WHERE id = ?`,
+        taskId,
+      );
+      this.events.append({ auditId: task.audit_id, taskId, type: "task.requeued", payload: { by: actor } });
+    });
   }
 
   cancelTask(taskId: string, actor: string | null): void {
@@ -899,14 +956,24 @@ export class AuditEngine {
       1,
       12,
     );
-    const projectLimit = project?.max_concurrent_agents ?? auditLimit;
-    const limit = Math.min(globalLimit, auditLimit, projectLimit, 16);
     if (this.running.size >= globalLimit) return;
     const runningForAudit = this.store.get<{ count: number }>(
       "SELECT COUNT(*) AS count FROM tasks WHERE audit_id = ? AND status = 'running'",
       auditId,
     )?.count ?? 0;
-    let slots = Math.min(limit - runningForAudit, globalLimit - this.running.size);
+    const configuredProjectLimit = project?.max_concurrent_agents;
+    const projectLimit =
+      configuredProjectLimit != null &&
+      Number.isInteger(configuredProjectLimit) &&
+      configuredProjectLimit > 0
+        ? Math.min(configuredProjectLimit, 16)
+        : globalLimit;
+    const projectSlots = projectLimit - (this.store.get<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM tasks t JOIN audits a ON a.id = t.audit_id
+       WHERE a.project_id = ? AND t.status = 'running'`,
+      audit.project_id,
+    )?.count ?? 0);
+    let slots = Math.min(auditLimit - runningForAudit, projectSlots, globalLimit - this.running.size);
     if (slots <= 0) return;
     const candidates = this.store.all<TaskRow>(
       `SELECT t.* FROM tasks t
@@ -1010,6 +1077,10 @@ export class AuditEngine {
       if (this.cancelIfAuditClosed(task, "Audit was cancelled before deterministic persistence ran")) return;
       const payload = parseJson<Record<string, unknown>>(task.payload, {});
       const result = await this.persistFinding(task, payload);
+      if (!this.auditIsRunning(task.audit_id)) {
+        this.finishTaskFailure(task.id, "cancelled", "Audit was cancelled while the finding was being persisted");
+        return;
+      }
       this.completeTask(task.id, result);
     } catch (error) {
       this.finishTaskFailure(task.id, "internal", error instanceof Error ? error.message : String(error));
@@ -1121,15 +1192,16 @@ export class AuditEngine {
     ) => {
       if (sessionFinalized) return;
       sessionFinalized = true;
+      const safeError = error ? redactSecrets(error).text : null;
       this.store.run(
         `UPDATE agent_sessions SET status = ?, ended_at = ?, exit_code = ?, usage = ?, error = ?, harness_session_ref = COALESCE(?, harness_session_ref), metadata = ? WHERE id = ?`,
         status,
         now(),
         result?.exitCode ?? null,
         result ? toJson(result.usage) : null,
-        error,
+        safeError,
         result?.sessionRef ?? null,
-        result ? toJson(result.metadata) : null,
+        result ? toJson(redactObject(result.metadata)) : null,
         sessionId,
       );
       this.events.append({
@@ -1140,7 +1212,7 @@ export class AuditEngine {
         payload: {
           status,
           usage: result?.usage ?? null,
-          error,
+          error: safeError,
           harness_session_ref: result?.sessionRef ?? null,
         },
       });
@@ -1367,6 +1439,13 @@ export class AuditEngine {
     };
 
     if (cancelBeforeRun()) return;
+    const configuredTimeout = Number(
+      ctx.auditConfig.task_timeout_ms ??
+        getSetting(this.store, "audit.task_timeout_ms", definition.max_duration_ms),
+    );
+    const timeout = Number.isFinite(configuredTimeout) && configuredTimeout > 0
+      ? Math.max(10_000, configuredTimeout)
+      : definition.max_duration_ms;
     let result: HarnessRunResult;
     try {
       result = await this.manager.run(
@@ -1382,7 +1461,7 @@ export class AuditEngine {
           model: task.model,
           provider: harnessConfig(this.store, harness).provider,
           allowedTools: tools,
-          timeoutMs: Math.min(definition.max_duration_ms, Number(ctx.auditConfig.task_timeout_ms ?? definition.max_duration_ms)),
+          timeoutMs: Math.min(definition.max_duration_ms, timeout),
           schema: schema ?? undefined,
           maxBudgetUsd: definition.budget_usd,
           metadata: { attempt: task.attempts },
@@ -1499,6 +1578,10 @@ export class AuditEngine {
 
     try {
       const data = await this.handleAgentResult(task, ctx, structured, result, sessionId);
+      if (signal.aborted || !this.auditIsRunning(task.audit_id)) {
+        this.finishTaskFailure(task.id, "cancelled", "Task cancelled while the harness result was being applied");
+        return;
+      }
       this.completeTask(task.id, { data, meta: this.runMeta(result, sessionId, harness) });
     } catch (error) {
       this.finishTaskFailure(task.id, "invalid_output", error instanceof Error ? error.message : String(error));
@@ -1801,76 +1884,78 @@ export class AuditEngine {
     const areaId = String(payload.area_id);
     const validPaths = new Set(ctx.inventory.files.map((file) => file.path));
     const maxCandidates = Number(ctx.auditConfig.max_candidates_per_area ?? 4);
-    const candidates = raw.candidates.slice(0, maxCandidates).map((candidate) => ({
+    let candidates = raw.candidates.slice(0, maxCandidates).map((candidate) => ({
       ...candidate,
       files: candidate.files.filter((file) => validPaths.has(file.path)),
       evidence_excerpts: candidate.evidence_excerpts.filter((excerpt) => validPaths.has(excerpt.path)),
     }));
-    const checks: Array<Record<string, unknown>> = [];
-    for (const candidate of candidates) {
-      for (const excerpt of candidate.evidence_excerpts) {
-        checks.push({
-          candidate: candidate.title,
-          ...(await verifyQuote(await assertAuthorizedRoot(ctx.repository.path, this.config.allowedRoots), ctx.scope, excerpt)),
-        });
+    let checks: Array<Record<string, unknown>> = [];
+    const previousCandidates = this.store.all<CandidateRow>(
+      "SELECT * FROM candidates WHERE discovery_task_id = ? ORDER BY created_at, id",
+      task.id,
+    );
+    if (previousCandidates.length > 0) {
+      const persisted = previousCandidates.map((row) =>
+        parseJson<Candidate & { discovery_evidence_check?: Array<Record<string, unknown>> }>(row.payload, {} as Candidate),
+      );
+      candidates = persisted;
+      checks = persisted.flatMap((candidate) => candidate.discovery_evidence_check ?? []);
+    }
+    if (previousCandidates.length === 0) {
+      for (const candidate of candidates) {
+        for (const excerpt of candidate.evidence_excerpts) {
+          checks.push({
+            candidate: candidate.title,
+            ...(await verifyQuote(await assertAuthorizedRoot(ctx.repository.path, this.config.allowedRoots), ctx.scope, excerpt)),
+          });
+        }
       }
     }
+    this.requireRunningAudit(task.audit_id);
     const createdAt = now();
-    const candidateRows: CandidateRow[] = [];
-    this.store.transaction(() => {
-      for (const candidate of candidates) {
-        const id = uid();
-        const payloadWithChecks = {
-          ...candidate,
-          discovery_evidence_check: checks.filter((check) => check.candidate === candidate.title),
-          area_id: areaId,
-        };
-        this.store.run(
-          `INSERT INTO candidates (id, audit_id, area_id, discovery_task_id, discovery_session_id, title, category, cwe, severity, status, payload, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'discovered', ?, ?)`,
-          id,
-          task.audit_id,
-          areaId,
-          task.id,
-          sessionId,
-          candidate.title,
-          candidate.category,
-          candidate.cwe,
-          candidate.severity,
-          toJson(payloadWithChecks),
-          createdAt,
-        );
-        candidateRows.push({
-          id,
-          audit_id: task.audit_id,
-          area_id: areaId,
-          discovery_task_id: task.id,
-          discovery_session_id: sessionId,
-          title: candidate.title,
-          category: candidate.category,
-          cwe: candidate.cwe,
-          severity: candidate.severity,
-          status: "discovered",
-          finding_id: null,
-          payload: toJson(payloadWithChecks),
-          created_at: createdAt,
-        });
-        this.events.append({
-          auditId: task.audit_id,
-          taskId: task.id,
-          sessionId,
-          type: "candidate.discovered",
-          payload: {
-            candidate_id: id,
-            title: candidate.title,
-            category: candidate.category,
-            cwe: candidate.cwe,
-            severity: candidate.severity,
+    if (previousCandidates.length === 0) {
+      this.store.transaction(() => {
+        for (const candidate of candidates) {
+          const id = uid();
+          const payloadWithChecks = {
+            ...candidate,
+            discovery_evidence_check: checks.filter((check) => check.candidate === candidate.title),
             area_id: areaId,
-            evidence_checks: checks.filter((check) => check.candidate === candidate.title),
-          },
-        });
-      }
+          };
+          this.store.run(
+            `INSERT INTO candidates (id, audit_id, area_id, discovery_task_id, discovery_session_id, title, category, cwe, severity, status, payload, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'discovered', ?, ?)`,
+            id,
+            task.audit_id,
+            areaId,
+            task.id,
+            sessionId,
+            candidate.title,
+            candidate.category,
+            candidate.cwe,
+            candidate.severity,
+            toJson(payloadWithChecks),
+            createdAt,
+          );
+          this.events.append({
+            auditId: task.audit_id,
+            taskId: task.id,
+            sessionId,
+            type: "candidate.discovered",
+            payload: {
+              candidate_id: id,
+              title: candidate.title,
+              category: candidate.category,
+              cwe: candidate.cwe,
+              severity: candidate.severity,
+              area_id: areaId,
+              evidence_checks: checks.filter((check) => check.candidate === candidate.title),
+            },
+          });
+        }
+      });
+    }
+    this.store.transaction(() => {
       this.store.run(
         "UPDATE coverage SET status = 'COMPLETED', task_id = ?, notes = ?, updated_at = ? WHERE audit_id = ? AND area_id = ?",
         task.id,
@@ -1885,7 +1970,7 @@ export class AuditEngine {
         task.audit_id,
       );
     });
-    await this.evidence.append({
+    await this.appendTaskEvidence({
       auditId: task.audit_id,
       taskId: task.id,
       sessionId,
@@ -1918,7 +2003,8 @@ export class AuditEngine {
     const candidateData = parseJson<Candidate>(candidateRow.payload, {} as Candidate);
     const candidatePaths = new Set(candidateData.files.map((file) => file.path));
     const evaluation = await evaluateEvidence(repoRoot, ctx.scope, raw.verified_excerpts, candidatePaths);
-    const evidenceChecks = evaluation.checks;
+    this.requireRunningAudit(task.audit_id);
+    let evidenceChecks = evaluation.checks;
     const verifiedCount = evaluation.verifiedCount;
     const relevantCount = evaluation.relevantCount;
     let effectiveVerdict = raw.verdict;
@@ -1941,8 +2027,23 @@ export class AuditEngine {
         rationale = `${rationale}\n\nPlatform note: DUPLICATE was claimed without a valid existing finding code in this audit.`;
       }
     }
-    const verificationId = uid();
-    const createdAt = now();
+    const previousVerification = this.store.get<VerificationRow>(
+      `SELECT v.* FROM verifications v
+       JOIN agent_sessions s ON s.id = v.agent_session_id
+       WHERE s.task_id = ? AND v.kind = 'confirmation'
+       ORDER BY v.created_at DESC LIMIT 1`,
+      task.id,
+    );
+    if (previousVerification) {
+      effectiveVerdict = previousVerification.verdict as typeof effectiveVerdict;
+      rationale = previousVerification.rationale;
+      evidenceChecks = parseJson<{ checks?: typeof evidenceChecks }>(
+        previousVerification.evidence_check,
+        { checks: evidenceChecks },
+      ).checks ?? evidenceChecks;
+    }
+    const verificationId = previousVerification?.id ?? uid();
+    const createdAt = previousVerification?.created_at ?? now();
     const checkJson = {
       verified_count: verifiedCount,
       relevant_count: relevantCount,
@@ -1950,34 +2051,36 @@ export class AuditEngine {
       original_verdict: raw.verdict,
       effective_verdict: effectiveVerdict,
     };
-    this.store.transaction(() => {
-      this.store.run(
-        `INSERT INTO verifications (id, audit_id, candidate_id, kind, agent_session_id, discovery_session_id, verdict, rationale, evidence_check, payload, created_at)
-         VALUES (?, ?, ?, 'confirmation', ?, ?, ?, ?, ?, ?, ?)`,
-        verificationId,
-        task.audit_id,
-        candidateRow.id,
-        sessionId,
-        candidateRow.discovery_session_id,
-        effectiveVerdict,
-        rationale,
-        toJson(checkJson),
-        toJson({ raw, evidence_checks: evidenceChecks }),
-        createdAt,
-      );
-      this.store.run(
-        "UPDATE candidates SET status = ? WHERE id = ?",
-        effectiveVerdict === "CONFIRMED"
-          ? "confirmed"
-          : effectiveVerdict === "REFUTED"
-            ? "refuted"
-            : effectiveVerdict === "DUPLICATE"
-              ? "duplicate"
-              : "inconclusive",
-        candidateRow.id,
-      );
-    });
-    await this.evidence.append({
+    if (!previousVerification) {
+      this.store.transaction(() => {
+        this.store.run(
+          `INSERT INTO verifications (id, audit_id, candidate_id, kind, agent_session_id, discovery_session_id, verdict, rationale, evidence_check, payload, created_at)
+           VALUES (?, ?, ?, 'confirmation', ?, ?, ?, ?, ?, ?, ?)`,
+          verificationId,
+          task.audit_id,
+          candidateRow.id,
+          sessionId,
+          candidateRow.discovery_session_id,
+          effectiveVerdict,
+          rationale,
+          toJson(checkJson),
+          toJson({ raw, evidence_checks: evidenceChecks }),
+          createdAt,
+        );
+        this.store.run(
+          "UPDATE candidates SET status = ? WHERE id = ?",
+          effectiveVerdict === "CONFIRMED"
+            ? "confirmed"
+            : effectiveVerdict === "REFUTED"
+              ? "refuted"
+              : effectiveVerdict === "DUPLICATE"
+                ? "duplicate"
+                : "inconclusive",
+          candidateRow.id,
+        );
+      });
+    }
+    await this.appendTaskEvidence({
       auditId: task.audit_id,
       taskId: task.id,
       sessionId,
@@ -1986,7 +2089,7 @@ export class AuditEngine {
       content: { verification_id: verificationId, candidate_id: candidateRow.id, raw, effective_verdict: effectiveVerdict, evidence_checks: evidenceChecks },
     });
     if (verifiedCount > 0) {
-      await this.evidence.append({
+      await this.appendTaskEvidence({
         auditId: task.audit_id,
         taskId: task.id,
         sessionId,
@@ -1995,20 +2098,22 @@ export class AuditEngine {
         content: evidenceChecks,
       });
     }
-    this.events.append({
-      auditId: task.audit_id,
-      taskId: task.id,
-      sessionId,
-      type: "verification.completed",
-      payload: {
-        verification_id: verificationId,
-        candidate_id: candidateRow.id,
-        kind: "confirmation",
-        verdict: effectiveVerdict,
-        claimed_verdict: raw.verdict,
-        verified_excerpts: verifiedCount,
-      },
-    });
+    if (!this.eventFieldExists(task.audit_id, "verification.completed", "verification_id", verificationId)) {
+      this.events.append({
+        auditId: task.audit_id,
+        taskId: task.id,
+        sessionId,
+        type: "verification.completed",
+        payload: {
+          verification_id: verificationId,
+          candidate_id: candidateRow.id,
+          kind: "confirmation",
+          verdict: effectiveVerdict,
+          claimed_verdict: raw.verdict,
+          verified_excerpts: verifiedCount,
+        },
+      });
+    }
     return { ...raw, verdict: raw.verdict, effective_verdict: effectiveVerdict, evidence_checks: evidenceChecks };
   }
 
@@ -2028,7 +2133,8 @@ export class AuditEngine {
     const repoRoot = await assertAuthorizedRoot(ctx.repository.path, this.config.allowedRoots);
     const findingPaths = new Set(parseJson<Array<{ path: string }>>(finding.files, []).map((file) => file.path));
     const evaluation = await evaluateEvidence(repoRoot, ctx.scope, raw.verified_excerpts, findingPaths);
-    const evidenceChecks = evaluation.checks;
+    this.requireRunningAudit(task.audit_id);
+    let evidenceChecks = evaluation.checks;
     const verifiedCount = evaluation.verifiedCount;
     const relevantCount = evaluation.relevantCount;
     let effectiveDecision = raw.decision;
@@ -2037,8 +2143,23 @@ export class AuditEngine {
       effectiveDecision = "NEEDS_CORRECTION";
       rationale = `${rationale}\n\nPlatform evidence gate: REVERIFIED requires at least one exact source excerpt on an affected finding file, verified against the audited commit. None was verifiable.`;
     }
-    const verificationId = uid();
-    const createdAt = now();
+    const previousVerification = this.store.get<VerificationRow>(
+      `SELECT v.* FROM verifications v
+       JOIN agent_sessions s ON s.id = v.agent_session_id
+       WHERE s.task_id = ? AND v.kind = 'reverification'
+       ORDER BY v.created_at DESC LIMIT 1`,
+      task.id,
+    );
+    if (previousVerification) {
+      effectiveDecision = previousVerification.verdict as typeof effectiveDecision;
+      rationale = previousVerification.rationale;
+      evidenceChecks = parseJson<{ checks?: typeof evidenceChecks }>(
+        previousVerification.evidence_check,
+        { checks: evidenceChecks },
+      ).checks ?? evidenceChecks;
+    }
+    const verificationId = previousVerification?.id ?? uid();
+    const createdAt = previousVerification?.created_at ?? now();
     const findingStatus =
       effectiveDecision === "REVERIFIED"
         ? "reverified"
@@ -2047,33 +2168,35 @@ export class AuditEngine {
           : effectiveDecision === "NEEDS_CORRECTION"
             ? "needs_correction"
             : "unresolved";
-    this.store.transaction(() => {
-      this.store.run(
-        `INSERT INTO verifications (id, audit_id, candidate_id, finding_id, kind, agent_session_id, discovery_session_id, verdict, rationale, evidence_check, payload, created_at)
-         VALUES (?, ?, ?, ?, 'reverification', ?, ?, ?, ?, ?, ?, ?)`,
-        verificationId,
-        task.audit_id,
-        finding.candidate_id,
-        finding.id,
-        sessionId,
-        finding.discovery_session_id ?? "",
-        effectiveDecision,
-        rationale,
-        toJson({ verified_count: verifiedCount, relevant_count: relevantCount, checks: evidenceChecks, original_decision: raw.decision, effective_decision: effectiveDecision }),
-        toJson({ raw, evidence_checks: evidenceChecks }),
-        createdAt,
-      );
-      this.store.run(
-        `UPDATE findings SET status = ?, severity = ?, retest_decision = ?, retest_session_id = COALESCE(retest_session_id, ?), updated_at = ? WHERE id = ?`,
-        findingStatus,
-        raw.severity_assessment,
-        effectiveDecision,
-        sessionId,
-        createdAt,
-        finding.id,
-      );
-    });
-    await this.evidence.append({
+    if (!previousVerification) {
+      this.store.transaction(() => {
+        this.store.run(
+          `INSERT INTO verifications (id, audit_id, candidate_id, finding_id, kind, agent_session_id, discovery_session_id, verdict, rationale, evidence_check, payload, created_at)
+           VALUES (?, ?, ?, ?, 'reverification', ?, ?, ?, ?, ?, ?, ?)`,
+          verificationId,
+          task.audit_id,
+          finding.candidate_id,
+          finding.id,
+          sessionId,
+          finding.discovery_session_id ?? "",
+          effectiveDecision,
+          rationale,
+          toJson({ verified_count: verifiedCount, relevant_count: relevantCount, checks: evidenceChecks, original_decision: raw.decision, effective_decision: effectiveDecision }),
+          toJson({ raw, evidence_checks: evidenceChecks }),
+          createdAt,
+        );
+        this.store.run(
+          `UPDATE findings SET status = ?, severity = ?, retest_decision = ?, retest_session_id = COALESCE(retest_session_id, ?), updated_at = ? WHERE id = ?`,
+          findingStatus,
+          raw.severity_assessment,
+          effectiveDecision,
+          sessionId,
+          createdAt,
+          finding.id,
+        );
+      });
+    }
+    await this.appendTaskEvidence({
       auditId: task.audit_id,
       taskId: task.id,
       sessionId,
@@ -2082,25 +2205,28 @@ export class AuditEngine {
       title: `Independent reverification — ${finding.code}`,
       content: { verification_id: verificationId, finding_id: finding.id, raw, effective_decision: effectiveDecision, evidence_checks: evidenceChecks },
     });
-    this.events.append({
-      auditId: task.audit_id,
-      taskId: task.id,
-      sessionId,
-      type: "finding.reverified",
-      payload: {
-        finding_id: finding.id,
-        code: finding.code,
-        decision: effectiveDecision,
-        claimed_decision: raw.decision,
-        verified_excerpts: verifiedCount,
-        status: findingStatus,
-      },
-    });
+    if (!this.eventFieldExists(task.audit_id, "finding.reverified", "verification_id", verificationId)) {
+      this.events.append({
+        auditId: task.audit_id,
+        taskId: task.id,
+        sessionId,
+        type: "finding.reverified",
+        payload: {
+          verification_id: verificationId,
+          finding_id: finding.id,
+          code: finding.code,
+          decision: effectiveDecision,
+          claimed_decision: raw.decision,
+          verified_excerpts: verifiedCount,
+          status: findingStatus,
+        },
+      });
+    }
     const reportTaskExists = this.store.get<{ id: string }>(
       "SELECT id FROM tasks WHERE audit_id = ? AND kind = 'phase6.report' LIMIT 1",
       task.audit_id,
     );
-    if (reportTaskExists) {
+    if (reportTaskExists && this.auditIsRunning(task.audit_id)) {
       this.createTask({
         auditId: task.audit_id,
         phase: 6,
@@ -2153,24 +2279,25 @@ export class AuditEngine {
       candidate.category,
       toJson(files),
     );
-    if (existing) {
+    if (existing && existing.candidate_id !== candidate.id) {
       this.store.run("UPDATE candidates SET status = 'duplicate', finding_id = ? WHERE id = ?", existing.id, candidate.id);
       return { duplicate_of: existing.code, finding_id: existing.id };
     }
+    this.requireRunningAudit(task.audit_id);
     const count = this.store.get<{ count: number }>(
       "SELECT COUNT(*) AS count FROM findings WHERE audit_id = ?",
       task.audit_id,
     )?.count ?? 0;
-    const findingId = uid();
-    const code = `ARG-${String(count + 1).padStart(3, "0")}`;
-    const createdAt = now();
+    const findingId = existing?.id ?? uid();
+    const code = existing?.code ?? `ARG-${String(count + 1).padStart(3, "0")}`;
+    const createdAt = existing?.created_at ?? now();
     const reproduction = [
       candidateData.reproduction_notes,
       ...(confirm?.reproduction_steps ?? []),
     ].filter((step) => typeof step === "string" && step.trim().length > 0);
     const severity = confirm?.severity_assessment ?? candidateData.severity;
     const impact = confirm?.impact_assessment?.trim() ? confirm.impact_assessment : candidateData.impact;
-    const finding: FindingRow = {
+    const finding: FindingRow = existing ?? {
       id: findingId,
       code,
       audit_id: task.audit_id,
@@ -2198,44 +2325,54 @@ export class AuditEngine {
       created_at: createdAt,
       updated_at: createdAt,
     };
-    this.store.transaction(() => {
-      this.store.run(
-        `INSERT INTO findings (id, code, audit_id, project_id, candidate_id, title, category, cwe, severity, status, repository_commit, files, root_cause, preconditions, reproduction, expected, observed, impact, remediation, discovery_session_id, verification_session_id, retest_session_id, verification_decision, retest_decision, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'CONFIRMED', NULL, ?, ?)`,
+    if (!existing) {
+      this.store.transaction(() => {
+        this.store.run(
+          `INSERT INTO findings (id, code, audit_id, project_id, candidate_id, title, category, cwe, severity, status, repository_commit, files, root_cause, preconditions, reproduction, expected, observed, impact, remediation, discovery_session_id, verification_session_id, retest_session_id, verification_decision, retest_decision, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'CONFIRMED', NULL, ?, ?)`,
+          finding.id,
+          finding.code,
+          finding.audit_id,
+          finding.project_id,
+          finding.candidate_id,
+          finding.title,
+          finding.category,
+          finding.cwe,
+          finding.severity,
+          finding.status,
+          finding.repository_commit,
+          finding.files,
+          finding.root_cause,
+          finding.preconditions,
+          finding.reproduction,
+          finding.expected,
+          finding.observed,
+          finding.impact,
+          finding.remediation,
+          finding.discovery_session_id,
+          finding.verification_session_id,
+          finding.created_at,
+          finding.updated_at,
+        );
+        this.store.run("UPDATE candidates SET status = 'persisted', finding_id = ? WHERE id = ?", finding.id, candidate.id);
+      });
+    }
+    const existingEvidence = new Set(
+      this.store.all<{ evidence_key: string }>(
+        "SELECT kind || ':' || title AS evidence_key FROM evidence WHERE finding_id = ?",
         finding.id,
-        finding.code,
-        finding.audit_id,
-        finding.project_id,
-        finding.candidate_id,
-        finding.title,
-        finding.category,
-        finding.cwe,
-        finding.severity,
-        finding.status,
-        finding.repository_commit,
-        finding.files,
-        finding.root_cause,
-        finding.preconditions,
-        finding.reproduction,
-        finding.expected,
-        finding.observed,
-        finding.impact,
-        finding.remediation,
-        finding.discovery_session_id,
-        finding.verification_session_id,
-        finding.created_at,
-        finding.updated_at,
-      );
-      this.store.run("UPDATE candidates SET status = 'persisted', finding_id = ? WHERE id = ?", finding.id, candidate.id);
-    });
+      ).map((row) => row.evidence_key),
+    );
     for (const check of verifiedChecks) {
+      const title = `${check.path}:${check.line_start ?? 1}-${check.line_end ?? check.line_start ?? 1}`;
+      if (existingEvidence.has(`code_excerpt:${title}`)) continue;
       await this.evidence.append({
         auditId: task.audit_id,
         taskId: task.id,
         sessionId: verification.agent_session_id,
         findingId: finding.id,
         kind: "code_excerpt",
-        title: `${check.path}:${check.line_start ?? 1}-${check.line_end ?? check.line_start ?? 1}`,
+        title,
         content: {
           path: check.path,
           start_line: check.line_start ?? 1,
@@ -2251,33 +2388,74 @@ export class AuditEngine {
           verification_id: verification.id,
         },
       });
+      existingEvidence.add(`code_excerpt:${title}`);
     }
-    await this.evidence.append({
-      auditId: task.audit_id,
-      taskId: task.id,
-      sessionId: verification.agent_session_id,
-      findingId: finding.id,
-      kind: "finding_record",
-      title: `${finding.code} structured finding`,
-      content: {
-        ...finding,
-        verification_rationale: verification.rationale,
-        evidence_checks: verifiedChecks,
-      },
-    });
-    this.events.append({
-      auditId: task.audit_id,
-      taskId: task.id,
-      type: "finding.created",
-      payload: {
-        finding_id: finding.id,
-        code: finding.code,
-        title: finding.title,
-        severity: finding.severity,
-        files,
-      },
-    });
+    const recordTitle = `${finding.code} structured finding`;
+    if (!existingEvidence.has(`finding_record:${recordTitle}`)) {
+      await this.evidence.append({
+        auditId: task.audit_id,
+        taskId: task.id,
+        sessionId: verification.agent_session_id,
+        findingId: finding.id,
+        kind: "finding_record",
+        title: recordTitle,
+        content: {
+          ...finding,
+          verification_rationale: verification.rationale,
+          evidence_checks: verifiedChecks,
+        },
+      });
+      existingEvidence.add(`finding_record:${recordTitle}`);
+    }
+    if (!this.eventFieldExists(task.audit_id, "finding.created", "finding_id", finding.id)) {
+      this.events.append({
+        auditId: task.audit_id,
+        taskId: task.id,
+        type: "finding.created",
+        payload: {
+          finding_id: finding.id,
+          code: finding.code,
+          title: finding.title,
+          severity: finding.severity,
+          files,
+        },
+      });
+    }
     return { finding_id: finding.id, code: finding.code, files };
+  }
+
+  private auditIsRunning(auditId: string): boolean {
+    return this.store.get<{ status: string }>("SELECT status FROM audits WHERE id = ?", auditId)?.status === "running";
+  }
+
+  private async appendTaskEvidence(input: EvidenceInput): Promise<void> {
+    const existing = input.taskId
+      ? this.store.get<{ id: string }>(
+          "SELECT id FROM evidence WHERE task_id = ? AND kind = ? AND title = ? LIMIT 1",
+          input.taskId,
+          input.kind,
+          input.title,
+        )
+      : null;
+    if (!existing) await this.evidence.append(input);
+  }
+
+  private eventFieldExists(auditId: string, type: string, field: string, value: string): boolean {
+    return Boolean(this.store.get(
+      `SELECT id FROM execution_events
+       WHERE audit_id = ? AND type = ? AND json_extract(payload, ?) = ?
+       LIMIT 1`,
+      auditId,
+      type,
+      `$.${field}`,
+      value,
+    ));
+  }
+
+  private requireRunningAudit(auditId: string): void {
+    if (!this.auditIsRunning(auditId)) {
+      throw new Error("Audit is no longer running; the harness result was not applied");
+    }
   }
 
   private completeTask(taskId: string, data: unknown): void {

@@ -10,9 +10,16 @@ LLM agents. Use it only on repositories you are authorized to assess.
   dashboard does not request them, and missing values are not filled with
   invented authorization claims. Authentication, role checks, CSRF protection,
   and source-path boundaries still apply.
-- The source path is canonicalized with `realpath` and checked against
-  `ARGUS_ALLOWED_ROOTS` on create/import and again when a workspace/evidence
-  file is opened.
+- Without an explicit `ARGUS_ALLOWED_ROOTS`, Argus detects readable source
+  locations from the host user's home, application folder, common project
+  locations, temporary directory, and mounted volumes. Administrators may
+  restrict them by setting `ARGUS_ALLOWED_ROOTS`. Imported snapshots under
+  `<dataDir>/repos` remain included in either mode.
+- The source path is canonicalized with `realpath` and checked against the
+  effective source locations on folder browsing and create/import, and again
+  when a workspace/evidence file is opened. Folder browsing requires the
+  auditor role, returns directory metadata only, and omits hidden folders,
+  `node_modules`, and symlinks.
 - Scope globs are enforced before file copy, in inventory, in explorer/file
   APIs, and in excerpt verification. Prompt text is never the authorization
   boundary.

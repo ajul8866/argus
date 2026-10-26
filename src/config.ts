@@ -1,5 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { detectRepositoryRoots } from "./repo/directories.ts";
 import packageInfo from "../package.json";
 
 export type Config = {
@@ -46,8 +48,10 @@ export function loadConfig(): Config {
   const dataDir = resolve(env("ARGUS_DATA_DIR", join(root, "data")));
   mkdirSync(dataDir, { recursive: true });
   const allowedRoots = [
-    ...new Set([join(dataDir, "repos"), ...envList("ARGUS_ALLOWED_ROOTS", [root])]),
-  ].map((entry) => resolve(entry));
+    ...new Set([join(dataDir, "repos"), ...envList("ARGUS_ALLOWED_ROOTS", detectRepositoryRoots([
+      homedir(), root, "/home", "/srv", "/opt", "/workspace", "/workspaces", "/projects", "/repos", "/mnt", "/media", tmpdir(),
+    ]))]),
+  ].map((entry) => detectRepositoryRoots([entry])[0] ?? resolve(entry));
   const masterKey = process.env.ARGUS_MASTER_KEY?.trim() || null;
   return {
     port: envInt("ARGUS_PORT", 8787),

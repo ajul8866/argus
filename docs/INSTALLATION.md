@@ -89,9 +89,11 @@ keeps `app/.env` when it updates the application.
 | `ARGUS_SANDBOX` | `auto`; use `bwrap` to require Bubblewrap isolation |
 | `ARGUS_PI_BIN` / `ARGUS_CLAUDE_BIN` | `pi` / `claude` |
 
-See [.env.example](../.env.example) for the remaining options. To import a
-local repository outside the application's allowed roots, set
-`ARGUS_ALLOWED_ROOTS` to colon-separated authorized directories.
+See [.env.example](../.env.example) for the remaining options. Use Browse folders
+when adding a project to select an existing repository on the host. Argus
+automatically detects the host user's home, common project locations, and
+mounted volumes. `ARGUS_ALLOWED_ROOTS` is an optional colon-separated list for
+administrators who want to restrict or customize these locations.
 
 ## Harnesses, Skills, and MCP
 

@@ -263,6 +263,13 @@
 .form-advanced > summary { cursor: pointer; color: var(--color-ink-2); font-size: var(--text-sm); padding-block: var(--space-xs); }
 .form-advanced > summary:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
 .form-advanced[open] > summary { margin-bottom: var(--space-sm); }
+.folder-address { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: var(--space-xs); }
+.folder-toolbar { display: flex; align-items: center; gap: var(--space-sm); min-width: 0; }
+.folder-current { min-width: 0; overflow-wrap: anywhere; font-size: var(--text-xs); color: var(--color-ink-2); }
+.folder-list { min-height: 160px; max-height: 280px; overflow-y: auto; border-block: var(--rule-hair) solid var(--color-rule); }
+.folder-row { display: flex; width: 100%; justify-content: space-between; gap: var(--space-sm); text-align: left; white-space: normal; overflow-wrap: anywhere; border-radius: 0; padding: var(--space-xs) var(--space-sm); }
+.folder-kind { flex-shrink: 0; color: var(--color-muted); font-size: var(--text-xs); }
+.folder-pagination { padding-block: var(--space-xs); }
 .checkbox { display: flex; align-items: center; gap: var(--space-xs); font-size: var(--text-sm); color: var(--color-ink-2); cursor: pointer; min-height: 36px; }
 .checkbox input { width: 15px; height: 15px; accent-color: var(--color-accent); flex-shrink: 0; }
 .checkbox:has(input:disabled) { opacity: 0.55; cursor: not-allowed; }

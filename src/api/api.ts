@@ -16,6 +16,7 @@ import { REPORT_FORMATS, type ReportFormat } from "../reports/generator.ts";
 import { DEFAULT_EXCLUDES } from "../repo/inventory.ts";
 import { importRepository } from "../repo/import.ts";
 import { assertAuthorizedRoot, readScopedFile } from "../repo/workspace.ts";
+import { listRepositoryFolders } from "../repo/directories.ts";
 import { agentDefinition, getSetting, harnessConfig, listSettings, saveHarnessConfig, setSetting } from "../settings.ts";
 import { decryptSecret, encryptSecret, type StoredCredential } from "../security/credentials.ts";
 import { redactObject } from "../security/redact.ts";
@@ -212,6 +213,15 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
           }),
           pending_approvals: totals?.pending_approvals ?? 0,
         });
+      }
+
+      if (path === "/api/repository-folders" && method === "GET") {
+        requireRole("auditor");
+        return json(await listRepositoryFolders(deps.config.allowedRoots, {
+          path: url.searchParams.get("path") ?? undefined,
+          search: url.searchParams.get("search") ?? undefined,
+          offset: url.searchParams.get("offset") ?? undefined,
+        }));
       }
 
       if (path === "/api/projects" && method === "GET") {

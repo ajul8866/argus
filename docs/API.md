@@ -38,6 +38,7 @@ failures).
 | `PUT` | `/api/projects/:id` | auditor | Update metadata/scope/status |
 | `DELETE` | `/api/projects/:id` | admin | Delete only if no audits |
 | `POST` | `/api/projects/:id/import` | auditor | Import current worktree or `{ref}` |
+| `GET` | `/api/repository-folders?path=&search=&offset=` | auditor | Browse existing host folders, with Git markers and pages of 100 |
 | `GET` | `/api/repositories` | any | All snapshots |
 | `GET` | `/api/repositories/:id` | any | Snapshot + inventory + architecture map |
 | `GET` | `/api/repositories/:id/tree?path=` | any | Inventory-derived tree |
@@ -46,12 +47,25 @@ failures).
 Creating a project requires only `name` and `source_path`. The optional
 `authorized_by` and `authorization_ref` fields remain supported for existing
 clients and default to empty strings. Scope arrays default to `["**/*"]` and
-the safe exclusion set. The source path must resolve under `ARGUS_ALLOWED_ROOTS`.
+the safe exclusion set. Source locations are detected automatically from the
+host user's home, the Argus application folder, common project locations, and
+mounted volumes. An explicit `ARGUS_ALLOWED_ROOTS` overrides these defaults.
+The data directory's `repos` folder is always included for imported snapshots.
 
 The dashboard shows only the project name and repository folder initially.
+Browse folders opens a host folder picker. It starts at the host user's home
+when available, marks Git repositories, supports filtering and subfolders, and
+fills the project name from the selection when the name is empty. No manual
+environment configuration is needed with the default source locations.
 Description, file patterns, and concurrent agents are under the collapsed
 Advanced settings section. Reports omit empty authorization metadata from
 Markdown, HTML, and PDF; JSON retains the fields for compatibility.
+
+Folder discovery returns `{path, parent_path, roots, folders, next_offset}`.
+Each root has `name` and `path`; each folder also has `is_repository`. The
+endpoint returns directory names and paths, never file contents. Hidden
+folders, `node_modules`, and symlinks are omitted. Invalid paths and
+offsets return 400, and paths outside configured locations return 403.
 
 Import writes an immutable snapshot under `$ARGUS_DATA_DIR/repos/...`, records
 the commit/ref, and rejects empty/invalid snapshots.

@@ -200,7 +200,7 @@ export async function assertAuthorizedRoot(path: string, allowedRoots: string[])
     throw new AppError(
       403,
       "repository_not_authorized",
-      "Repository path is outside ARGUS_ALLOWED_ROOTS. Add the root explicitly before importing.",
+      "This folder is outside the configured repository locations. Choose a folder from Browse folders.",
     );
   }
   return resolved;

@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Config } from "../src/config.ts";
-import { PHASE_NAMES } from "../src/config.ts";
+import { loadConfig, PHASE_NAMES } from "../src/config.ts";
 import { KeyedSerialQueue } from "../src/concurrency.ts";
 import { Store } from "../src/db/index.ts";
 import { buildFallbackPdf } from "../src/reports/pdf.ts";
@@ -16,6 +16,7 @@ import { createScopeMatcher, globToRegExp, matchesScope, extractJson, sha256 } f
 import { redactSecrets } from "../src/security/redact.ts";
 import { credentialEnvironment, decryptSecret, encryptSecret, type StoredCredential } from "../src/security/credentials.ts";
 import { MAP_SCHEMA, validateAgainstSchema } from "../src/orchestrator/schemas.ts";
+import { detectRepositoryRoots, listRepositoryFolders } from "../src/repo/directories.ts";
 
 const fixture = join(import.meta.dir, "fixtures", "vulnerable-app");
 
@@ -39,6 +40,92 @@ function testConfig(dataDir: string): Config {
     logLevel: "error",
   };
 }
+
+describe("host repository folders", () => {
+  test("default configuration accepts host folders without environment setup and honors explicit restrictions", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "argus-folders-config-"));
+    const originalRoots = process.env.ARGUS_ALLOWED_ROOTS;
+    const originalData = process.env.ARGUS_DATA_DIR;
+    try {
+      process.env.ARGUS_DATA_DIR = directory;
+      delete process.env.ARGUS_ALLOWED_ROOTS;
+      const automatic = loadConfig();
+      expect(automatic.allowedRoots).toContain(detectRepositoryRoots([homedir()])[0]!);
+      expect((await listRepositoryFolders(automatic.allowedRoots, { path: directory })).path).toBe(detectRepositoryRoots([directory])[0]!);
+      mkdirSync(join(directory, "only-this"));
+      process.env.ARGUS_ALLOWED_ROOTS = join(directory, "only-this");
+      const restricted = loadConfig();
+      await expect(listRepositoryFolders(restricted.allowedRoots, { path: directory })).rejects.toMatchObject({ code: "repository_not_authorized" });
+      expect((await listRepositoryFolders(restricted.allowedRoots)).path).toBe(join(detectRepositoryRoots([directory])[0]!, "only-this"));
+      symlinkSync(join(directory, "only-this"), join(directory, "alias"));
+      process.env.ARGUS_ALLOWED_ROOTS = join(directory, "alias");
+      const aliased = loadConfig();
+      const selection = await listRepositoryFolders(aliased.allowedRoots);
+      expect(aliased.allowedRoots).toContain(selection.path);
+    } finally {
+      if (originalRoots === undefined) delete process.env.ARGUS_ALLOWED_ROOTS;
+      else process.env.ARGUS_ALLOWED_ROOTS = originalRoots;
+      if (originalData === undefined) delete process.env.ARGUS_DATA_DIR;
+      else process.env.ARGUS_DATA_DIR = originalData;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("detects existing readable locations and resolves duplicate aliases", () => {
+    const directory = mkdtempSync(join(tmpdir(), "argus-folders-"));
+    try {
+      mkdirSync(join(directory, "repositories"));
+      writeFileSync(join(directory, "file.txt"), "not a directory");
+      symlinkSync(join(directory, "repositories"), join(directory, "alias"));
+      const roots = detectRepositoryRoots([
+        join(directory, "repositories"), join(directory, "missing"), join(directory, "file.txt"), join(directory, "alias"),
+      ]);
+      expect(roots).toEqual([detectRepositoryRoots([join(directory, "repositories")])[0]!]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("lists selectable host folders with Git detection, filtering, and pagination", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "argus-folders-"));
+    try {
+      mkdirSync(join(directory, "smart-contract", ".git"), { recursive: true });
+      mkdirSync(join(directory, "smart-contract", "contracts"));
+      mkdirSync(join(directory, ".private"));
+      mkdirSync(join(directory, "node_modules"));
+      writeFileSync(join(directory, "secret.txt"), "file content must not be returned");
+      symlinkSync(tmpdir(), join(directory, "outside-link"));
+      for (let index = 0; index < 105; index += 1) mkdirSync(join(directory, `project-${String(index).padStart(3, "0")}`));
+      const roots = detectRepositoryRoots([directory]);
+      const first = await listRepositoryFolders(roots);
+      expect(first.path).toBe(roots[0]!);
+      expect(first.parent_path).toBeNull();
+      expect(first.folders).toHaveLength(100);
+      expect(first.next_offset).toBe(100);
+      const next = await listRepositoryFolders(roots, { offset: "100" });
+      expect(next.folders).toHaveLength(6);
+      expect(next.next_offset).toBeNull();
+      expect(next.folders.find((folder) => folder.name === "smart-contract")?.is_repository).toBe(true);
+      expect(first.folders.every((folder) => !folder.is_repository)).toBe(true);
+      const filtered = await listRepositoryFolders(roots, { search: "SMART" });
+      expect(filtered.folders.map((folder) => folder.name)).toEqual(["smart-contract"]);
+      const nested = await listRepositoryFolders(roots, { path: join(directory, "smart-contract") });
+      expect(nested.parent_path).toBe(first.path);
+      expect(nested.folders.map((folder) => folder.name)).toEqual(["contracts"]);
+      expect(JSON.stringify(first)).not.toContain("secret.txt");
+      expect(JSON.stringify(first)).not.toContain("outside-link");
+      expect(JSON.stringify(first)).not.toContain(".private");
+      expect(JSON.stringify(first)).not.toContain("node_modules");
+      await expect(listRepositoryFolders(roots, { path: join(directory, "outside-link") })).rejects.toMatchObject({ code: "repository_not_authorized" });
+      await expect(listRepositoryFolders(roots, { path: join(directory, "missing") })).rejects.toMatchObject({ code: "invalid_repository" });
+      await expect(listRepositoryFolders(roots, { path: join(directory, "secret.txt") })).rejects.toMatchObject({ code: "invalid_repository" });
+      await expect(listRepositoryFolders(roots, { offset: "-1" })).rejects.toMatchObject({ code: "bad_request" });
+      await expect(listRepositoryFolders(roots, { offset: "Infinity" })).rejects.toMatchObject({ code: "bad_request" });
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("scope and parsing", () => {
   test("glob matcher supports ** and directory paths", () => {

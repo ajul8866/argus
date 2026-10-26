@@ -1,5 +1,6 @@
 import { api } from "../api.ts";
 import { button, field, h, input, modal, select, toast } from "../ui.ts";
+import { chooseRepositoryFolder } from "./repository-folder-picker.ts";
 
 type ProjectRow = {
   id: string;
@@ -163,7 +164,15 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
 
 export async function openProjectCreate(): Promise<void> {
   const name = input("name", { placeholder: "Payments API", required: true });
-  const sourcePath = input("source_path", { placeholder: "/srv/authorized/repositories/payments", required: true });
+  const sourcePath = input("source_path", { placeholder: "Choose a folder on this host", required: true });
+  sourcePath.id = "project-source-path";
+  sourcePath.readOnly = true;
+  const browse = button("Browse folders", async () => {
+    const selected = await chooseRepositoryFolder(sourcePath.value || undefined);
+    if (!selected) return;
+    sourcePath.value = selected;
+    if (!name.value.trim()) name.value = selected.split(/[\\/]/).filter(Boolean).at(-1) ?? "My project";
+  }, "secondary");
   const description = input("description", { placeholder: "What this project does" });
   const include = input("scope_include", { value: "**/*" });
   const exclude = h("textarea", {
@@ -186,6 +195,12 @@ export async function openProjectCreate(): Promise<void> {
       onsubmit: async (event: Event) => {
         event.preventDefault();
         errorBox.classList.add("hidden");
+        if (!sourcePath.value) {
+          errorBox.textContent = "Choose a repository folder.";
+          errorBox.classList.remove("hidden");
+          browse.focus();
+          return;
+        }
         const submitButton = (event.currentTarget as HTMLFormElement).querySelector<HTMLButtonElement>('button[type="submit"]');
         if (submitButton) submitButton.disabled = true;
         try {
@@ -215,7 +230,10 @@ export async function openProjectCreate(): Promise<void> {
     errorBox,
     h("div", { class: "stack" },
       field("Project name", name),
-      field("Repository folder", sourcePath, "Full path to the repository on the machine running Argus"),
+      h("div", { class: "field" },
+        h("label", { class: "field-label", for: sourcePath.id }, "Repository folder"),
+        h("div", { class: "folder-address" }, sourcePath, browse),
+      ),
     ),
     h("p", { class: "modal-copy" }, "All source files are included by default. Dependencies and build outputs are excluded."),
     h("details", { class: "form-advanced" },

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuthService } from "../src/auth.ts";
@@ -157,4 +157,21 @@ test("optional project authorization metadata remains compatible and validated",
   expect(await empty.json()).toMatchObject({ project: { authorized_by: "", authorization_ref: "" } });
   expect((await create({ authorized_by: 123 })).status).toBe(400);
   expect((await create({ authorization_ref: "x".repeat(501) })).status).toBe(400);
+});
+
+test("folder discovery requires an auditor and only lists folders within configured locations", async () => {
+  const { api, headers, userId } = await projectClient();
+  mkdirSync(join(dir, "smart-contract", ".git"), { recursive: true });
+  const request = (suffix = "", requestHeaders = headers) => new Request(`http://localhost/api/repository-folders${suffix}`, { headers: requestHeaders });
+  expect((await api(request("", { ...headers, cookie: "" }))).status).toBe(401);
+  const listing = await api(request());
+  expect(listing.status).toBe(200);
+  const body = await listing.json();
+  expect(body.folders).toContainEqual({ name: "smart-contract", path: join(body.path, "smart-contract"), is_repository: true });
+  expect((await api(request(`?path=${encodeURIComponent(tmpdir())}`))).status).toBe(403);
+  expect((await api(request("?offset=abc"))).status).toBe(400);
+  store.run("UPDATE users SET role = 'auditor' WHERE id = ?", userId);
+  expect((await api(request())).status).toBe(200);
+  store.run("UPDATE users SET role = 'viewer' WHERE id = ?", userId);
+  expect((await api(request())).status).toBe(403);
 });

@@ -116,11 +116,13 @@ try {
 
   await page.click("#open-drawer");
   await page.waitForSelector(".drawer-overlay");
+  await page.waitForFunction(() => document.activeElement?.getAttribute("aria-label") === "Close");
   check(await activeLabel() === "Close", "drawer should focus its close control");
   check((await overlayCounts()).appInert, "app should be inert while the drawer is open");
 
   await page.click("#confirm-trigger");
   await page.waitForSelector(".modal-overlay");
+  await page.waitForFunction(() => document.activeElement?.textContent?.trim() === "Cancel");
   check((await overlayCounts()).modals === 1 && (await overlayCounts()).drawers === 1, "confirmation should stack over the drawer");
   check(await activeText() === "Cancel", "confirmation should focus Cancel first");
 
@@ -133,6 +135,7 @@ try {
 
   await page.click("#confirm-trigger");
   await page.waitForSelector(".modal-overlay");
+  await page.waitForFunction(() => document.activeElement?.textContent?.trim() === "Cancel");
   await page.locator(".modal-overlay").click({ position: { x: 5, y: 5 } });
   await page.waitForSelector(".modal-overlay", { state: "detached" });
   check(await lastConfirm() === false, "backdrop dismissal should resolve the confirmation as false");

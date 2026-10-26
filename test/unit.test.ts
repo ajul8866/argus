@@ -8,7 +8,9 @@ import { loadConfig, PHASE_NAMES } from "../src/config.ts";
 import { KeyedSerialQueue } from "../src/concurrency.ts";
 import { Store } from "../src/db/index.ts";
 import { buildFallbackPdf } from "../src/reports/pdf.ts";
+import { EventLog } from "../src/events.ts";
 import { EvidenceStore } from "../src/orchestrator/evidence.ts";
+import { ReportService } from "../src/reports/generator.ts";
 import { buildInventory, gitInfo } from "../src/repo/inventory.ts";
 import { importRepository } from "../src/repo/import.ts";
 import { createWorkspace, readScopedFile, verifyQuote } from "../src/repo/workspace.ts";
@@ -567,6 +569,88 @@ describe("evidence chain", () => {
     symlinkSync(target, row.content_path);
     await expect(evidence.content(row.id)).rejects.toMatchObject({ status: 409, code: "conflict" });
     expect((await evidence.verifyChain("a1")).ok).toBe(false);
+  });
+
+  test("evidence content rejects a symlink even when the target copies the sidecar", async () => {
+    const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "one", content: "alpha" });
+    const target = join(dir, "sidecar-copy.json");
+    await Bun.write(target, await Bun.file(row.content_path).arrayBuffer());
+    rmSync(row.content_path);
+    symlinkSync(target, row.content_path);
+    await expect(evidence.content(row.id)).rejects.toMatchObject({ status: 409, code: "conflict" });
+    expect((await evidence.verifyChain("a1")).ok).toBe(false);
+  });
+
+  test("evidence content accepts a JSON-escaped sidecar larger than the recorded text plus one megabyte", async () => {
+    const content = "\u0001".repeat(210_000);
+    const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "controls", content });
+    expect(Bun.file(row.content_path).size - row.size).toBeGreaterThan(1_000_000);
+    expect((await evidence.content(row.id))?.content).toBe(content);
+    expect((await evidence.verifyChain("a1")).ok).toBe(true);
+  });
+
+  test("evidence content rejects a sidecar larger than the recorded content can encode", async () => {
+    const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "one", content: "alpha" });
+    await Bun.write(row.content_path, "x".repeat(64 * 1024));
+    await expect(evidence.content(row.id)).rejects.toMatchObject({ status: 409, code: "conflict" });
+    const broken = await evidence.verifyChain("a1");
+    expect(broken).toMatchObject({
+      ok: false,
+      broken_at: row.id,
+      reason: "Evidence file is larger than the recorded content",
+    });
+  });
+
+  test("reports omit a code excerpt whose sidecar does not match the database record", async () => {
+    store.run(
+      `INSERT INTO findings (
+        id, code, audit_id, project_id, title, category, severity, status, files, root_cause,
+        preconditions, reproduction, expected, observed, impact, remediation, created_at, updated_at
+      ) VALUES (
+        'f-report', 'ARG-1', 'a1', 'p1', 'Tampered excerpt', 'injection', 'high', 'reverified', '[]',
+        'cause', '[]', '[]', 'expected', 'observed', 'impact', 'fix', '2026-01-01', '2026-01-01'
+      )`,
+    );
+    await evidence.append({
+      auditId: "a1",
+      findingId: "f-report",
+      kind: "code_excerpt",
+      title: "src/ok.js:1-1",
+      content: { path: "src/ok.js", start_line: 1, end_line: 1, quote: "intact quote stays" },
+    });
+    const tampered = await evidence.append({
+      auditId: "a1",
+      findingId: "f-report",
+      kind: "code_excerpt",
+      title: "src/bad.js:2-2",
+      content: { path: "src/bad.js", start_line: 2, end_line: 2, quote: "original quote" },
+    });
+    const parsed = await Bun.file(tampered.content_path).json() as { content?: string };
+    parsed.content = JSON.stringify(
+      { path: "src/bad.js", start_line: 2, end_line: 2, quote: "TAMPERED_QUOTE_SENTINEL" },
+      null,
+      2,
+    );
+    await Bun.write(tampered.content_path, `${JSON.stringify(parsed, null, 2)}\n`);
+    const generated = await new ReportService(testConfig(dir), store, evidence, new EventLog(store)).generate(
+      "a1",
+      ["markdown", "json"],
+      "test",
+    );
+    const jsonReport = generated.find((report) => report.format === "json");
+    expect(jsonReport).toBeTruthy();
+    const body = JSON.parse(await Bun.file(jsonReport!.path).text()) as {
+      evidence_chain: { ok: boolean };
+      findings: Array<{ verified_excerpts: Array<{ quote: string }> }>;
+    };
+    expect(body.evidence_chain.ok).toBe(false);
+    expect(body.findings[0]?.verified_excerpts.map((excerpt) => excerpt.quote)).toEqual(["intact quote stays"]);
+    for (const report of generated) {
+      const text = await Bun.file(report.path).text();
+      expect(text).toContain("intact quote stays");
+      expect(text).not.toContain("TAMPERED_QUOTE_SENTINEL");
+      expect(text).not.toContain("original quote");
+    }
   });
 
   test("evidence content preserves structured excerpts for later parsing", async () => {

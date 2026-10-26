@@ -5,7 +5,7 @@ import { APP_NAME, APP_VERSION, REPORT_DIR } from "../config.ts";
 import type { Store } from "../db/index.ts";
 import type { EventLog } from "../events.ts";
 import { getSetting } from "../settings.ts";
-import { now, parseJson, sha256, truncate, uid } from "../util.ts";
+import { AppError, now, parseJson, sha256, truncate, uid } from "../util.ts";
 import { redactObject, redactSecrets } from "../security/redact.ts";
 import type { EvidenceStore, EvidenceRow } from "../orchestrator/evidence.ts";
 import { buildFallbackPdf } from "./pdf.ts";
@@ -229,18 +229,15 @@ export class ReportService {
     for (const row of evidenceRows) {
       if (row.kind !== "code_excerpt" || !row.finding_id) continue;
       try {
-        const parsed = JSON.parse(await readFile(row.content_path, "utf8")) as {
-          content?: string | { path?: string; start_line?: number; end_line?: number; quote?: string };
+        const verified = await this.evidence.content(row.id);
+        if (!verified) continue;
+        const content = JSON.parse(verified.content) as {
+          path?: string;
+          start_line?: number;
+          end_line?: number;
+          quote?: string;
         };
-        let content = parsed.content;
-        if (typeof content === "string") {
-          try {
-            content = JSON.parse(content) as { path?: string; start_line?: number; end_line?: number; quote?: string };
-          } catch {
-            continue;
-          }
-        }
-        if (!content || typeof content !== "object" || !content.path || !content.quote) continue;
+        if (!content || typeof content !== "object" || Array.isArray(content) || !content.path || !content.quote) continue;
         const list = excerptsByFinding[row.finding_id] ?? [];
         list.push({
           path: content.path,
@@ -249,8 +246,9 @@ export class ReportService {
           quote: content.quote,
         });
         excerptsByFinding[row.finding_id] = list;
-      } catch {
-        // unreadable evidence is reported by the chain verifier
+      } catch (error) {
+        // Integrity failures stay out of the report. verifyChain records the break.
+        if (!(error instanceof AppError)) throw error;
       }
     }
     const verifications = this.store.all<{

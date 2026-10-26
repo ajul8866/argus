@@ -1,4 +1,5 @@
-import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdir, open, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Config } from "../config.ts";
 import { KeyedSerialQueue } from "../concurrency.ts";
@@ -172,14 +173,46 @@ export class EvidenceStore {
     return { ok: true, count: rows.length, broken_at: null, reason: null };
   }
 
+  private maxSidecarBytes(row: EvidenceRow): number {
+    // JSON.stringify writes one UTF-16 code unit as at most six bytes (\uXXXX).
+    // UTF-8 size is at least that code-unit count, so six times the recorded
+    // content size bounds the embedded string. Metadata values are known here
+    // and use the same bound. Keep the list aligned with the object written by
+    // appendInternal. The fixed allowance covers keys, nulls, and pretty-print.
+    const fields = [
+      row.id,
+      row.audit_id,
+      row.task_id ?? "",
+      row.agent_session_id ?? "",
+      row.finding_id ?? "",
+      row.kind,
+      row.title,
+      row.created_at,
+      row.sha256,
+      row.prev_hash,
+      row.chain_hash,
+    ];
+    const contentBytes = Number.isFinite(row.size) ? Math.max(0, row.size) : 0;
+    let bound = contentBytes * 6 + 2;
+    for (const field of fields) bound += field.length * 6 + 2;
+    return bound + 1024;
+  }
+
   private async readVerified(row: EvidenceRow): Promise<{ ok: true; text: string } | { ok: false; reason: string }> {
+    const limit = this.maxSidecarBytes(row);
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
-      const info = await lstat(row.content_path);
-      // Reject symlinks before reading so a replaced sidecar cannot redirect the hash check.
-      if (!info.isFile() || info.size > row.size + 1_000_000) {
-        return { ok: false, reason: "Evidence file is missing or unreadable" };
+      // O_NOFOLLOW binds the size check and the read to one inode. A symlink
+      // swapped in for the sidecar cannot redirect the hash check.
+      handle = await open(row.content_path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const info = await handle.stat();
+      if (!info.isFile()) return { ok: false, reason: "Evidence file is missing or unreadable" };
+      if (info.size > limit) return { ok: false, reason: "Evidence file is larger than the recorded content" };
+      const loaded = await handle.readFile({ encoding: "utf8" });
+      const raw = typeof loaded === "string" ? loaded : loaded.toString("utf8");
+      if (Buffer.byteLength(raw) > limit) {
+        return { ok: false, reason: "Evidence file is larger than the recorded content" };
       }
-      const raw = await readFile(row.content_path, "utf8");
       const parsed = JSON.parse(raw) as {
         id?: string;
         audit_id?: string;
@@ -222,6 +255,8 @@ export class EvidenceStore {
       return { ok: true, text };
     } catch {
       return { ok: false, reason: "Evidence file is missing or unreadable" };
+    } finally {
+      await handle?.close().catch(() => undefined);
     }
   }
 

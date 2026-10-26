@@ -165,9 +165,50 @@ export class EvidenceStore {
       }
       try {
         const raw = await readFile(row.content_path, "utf8");
-        const parsed = JSON.parse(raw) as { content?: unknown; sha256?: string; chain_hash?: string };
+        const parsed = JSON.parse(raw) as {
+          id?: string;
+          audit_id?: string;
+          task_id?: string | null;
+          agent_session_id?: string | null;
+          finding_id?: string | null;
+          kind?: string;
+          title?: string;
+          created_at?: string;
+          sha256?: string;
+          prev_hash?: string;
+          chain_hash?: string;
+          content?: unknown;
+        };
+        const metadataMatches =
+          parsed.id === row.id &&
+          parsed.audit_id === row.audit_id &&
+          parsed.task_id === row.task_id &&
+          parsed.agent_session_id === row.agent_session_id &&
+          parsed.finding_id === row.finding_id &&
+          parsed.kind === row.kind &&
+          parsed.title === row.title &&
+          parsed.created_at === row.created_at &&
+          parsed.sha256 === row.sha256 &&
+          parsed.prev_hash === row.prev_hash &&
+          parsed.chain_hash === row.chain_hash;
+        if (!metadataMatches) {
+          return {
+            ok: false,
+            count: rows.length,
+            broken_at: row.id,
+            reason: "Evidence file metadata does not match the database record",
+          };
+        }
         const text =
           typeof parsed.content === "string" ? parsed.content : `${JSON.stringify(parsed.content, null, 2)}\n`;
+        if (Buffer.byteLength(text) !== row.size) {
+          return {
+            ok: false,
+            count: rows.length,
+            broken_at: row.id,
+            reason: "Evidence content size does not match the database record",
+          };
+        }
         const recomputed = sha256(text);
         if (recomputed !== row.sha256) {
           return {

@@ -11,7 +11,13 @@ type ResourceRow = {
   sources: string; metadata: string; present: number; enabled: number; roles: string; mcp_ids: string;
 };
 const emptyStats = (): ResourceStats => ({ total_calls: 0, tasks_covered: 0, last_call: null });
-const privateFile = (path: string): boolean => path.split(/[\\/]/).some((part) => /^\.env(?:\.|$)/i.test(part) || /^(auth|credentials)\.json$/i.test(part) || /\.(pem|key|p12|pfx)$/i.test(part));
+const privateFile = (path: string): boolean => path.split(/[\\/]/).some((part) =>
+  /^\.env(?:\.|$)/i.test(part) ||
+  /^(?:\.npmrc|\.netrc|\.pypirc|\.git-credentials)$/i.test(part) ||
+  /^(?:auth|credentials|secrets)(?:\.(?:json|ya?ml|toml|ini|conf))?$/i.test(part) ||
+  /^id_(?:rsa|dsa|ecdsa|ed25519)$/i.test(part) ||
+  /\.(?:pem|key|p12|pfx)$/i.test(part)
+);
 
 export class LocalCatalog {
   private readonly options: DiscoveryOptions;

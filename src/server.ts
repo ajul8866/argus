@@ -68,7 +68,13 @@ async function serveStatic(request: Request, pathname: string): Promise<Response
     return new Response("Method not allowed", { status: 405 });
   }
   const dist = resolve(config.webDist);
-  const relative = pathname === "/" ? "index.html" : decodeURIComponent(pathname.replace(/^\/+/, ""));
+  let relative: string;
+  try {
+    relative = pathname === "/" ? "index.html" : decodeURIComponent(pathname.replace(/^\/+/, ""));
+  } catch {
+    return new Response("Bad request", { status: 400 });
+  }
+  if (relative.includes("\0")) return new Response("Bad request", { status: 400 });
   const candidate = resolve(join(dist, normalize(relative)));
   if (!candidate.startsWith(`${dist}/`) && candidate !== dist) {
     return new Response("Not found", { status: 404 });
@@ -107,10 +113,10 @@ const server = Bun.serve({
   port: config.port,
   hostname: config.hostname,
   idleTimeout: 120,
-  async fetch(request) {
+  async fetch(request, server) {
     const url = new URL(request.url);
     if (url.pathname.startsWith("/api/")) {
-      return securityHeaders(await api(request));
+      return securityHeaders(await api(request, server.requestIP(request)?.address));
     }
     return securityHeaders(await serveStatic(request, url.pathname));
   },

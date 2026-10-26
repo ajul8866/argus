@@ -104,10 +104,16 @@ test("skill file preview rejects traversal and symlinks that escape the skill di
   await writeFile(join(dir, "secret.txt"), "outside secret");
   await symlink(join(dir, "secret.txt"), join(root, "leak.txt"));
   await writeFile(join(root, ".env.local"), "PRIVATE_CREDENTIAL=hidden");
+  await writeFile(join(root, ".npmrc"), "//registry.example/:_authToken=hidden");
+  await writeFile(join(root, "credentials.yaml"), "token: hidden\n");
+  await writeFile(join(root, "id_ed25519"), "private key material");
   const id = (await catalog.refresh()).skills[0]!.id;
   await expect(catalog.readSkillFile(id, "../../secret.txt")).rejects.toThrow();
   await expect(catalog.readSkillFile(id, "leak.txt")).rejects.toThrow();
   await expect(catalog.readSkillFile(id, ".env.local")).rejects.toThrow();
+  await expect(catalog.readSkillFile(id, ".npmrc")).rejects.toThrow();
+  await expect(catalog.readSkillFile(id, "credentials.yaml")).rejects.toThrow();
+  await expect(catalog.readSkillFile(id, "id_ed25519")).rejects.toThrow();
   expect((await catalog.readSkillFile(id, "references/checks.md")).content).toContain("source-to-sink");
 });
 

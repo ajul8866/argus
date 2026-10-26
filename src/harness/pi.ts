@@ -176,6 +176,12 @@ export class PiHarnessAdapter implements HarnessAdapter {
     if (!executable) {
       return this.failure(startedAt, "harness_missing", "Pi executable not found", usage, events, null);
     }
+    if (hooks.signal?.aborted) {
+      return this.result(
+        "cancelled", "", undefined, null, task, usage, events, startedAt, now(),
+        null, "Run was cancelled before launch", "cancelled", this.config.sandboxMode,
+      );
+    }
     if (!this.harnessConfig.provider || !this.harnessConfig.model) {
       return this.failure(
         startedAt,
@@ -258,6 +264,7 @@ export class PiHarnessAdapter implements HarnessAdapter {
     });
 
     let settled = false;
+    let agentSettled = false;
     let timedOut = false;
     let cancelled = false;
     let rpcError: string | null = null;
@@ -280,9 +287,10 @@ export class PiHarnessAdapter implements HarnessAdapter {
       await stdin.flush();
     };
 
-    const cancelRun = () => {
-      if (cancelled) return;
-      cancelled = true;
+    const cancelRun = (reason: "cancelled" | "timeout" = "cancelled") => {
+      if (cancelled || timedOut) return;
+      if (reason === "timeout") timedOut = true;
+      else cancelled = true;
       void send({ type: "abort" }).catch(() => undefined);
       setTimeout(() => {
         void active.terminate("SIGTERM", 1_500);
@@ -293,11 +301,9 @@ export class PiHarnessAdapter implements HarnessAdapter {
 
     const onAbort = () => cancelRun();
     hooks.signal?.addEventListener("abort", onAbort, { once: true });
+    if (hooks.signal?.aborted) onAbort();
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      cancelRun();
-    }, task.timeoutMs);
+    const timer = setTimeout(() => cancelRun("timeout"), task.timeoutMs);
 
     const stderrChunks: string[] = [];
     const stderrPromise = (async () => {
@@ -355,17 +361,18 @@ export class PiHarnessAdapter implements HarnessAdapter {
       if (type === "message_end") {
         const message = record.message as PiMessage | undefined;
         if (message?.role !== "assistant") return;
+        usage.turns = (usage.turns ?? 0) + 1;
         const text = (message.content ?? [])
           .filter((block) => block.type === "text")
           .map((block) => block.text ?? "")
           .join("");
         if (text) finalText = text;
         if (message.usage) {
-          usage.input_tokens = message.usage.input ?? usage.input_tokens;
-          usage.output_tokens = message.usage.output ?? usage.output_tokens;
-          usage.total_tokens = message.usage.totalTokens ?? usage.total_tokens;
-          usage.cache_read_tokens = message.usage.cacheRead ?? usage.cache_read_tokens;
-          usage.cost_usd = message.usage.cost?.total ?? usage.cost_usd;
+          usage.input_tokens += message.usage.input ?? 0;
+          usage.output_tokens += message.usage.output ?? 0;
+          usage.total_tokens += message.usage.totalTokens ?? 0;
+          usage.cache_read_tokens += message.usage.cacheRead ?? 0;
+          usage.cost_usd += message.usage.cost?.total ?? 0;
           emit({ type: "usage", usage: { ...usage } });
         }
         if (message.stopReason === "error" && message.errorMessage) {
@@ -400,7 +407,8 @@ export class PiHarnessAdapter implements HarnessAdapter {
         return;
       }
       if (type === "agent_settled") {
-        if (record.aborted === true) cancelled = true;
+        agentSettled = true;
+        if (record.aborted === true && !timedOut) cancelled = true;
         finish();
         return;
       }
@@ -480,7 +488,7 @@ export class PiHarnessAdapter implements HarnessAdapter {
       const error = rpcError ?? `Pi exited without a final assistant message${stderr ? `: ${truncate(stderr, 1_500)}` : ""}`;
       return this.result("failed", finalText, undefined, sessionRef, task, usage, events, startedAt, endedAt, exitCode, error, "agent_error", plan.mode);
     }
-    if (!settled && exitCode !== 0) {
+    if (!agentSettled || exitCode !== 0) {
       return this.result(
         "failed",
         finalText,
@@ -492,7 +500,7 @@ export class PiHarnessAdapter implements HarnessAdapter {
         startedAt,
         endedAt,
         exitCode,
-        `Pi exited with code ${exitCode}${stderr ? `: ${truncate(stderr, 1_500)}` : ""}`,
+        `${!agentSettled ? "Pi exited without an agent_settled record" : `Pi exited with code ${exitCode}`}${stderr ? `: ${truncate(stderr, 1_500)}` : ""}`,
         "harness_error",
         plan.mode,
       );

@@ -53,14 +53,20 @@ export async function runCommand(
 export async function readJsonLines(
   stream: ReadableStream<Uint8Array>,
   onLine: (line: string) => void,
+  limits: { maxBytes?: number; maxLineCharacters?: number } = {},
 ): Promise<void> {
+  const maxBytes = limits.maxBytes ?? 16_000_000;
+  const maxLineCharacters = limits.maxLineCharacters ?? 2_000_000;
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let received = 0;
   try {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
+      received += value.byteLength;
+      if (received > maxBytes) throw new Error(`Harness output exceeded ${maxBytes} bytes`);
       buffer += decoder.decode(value, { stream: true });
       while (true) {
         const newline = buffer.indexOf("\n");
@@ -68,10 +74,19 @@ export async function readJsonLines(
         let line = buffer.slice(0, newline);
         buffer = buffer.slice(newline + 1);
         if (line.endsWith("\r")) line = line.slice(0, -1);
+        if (line.length > maxLineCharacters) {
+          throw new Error(`Harness JSON record exceeded ${maxLineCharacters} characters`);
+        }
         if (line.trim().length > 0) onLine(line);
+      }
+      if (buffer.length > maxLineCharacters) {
+        throw new Error(`Harness JSON record exceeded ${maxLineCharacters} characters`);
       }
     }
     buffer += decoder.decode();
+    if (buffer.length > maxLineCharacters) {
+      throw new Error(`Harness JSON record exceeded ${maxLineCharacters} characters`);
+    }
     if (buffer.trim().length > 0) onLine(buffer);
   } finally {
     reader.releaseLock();

@@ -27,6 +27,9 @@ LLM agents. Use it only on repositories you are authorized to assess.
   cap are skipped and recorded.
 - An immutable snapshot is created at import, so later edits to the original
   worktree cannot change what the evidence refers to.
+- Git-ref imports resolve the ref once, archive that immutable commit, and copy
+  only in-scope regular files into a read-only snapshot. Excluded files,
+  oversized files, and symlinks are not retained in the snapshot.
 
 ## Execution isolation
 
@@ -171,6 +174,8 @@ absence of vulnerabilities. Human review is required.
 - HttpOnly, SameSite=Lax cookies; `Secure` when `ARGUS_SECURE_COOKIES=1`.
 - CSRF token required on all mutations.
 - Login rate limit and audit logging.
+- The login throttle uses the socket peer address instead of caller-provided
+  forwarding headers.
 - Roles are enforced server-side on every route; UI hiding is not a control.
 - The last active administrator cannot be disabled or demoted by the API.
 

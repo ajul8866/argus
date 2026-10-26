@@ -36,7 +36,7 @@ export class ReportService {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     for (const format of [...new Set(formats)]) {
       const id = uid();
-      const filename = join(directory, `${stamp}-${data.findingCodePrefix}-${format}.${extension(format)}`);
+      const filename = join(directory, `${stamp}-${id}-${data.findingCodePrefix}-${format}.${extension(format)}`);
       let body: Uint8Array;
       try {
         body = await this.render(data, format);
@@ -57,7 +57,7 @@ export class ReportService {
         });
         continue;
       }
-      await writeFile(filename, body, { mode: 0o600 });
+      await writeFile(filename, body, { mode: 0o600, flag: "wx" });
       const digest = sha256(body);
       const size = (await stat(filename)).size;
       this.store.run(

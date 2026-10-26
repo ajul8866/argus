@@ -196,6 +196,12 @@ export class ClaudeCodeHarnessAdapter implements HarnessAdapter {
     if (!executable) {
       return this.failure(startedAt, "harness_missing", "Claude Code executable not found", usage, events, null);
     }
+    if (hooks.signal?.aborted) {
+      return this.result(
+        "cancelled", "", undefined, null, task, usage, events, startedAt, now(),
+        null, "Run was cancelled before launch", "cancelled", this.config.sandboxMode,
+      );
+    }
 
     const sessionId = task.resumeSessionRef ?? randomUUID();
     const args = [
@@ -296,20 +302,19 @@ export class ClaudeCodeHarnessAdapter implements HarnessAdapter {
       settleResolve?.();
     };
 
-    const cancelRun = () => {
-      if (cancelled) return;
-      cancelled = true;
+    const cancelRun = (reason: "cancelled" | "timeout" = "cancelled") => {
+      if (cancelled || timedOut) return;
+      if (reason === "timeout") timedOut = true;
+      else cancelled = true;
       void active.terminate("SIGTERM", 1_500);
       setTimeout(() => finish(), 1_800);
     };
     this.activeRuns.set(task.runId, { cancel: cancelRun, active });
     const onAbort = () => cancelRun();
     hooks.signal?.addEventListener("abort", onAbort, { once: true });
+    if (hooks.signal?.aborted) onAbort();
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      cancelRun();
-    }, task.timeoutMs);
+    const timer = setTimeout(() => cancelRun("timeout"), task.timeoutMs);
 
     const stderrChunks: string[] = [];
     const stderrPromise = (async () => {

@@ -5,6 +5,7 @@ import { credentialEnvironment, type StoredCredential } from "../security/creden
 import { ClaudeCodeHarnessAdapter } from "./claude.ts";
 import { PiHarnessAdapter } from "./pi.ts";
 import { harnessConfig, storedCredentials } from "../settings.ts";
+import { redactSecrets } from "../security/redact.ts";
 import type {
   HarnessAdapter,
   HarnessConfig,
@@ -60,15 +61,16 @@ export class HarnessManager {
     const detections: HarnessDetection[] = [];
     for (const result of results) {
       if (result.status === "fulfilled") {
-        detections.push(result.value);
-        this.persist(result.value);
+        const detection = this.redactDetection(result.value);
+        detections.push(detection);
+        this.persist(detection);
       }
     }
     return detections;
   }
 
   async health(kind: HarnessKind, force = true): Promise<HarnessDetection> {
-    const detection = await this.adapter(kind).health(force);
+    const detection = this.redactDetection(await this.adapter(kind).health(force));
     this.persist(detection);
     return detection;
   }
@@ -187,6 +189,17 @@ export class HarnessManager {
     }
   }
 
+  private redactDetection(detection: HarnessDetection): HarnessDetection {
+    return {
+      ...detection,
+      detail: redactSecrets(detection.detail).text,
+      auth: {
+        ...detection.auth,
+        detail: redactSecrets(detection.auth.detail).text,
+      },
+    };
+  }
+
   harnessRow(kind: HarnessKind): Record<string, unknown> | null {
     return this.store.get("SELECT * FROM harnesses WHERE kind = ?", kind);
   }
@@ -195,14 +208,15 @@ export class HarnessManager {
     const kinds: HarnessKind[] = ["pi", "claude-code"];
     return kinds.map((kind) => {
       const row = this.harnessRow(kind);
+      const detail = redactSecrets(String(row?.detail ?? "Not checked yet")).text;
       return {
         kind,
         label: kind === "pi" ? "Pi Coding Agent" : "Claude Code",
         executable: String(row?.executable ?? ""),
         version: row?.version ? String(row.version) : null,
         status: (row?.status as HarnessDetection["status"]) ?? "unknown",
-        detail: String(row?.detail ?? "Not checked yet"),
-        auth: { ready: row?.status === "ready", detail: String(row?.detail ?? "") },
+        detail,
+        auth: { ready: row?.status === "ready", detail },
         capabilities:
           (row?.capabilities ? parseJson<HarnessDetection["capabilities"]>(String(row.capabilities), {} as never) : ({} as never)),
         models: [],

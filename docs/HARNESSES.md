@@ -85,11 +85,15 @@ are written to that HOME's `.pi/agent/mcp.json`; `--no-mcp` is replaced by
 - Commands carry an `id`; responses are correlated by `id`, not order.
 - The adapter sends `get_state` and then `prompt`.
 - `data.disposition === "handled"` means no run started and is a failure.
-- Completion is `agent_settled`; `agent_end` is logged but not treated as final.
-- `aborted: true` at `agent_settled` marks cancellation.
+- Completion requires both `agent_settled` and a clean process exit;
+  `agent_end` and stdout EOF are not completion signals.
+- `aborted: true` at `agent_settled` marks cancellation unless the adapter first
+  stopped the process for its execution deadline.
 - Text deltas are streamed; the last authoritative assistant message supplies
-  final text.
-- On timeout/abort it sends `abort`, waits 1.2s, then terminates and reaps.
+  final text. Usage from every assistant message is accumulated for cost and
+  token accounting.
+- On timeout/abort it sends `abort`, waits 1.2s, then terminates and reaps. A
+  timeout remains a timeout even when the process reports an aborted settle.
 - Stderr is collected for diagnostics and never parsed as protocol.
 - The final text is parsed as JSON (raw, fenced, or embedded) and then validated
   against the phase schema. Invalid output is a retryable `invalid_output`

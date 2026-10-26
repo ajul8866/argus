@@ -2,8 +2,14 @@
 
 ## Unreleased
 
+## [0.0.2](https://github.com/ajul8866/argus/releases/tag/v0.0.2) — 2026-10-26
+
 ### Changed
 
+- The native installer resolves the newest `vX.Y.Z` release tag instead of a
+  hardcoded version, so rerunning the documented command installs the current
+  release. `ARGUS_VERSION` pins a specific tag, and README/installation docs
+  load the installer from `main`.
 - The dashboard now uses the Console system: a graphite ground in three
   lightness steps, hairline panels, Host Grotesk for reading and Atkinson
   Hyperlegible Mono for measured values. Amber marks a person or a decision
@@ -16,6 +22,11 @@
 
 ### Fixed
 
+- An interrupted fresh install no longer blocks a retry: a missing `VERSION`
+  is recovered from `app/package.json`, and an interrupted update restores
+  `app.previous` on the next run. The generated launcher sets `umask 077`.
+- A failed update keeps the installed release, `data/`, and `app/.env`; the
+  new app is built in staging before the swap, and downgrades are refused.
 - Writable-workspace policy denials fail closed on the first check. A disabled
   `security.allow_writable_workspace` setting is recorded as
   `writable_workspace_disabled`, and a missing `allow_writable_workspace`
@@ -23,6 +34,9 @@
 
 ### Added
 
+- In-place installer updates: the installed release tag and commit are tracked
+  in `VERSION` and `REVISION`, and rerunning the installer replaces `app/`
+  while preserving `data/` and `app/.env`.
 - Opt-in writable audit workspaces for authorized penetration testing. The
   default stays read-only; enabling requires `security.allow_writable_workspace`
   with `confirm_writable_workspace`, a per-audit `writable_workspace` request,

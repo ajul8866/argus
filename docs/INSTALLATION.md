@@ -1,8 +1,11 @@
 # Installation
 
 The native installer supports Linux and macOS. On Windows, use WSL2.
-You need Bash, Git, curl, and network access to GitHub and the package registry.
-Bun 1.3.14 or later is reused when available. Otherwise, the installer uses
+You need Bash, Git, curl, and network access to GitHub and the package
+registry. The installer resolves and installs the newest `vX.Y.Z` release by
+default; set `ARGUS_VERSION` to pin a specific tag. Rerunning it updates an
+existing installation in place and preserves its data. Bun 1.3.14 or later is
+reused when available. Otherwise, the installer uses
 [Bun's official installer](https://bun.com/docs/installation) to install
 version 1.3.14 in Argus's private runtime directory; this requires `unzip`.
 It does not request `sudo` or modify your shell startup files.
@@ -10,13 +13,13 @@ It does not request `sudo` or modify your shell startup files.
 ## Install and run
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ajul8866/argus/v0.0.1/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ajul8866/argus/main/install.sh | bash
 ```
 
 To download and inspect the installer before running it:
 
 ```bash
-curl -fsSLo install-argus.sh https://raw.githubusercontent.com/ajul8866/argus/v0.0.1/install.sh
+curl -fsSLo install-argus.sh https://raw.githubusercontent.com/ajul8866/argus/main/install.sh
 less install-argus.sh
 bash install-argus.sh
 ```
@@ -25,10 +28,11 @@ The default directory is `${XDG_DATA_HOME:-$HOME/.local/share}/argus`:
 
 ```text
 argus/
-├── app/              # Tagged source, dependencies, and built dashboard
+├── app/              # Release source, dependencies, and built dashboard
 ├── data/             # SQLite database, evidence, reports, and keys
 ├── runtime/          # Bun, when installed by the installer
-├── VERSION
+├── VERSION           # Installed release tag
+├── REVISION          # Installed commit
 └── start.sh          # Restart command
 ```
 
@@ -53,7 +57,7 @@ Environment variables before `curl` in a pipeline apply only to `curl`.
 When using the pipeline, set options on the `bash` side:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ajul8866/argus/v0.0.1/install.sh | ARGUS_PORT=8899 bash
+curl -fsSL https://raw.githubusercontent.com/ajul8866/argus/main/install.sh | ARGUS_PORT=8899 bash
 ```
 
 To install without starting:
@@ -71,7 +75,8 @@ ARGUS_PORT=8899 bash ~/.local/share/argus/start.sh
 For persistent configuration, copy `.env.example` to `.env` inside `app/`
 and edit it before starting. The generated launcher supplies the external
 data directory; set `ARGUS_DATA_DIR` on the launch command if you need to
-override it. Exported variables take precedence over `.env`.
+override it. Exported variables take precedence over `.env`. The installer
+keeps `app/.env` when it updates the application.
 
 | Variable | Default for the standard startup command |
 | --- | --- |
@@ -108,9 +113,15 @@ or MCP files from a visitor's browser or a different machine automatically.
   and rerun the installer.
 - **Install directory is not empty:** choose a dedicated `ARGUS_INSTALL_DIR`.
   The installer refuses to replace an unrelated directory.
-- **Interrupted installation:** rerun the same command. If `.install-lock`
-  remains after a forced termination, confirm the previous installer has
-  stopped before removing that lock directory.
+- **Interrupted installation:** rerun the same command. A failed update leaves
+  the installed release and data untouched; an interrupted update restores
+  `app.previous` on the next run. If `.install-lock` remains after a forced
+  termination, confirm the previous installer has stopped before removing it.
+- **Downgrade refused:** the installer will not replace a newer release with
+  an older one. Back up `data/` and use a separate `ARGUS_INSTALL_DIR` for an
+  older release; database migrations are forward-only.
+- **Update failed:** fix the reported error and rerun. The previous app stays
+  in place until the new build succeeds; `data/` and `app/.env` are kept.
 - **Dashboard assets missing:** inside `app/`, run
   `bun install --frozen-lockfile --ignore-scripts` and `bun run build`.
 - **Harness missing or authentication failure:** check the Harnesses screen
@@ -122,16 +133,22 @@ or MCP files from a visitor's browser or a different machine automatically.
 
 ## Updates, backup, and removal
 
-Rerunning the installer for the same version reuses the checkout and preserves
-data. This initial installer does not replace an existing different version.
-For a later release, use a separate install directory and follow that release's
-migration notes.
+Rerunning the installer resolves the newest release tag. When it differs from
+the installed `VERSION`, the installer builds the new app in a staging
+directory, swaps it in, and keeps `data/` and `app/.env`. The same release is
+reused without rebuilding. Downgrades are refused. Set
+`ARGUS_VERSION=vX.Y.Z` to install a specific release.
+
+`VERSION` records the installed release tag and `REVISION` its commit. A
+missing `VERSION` is recovered from `app/package.json`, and an interrupted
+update restores `app.previous` before the next attempt.
 
 Before changing versions, stop Argus and back up the entire data directory,
 including the database, evidence, reports, and `master.key`. If using
-`ARGUS_MASTER_KEY`, preserve that value separately. Keep the previous app and
-data backup until the new instance passes its health check; migrations are
-forward-only, so rollback may require restoring that backup.
+`ARGUS_MASTER_KEY`, preserve that value separately. Keep the data backup until
+the new instance passes its health check; migrations are forward-only, so
+rollback may require restoring that backup. The previous app is not retained
+after a successful update.
 
 To remove Argus, stop it and delete its dedicated install directory only after
 saving any data you need. Bun installed under `runtime/` is private to Argus;

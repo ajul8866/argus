@@ -1,6 +1,6 @@
 # Repository Guidelines
 
-Argus (`argus-audit`, v0.0.1) is a self-hosted source-code security audit workspace. It imports an authorized repository snapshot, maps it, discovers candidate vulnerabilities, confirms them in independent harness sessions, persists evidence-backed findings, re-verifies them, and exports deterministic reports. Bun + strict TypeScript + SQLite + a vanilla TypeScript SPA. AGPL-3.0-only.
+Argus (`argus-audit`, v0.0.2) is a self-hosted source-code security audit workspace. It imports an authorized repository snapshot, maps it, discovers candidate vulnerabilities, confirms them in independent harness sessions, persists evidence-backed findings, re-verifies them, and exports deterministic reports. Bun + strict TypeScript + SQLite + a vanilla TypeScript SPA. AGPL-3.0-only.
 
 Deeper references: `docs/ARCHITECTURE.md`, `docs/API.md`, `docs/DATABASE.md`, `docs/HARNESSES.md`, `docs/SECURITY.md`, `docs/DECISIONS.md`.
 

@@ -1,6 +1,6 @@
 {
   "name": "argus-audit",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "private": true,
   "description": "Self-hosted source code security audits with Pi, Claude Code, local Skills, and MCP.",
   "license": "AGPL-3.0-only",

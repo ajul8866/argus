@@ -1,8 +1,8 @@
 # Security policy
 
-Argus v0.0.1 is an initial public release. Security fixes are maintained on
-`main` and published as new releases. Upgrade to the latest patched version
-when one is available.
+Argus v0.0.2 is the current release. Security fixes are maintained on `main`
+and published as new releases. The installer resolves the newest release tag
+by default; upgrade to the latest patched version when one is available.
 
 ## Report a vulnerability
 

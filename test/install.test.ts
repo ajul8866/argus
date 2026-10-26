@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,6 +7,9 @@ const root = join(import.meta.dir, "..");
 const installer = join(root, "install.sh");
 const temporary: string[] = [];
 let fixture: string;
+let mismatchFixture: string;
+let revisionOne: string;
+let revisionTwo: string;
 
 function temporaryDirectory(): string {
   const directory = mkdtempSync(join(tmpdir(), "argus-install-test-"));
@@ -25,48 +28,86 @@ function run(command: string[], cwd: string, env: Record<string, string | undefi
   return { code: result.exitCode, output: result.stdout.toString() + result.stderr.toString() };
 }
 
+function git(command: string[], cwd: string): string {
+  const result = run(["git", ...command], cwd);
+  if (result.code !== 0) throw new Error(`Fixture git failed: ${result.output}`);
+  return result.output.trim();
+}
+
+function gitConfig(repository: string): Record<string, string> {
+  return {
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: `url.file://${repository}.insteadOf`,
+    GIT_CONFIG_VALUE_0: "https://github.com/ajul8866/argus.git",
+  };
+}
+
 function install(directory: string, args: string[] = ["--no-start"], env: Record<string, string | undefined> = {}) {
   return run(["bash", installer, ...args], root, {
     ARGUS_INSTALL_DIR: directory,
     ARGUS_VERSION: "v0.0.1",
-    GIT_CONFIG_NOSYSTEM: "1",
-    GIT_CONFIG_GLOBAL: "/dev/null",
-    GIT_CONFIG_COUNT: "1",
-    GIT_CONFIG_KEY_0: `url.file://${fixture}.insteadOf`,
-    GIT_CONFIG_VALUE_0: "https://github.com/ajul8866/argus.git",
+    ...gitConfig(fixture),
     ...env,
   });
 }
 
-beforeAll(() => {
-  fixture = mkdtempSync(join(tmpdir(), "argus-install-fixture-"));
-  writeFileSync(join(fixture, "package.json"), JSON.stringify({
+function writeFixtureSources(directory: string, version: string) {
+  writeFileSync(join(directory, ".gitignore"), "node_modules/\nweb/dist/\n");
+  writeFileSync(join(directory, "package.json"), JSON.stringify({
     name: "argus-installer-fixture",
-    version: "0.0.1",
+    version,
     type: "module",
     scripts: { build: "bun run build.ts" },
   }));
-  writeFileSync(join(fixture, "build.ts"), 'await Bun.write("web/dist/index.html", "<!doctype html><title>Installer fixture</title>");');
-  writeFileSync(join(fixture, "start.sh"), '#!/usr/bin/env bash\nset -euo pipefail\ncd -- "$(dirname -- "${BASH_SOURCE[0]}")"\nexec bun run smoke.ts\n');
-  writeFileSync(join(fixture, "smoke.ts"), 'await Bun.write(`${process.env.ARGUS_DATA_DIR}/launched.json`, JSON.stringify({ data: process.env.ARGUS_DATA_DIR, port: process.env.ARGUS_PORT }));');
-  const commands = [
-    [process.execPath, "install", "--ignore-scripts"],
-    ["git", "init", "-b", "main"],
-    ["git", "add", "."],
-    ["git", "-c", "user.name=Argus tests", "-c", "user.email=tests@example.invalid", "commit", "-m", "Installer fixture"],
-    ["git", "tag", "v0.0.1"],
-    ["git", "tag", "v0.0.2"],
-  ];
-  for (const command of commands) {
-    const result = run(command, fixture);
-    if (result.code !== 0) throw new Error(`Fixture setup failed: ${result.output}`);
-  }
+  writeFileSync(join(directory, "build.ts"), [
+    'const pkg = await Bun.file("package.json").json();',
+    'if (process.env.FIXTURE_FAIL_BUILD === "1") {',
+    '  console.error("fixture build failure");',
+    "  process.exit(1);",
+    "}",
+    'await Bun.write("web/dist/index.html", `<!doctype html><title>Installer fixture ${pkg.version}</title>`);',
+  ].join("\n"));
+  writeFileSync(join(directory, "start.sh"), '#!/usr/bin/env bash\nset -euo pipefail\ncd -- "$(dirname -- "${BASH_SOURCE[0]}")"\nexec bun run smoke.ts\n');
+  writeFileSync(join(directory, "smoke.ts"), 'await Bun.write(`${process.env.ARGUS_DATA_DIR}/launched.json`, JSON.stringify({ data: process.env.ARGUS_DATA_DIR, port: process.env.ARGUS_PORT }));');
+}
+
+beforeAll(() => {
+  fixture = mkdtempSync(join(tmpdir(), "argus-install-fixture-"));
+  writeFixtureSources(fixture, "0.0.1");
+  const installed = run([process.execPath, "install", "--ignore-scripts"], fixture);
+  if (installed.code !== 0) throw new Error(`Fixture setup failed: ${installed.output}`);
+  git(["init", "-b", "main"], fixture);
+  git(["add", "."], fixture);
+  git(["-c", "user.name=Argus tests", "-c", "user.email=tests@example.invalid", "commit", "-m", "Installer fixture 0.0.1"], fixture);
+  git(["tag", "v0.0.1"], fixture);
+  revisionOne = git(["rev-parse", "v0.0.1^{commit}"], fixture);
+  writeFixtureSources(fixture, "0.0.2");
+  git(["add", "."], fixture);
+  git(["-c", "user.name=Argus tests", "-c", "user.email=tests@example.invalid", "commit", "-m", "Installer fixture 0.0.2"], fixture);
+  git(["tag", "-a", "v0.0.2", "-m", "Installer fixture 0.0.2"], fixture);
+  revisionTwo = git(["rev-parse", "v0.0.2^{commit}"], fixture);
+
+  mismatchFixture = mkdtempSync(join(tmpdir(), "argus-install-mismatch-"));
+  writeFileSync(join(mismatchFixture, "package.json"), JSON.stringify({
+    name: "argus-installer-mismatch",
+    version: "0.0.1",
+    type: "module",
+  }));
+  git(["init", "-b", "main"], mismatchFixture);
+  git(["add", "."], mismatchFixture);
+  git(["-c", "user.name=Argus tests", "-c", "user.email=tests@example.invalid", "commit", "-m", "Mismatched tag"], mismatchFixture);
+  git(["tag", "v0.0.2"], mismatchFixture);
 });
 
 afterEach(() => {
   for (const directory of temporary.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
-afterAll(() => rmSync(fixture, { recursive: true, force: true }));
+afterAll(() => {
+  rmSync(fixture, { recursive: true, force: true });
+  rmSync(mismatchFixture, { recursive: true, force: true });
+});
 
 describe("release installer", () => {
   test("help and invalid inputs do not create an installation", () => {
@@ -88,12 +129,22 @@ describe("release installer", () => {
     expect(existsSync(join(directory, ".argus-install"))).toBe(false);
   });
 
-  test("installs a pinned local Git release in a path with spaces and starts on rerun while preserving data", () => {
+  test("installs the newest release when no version is pinned", () => {
+    const directory = join(temporaryDirectory(), "latest");
+    const result = install(directory, ["--no-start"], { ARGUS_VERSION: undefined });
+    expect(result.code, result.output).toBe(0);
+    expect(readFileSync(join(directory, "VERSION"), "utf8").trim()).toBe("v0.0.2");
+    expect(readFileSync(join(directory, "REVISION"), "utf8").trim()).toBe(revisionTwo);
+    expect(readFileSync(join(directory, "app/web/dist/index.html"), "utf8")).toContain("0.0.2");
+  });
+
+  test("installs a pinned release and starts on rerun while preserving data", () => {
     const directory = join(temporaryDirectory(), "installation with spaces ' and $characters");
     const result = install(directory);
     expect(result.code, result.output).toBe(0);
     expect(readFileSync(join(directory, "VERSION"), "utf8").trim()).toBe("v0.0.1");
-    expect(existsSync(join(directory, "app/web/dist/index.html"))).toBe(true);
+    expect(readFileSync(join(directory, "REVISION"), "utf8").trim()).toBe(revisionOne);
+    expect(readFileSync(join(directory, "app/web/dist/index.html"), "utf8")).toContain("0.0.1");
     expect(existsSync(join(directory, "data"))).toBe(false);
     expect(statSync(join(directory, "start.sh")).mode & 0o777).toBe(0o700);
 
@@ -106,17 +157,86 @@ describe("release installer", () => {
     expect(state).toEqual({ data: join(directory, "data"), port: "8898" });
     expect(readFileSync(join(directory, "data/keep.txt"), "utf8")).toBe("persistent evidence");
     expect(readFileSync(join(directory, "app/.env"), "utf8")).toBe("ARGUS_MAX_AGENTS=2\n");
+    expect(readFileSync(join(directory, "VERSION"), "utf8").trim()).toBe("v0.0.1");
     expect(existsSync(join(directory, ".install-lock"))).toBe(false);
+  });
 
-    const otherVersion = install(directory, ["--no-start"], { ARGUS_VERSION: "v0.0.2" });
-    expect(otherVersion.code).not.toBe(0);
-    expect(otherVersion.output).toContain("different or incomplete");
+  test("upgrades an existing installation in place and preserves data and configuration", () => {
+    const directory = join(temporaryDirectory(), "upgrade");
+    expect(install(directory).code).toBe(0);
+    mkdirSync(join(directory, "data"));
+    writeFileSync(join(directory, "data/keep.txt"), "persistent evidence");
+    writeFileSync(join(directory, "app/.env"), "ARGUS_MAX_AGENTS=2\n");
+
+    const upgraded = install(directory, ["--no-start"], { ARGUS_VERSION: "v0.0.2" });
+    expect(upgraded.code, upgraded.output).toBe(0);
+    expect(readFileSync(join(directory, "VERSION"), "utf8").trim()).toBe("v0.0.2");
+    expect(readFileSync(join(directory, "REVISION"), "utf8").trim()).toBe(revisionTwo);
+    expect(readFileSync(join(directory, "app/web/dist/index.html"), "utf8")).toContain("0.0.2");
+    expect(readFileSync(join(directory, "data/keep.txt"), "utf8")).toBe("persistent evidence");
+    expect(readFileSync(join(directory, "app/.env"), "utf8")).toBe("ARGUS_MAX_AGENTS=2\n");
+    expect(existsSync(join(directory, "app.previous"))).toBe(false);
+    expect(existsSync(join(directory, ".install-lock"))).toBe(false);
+    expect(readdirSync(directory).filter((entry) => entry.startsWith(".install."))).toEqual([]);
+  });
+
+  test("refuses to downgrade and keeps the newer installation", () => {
+    const directory = join(temporaryDirectory(), "downgrade");
+    expect(install(directory, ["--no-start"], { ARGUS_VERSION: "v0.0.2" }).code).toBe(0);
+    mkdirSync(join(directory, "data"));
+    writeFileSync(join(directory, "data/keep.txt"), "persistent evidence");
+    const downgraded = install(directory, ["--no-start"], { ARGUS_VERSION: "v0.0.1" });
+    expect(downgraded.code).not.toBe(0);
+    expect(downgraded.output).toContain("Refusing to downgrade");
+    expect(readFileSync(join(directory, "VERSION"), "utf8").trim()).toBe("v0.0.2");
+    expect(readFileSync(join(directory, "app/web/dist/index.html"), "utf8")).toContain("0.0.2");
     expect(readFileSync(join(directory, "data/keep.txt"), "utf8")).toBe("persistent evidence");
   });
 
-  test("cleans up a version mismatch and allows a successful retry", () => {
+  test("recovers a missing VERSION file from the installed package", () => {
+    const directory = join(temporaryDirectory(), "recover-version");
+    expect(install(directory).code).toBe(0);
+    rmSync(join(directory, "VERSION"));
+    const rerun = install(directory);
+    expect(rerun.code, rerun.output).toBe(0);
+    expect(rerun.output).toContain("Recovered the installed version v0.0.1");
+    expect(readFileSync(join(directory, "VERSION"), "utf8").trim()).toBe("v0.0.1");
+    expect(readFileSync(join(directory, "REVISION"), "utf8").trim()).toBe(revisionOne);
+  });
+
+  test("records a revision for an installation created without REVISION", () => {
+    const directory = join(temporaryDirectory(), "legacy-revision");
+    expect(install(directory).code).toBe(0);
+    rmSync(join(directory, "REVISION"));
+    const rerun = install(directory);
+    expect(rerun.code, rerun.output).toBe(0);
+    expect(readFileSync(join(directory, "REVISION"), "utf8").trim()).toBe(revisionOne);
+  });
+
+  test("a failed build leaves the installed release and data intact", () => {
+    const directory = join(temporaryDirectory(), "failed-upgrade");
+    expect(install(directory).code).toBe(0);
+    mkdirSync(join(directory, "data"));
+    writeFileSync(join(directory, "data/keep.txt"), "persistent evidence");
+    writeFileSync(join(directory, "app/.env"), "ARGUS_MAX_AGENTS=2\n");
+    const failed = install(directory, ["--no-start"], { ARGUS_VERSION: "v0.0.2", FIXTURE_FAIL_BUILD: "1" });
+    expect(failed.code).not.toBe(0);
+    expect(failed.output).toContain("fixture build failure");
+    expect(readFileSync(join(directory, "VERSION"), "utf8").trim()).toBe("v0.0.1");
+    expect(readFileSync(join(directory, "app/web/dist/index.html"), "utf8")).toContain("0.0.1");
+    expect(readFileSync(join(directory, "data/keep.txt"), "utf8")).toBe("persistent evidence");
+    expect(readFileSync(join(directory, "app/.env"), "utf8")).toBe("ARGUS_MAX_AGENTS=2\n");
+    expect(existsSync(join(directory, "app.previous"))).toBe(false);
+    expect(existsSync(join(directory, ".install-lock"))).toBe(false);
+  });
+
+  test("cleans up a failed checkout and allows a successful retry", () => {
     const directory = join(temporaryDirectory(), "retry");
-    const failed = install(directory, ["--no-start"], { ARGUS_VERSION: "v0.0.2" });
+    const failed = install(directory, ["--no-start"], {
+      ARGUS_VERSION: "v0.0.2",
+      GIT_CONFIG_KEY_0: `url.file://${mismatchFixture}.insteadOf`,
+      GIT_CONFIG_VALUE_0: "https://github.com/ajul8866/argus.git",
+    });
     expect(failed.code).not.toBe(0);
     expect(failed.output).toContain("does not match");
     expect(existsSync(join(directory, "app"))).toBe(false);

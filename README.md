@@ -35,7 +35,7 @@ scope, models, and configured tools.*
 - **Self-hosted storage.** Bun, strict TypeScript, SQLite, and a vanilla
   TypeScript dashboard. No external database is required.
 
-Argus **v0.0.1** is the first public release. Audit findings need human review;
+Argus **v0.0.2** is the current release. Audit findings need human review;
 a completed workflow does not guarantee exhaustive coverage or exploitability.
 Model providers process the source excerpts sent to them according to your
 chosen harness and provider configuration.
@@ -47,12 +47,14 @@ chosen harness and provider configuration.
 On **Linux, macOS, or Windows through WSL2**, with Git and curl installed:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ajul8866/argus/v0.0.1/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ajul8866/argus/main/install.sh | bash
 ```
 
-The installer downloads the tagged release, installs a private Bun runtime if
-needed, installs locked dependencies, builds the dashboard, and starts Argus
-in the foreground. Installing Bun requires `unzip`. No `sudo` is used.
+The installer resolves the newest release tag, installs a private Bun runtime
+if needed, installs locked dependencies, builds the dashboard, and starts Argus
+in the foreground. Rerunning it updates an existing installation in place and
+preserves `data/` and `app/.env`; `ARGUS_VERSION=v0.0.2` pins a release.
+Installing Bun requires `unzip`. No `sudo` is used.
 
 Open **http://127.0.0.1:8787**. Initial administrator credentials are generated
 on first start and saved in:
@@ -69,9 +71,9 @@ bash ~/.local/share/argus/start.sh
 ```
 
 The default install directory follows `XDG_DATA_HOME` when set. Data lives
-outside the application checkout, and repeating the same release install
-preserves it. For custom paths, ports, install-only mode, or a download-first
-workflow, see [installation details](docs/INSTALLATION.md).
+outside the application checkout, so rerunning the installer updates the app
+without touching it. For custom paths, ports, install-only mode, or a
+download-first workflow, see [installation details](docs/INSTALLATION.md).
 
 ### Configure your agents
 
@@ -99,7 +101,7 @@ With [Bun](https://bun.com/docs/installation) **1.3.14+** and Git:
 ```bash
 git clone https://github.com/ajul8866/argus.git
 cd argus
-git checkout v0.0.1
+git checkout v0.0.2
 bun install --frozen-lockfile --ignore-scripts
 bun run build
 bun run start

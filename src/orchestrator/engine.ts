@@ -484,7 +484,7 @@ export class AuditEngine {
           getSetting(this.store, "audit.require_distinct_harness_for_retest", true),
       ),
       writable_workspace: writableWorkspace,
-      max_cost_usd: input.overrides?.max_cost_usd ? Number(input.overrides.max_cost_usd) : null,
+      max_cost_usd: normalizeCostCeiling(input.overrides?.max_cost_usd),
       harness_overrides:
         input.overrides?.harness_overrides && typeof input.overrides.harness_overrides === "object"
           ? input.overrides.harness_overrides
@@ -2594,8 +2594,8 @@ export class AuditEngine {
       }
       if (audit.status !== "running") return;
 
-      const maxCost = audit.config ? parseJson<Record<string, unknown>>(audit.config, {}).max_cost_usd : null;
-      if (maxCost) {
+      const maxCost = costCeiling(audit.config ? parseJson<Record<string, unknown>>(audit.config, {}).max_cost_usd : null);
+      if (maxCost !== null) {
         const sessions = this.store.all<{ usage: string | null }>(
           "SELECT usage FROM agent_sessions WHERE audit_id = ?",
           auditId,
@@ -2604,7 +2604,7 @@ export class AuditEngine {
           (sum, session) => sum + Number(parseJson<{ cost_usd?: number }>(session.usage ?? "{}", {}).cost_usd ?? 0),
           0,
         );
-        if (total > Number(maxCost)) {
+        if (Number.isFinite(total) && total > maxCost) {
           this.store.run(
             "UPDATE audits SET status = 'failed', finished_at = ?, error = ? WHERE id = ?",
             now(),
@@ -3005,6 +3005,16 @@ export class AuditEngine {
       }
     });
   }
+}
+
+function normalizeCostCeiling(value: unknown): number | null {
+  if (value === undefined || value === null) return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? numeric : null;
+}
+
+function costCeiling(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
 function loadAuditNumber(audit: AuditRow, key: string, fallback: number): number {

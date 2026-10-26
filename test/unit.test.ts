@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,7 +11,7 @@ import { buildFallbackPdf } from "../src/reports/pdf.ts";
 import { EvidenceStore } from "../src/orchestrator/evidence.ts";
 import { buildInventory, gitInfo } from "../src/repo/inventory.ts";
 import { importRepository } from "../src/repo/import.ts";
-import { createWorkspace, verifyQuote } from "../src/repo/workspace.ts";
+import { createWorkspace, readScopedFile, verifyQuote } from "../src/repo/workspace.ts";
 import { createScopeMatcher, globToRegExp, matchesScope, extractJson, sha256 } from "../src/util.ts";
 import { redactSecrets } from "../src/security/redact.ts";
 import { credentialEnvironment, decryptSecret, encryptSecret, type StoredCredential } from "../src/security/credentials.ts";
@@ -71,6 +71,37 @@ describe("scope and parsing", () => {
     expect(matcher.excludes("src/private/argus-probe")).toBe(true);
     expect(matcher.excludes("src/public/argus-probe")).toBe(false);
     expect(createScopeMatcher({ include: [], exclude: [] }).matches("src/main.ts")).toBe(false);
+  });
+
+  test("readScopedFile rejects traversal and symlink escapes outside the declared scope", async () => {
+    const root = mkdtempSync(join(tmpdir(), "argus-scope-"));
+    try {
+      mkdirSync(join(root, "src"), { recursive: true });
+      writeFileSync(join(root, "src", "a.js"), "console.log('inside');\n");
+      writeFileSync(join(root, "secrets.js"), "console.log('outside');\n");
+      symlinkSync("../secrets.js", join(root, "src", "link.js"));
+      symlinkSync("/etc/passwd", join(root, "src", "outside.js"));
+      const scope = { include: ["src/**/*.js"], exclude: [] };
+      const inside = await readScopedFile(root, "src/a.js", scope);
+      expect(inside.path).toBe("src/a.js");
+      expect(inside.content).toContain("inside");
+      const normalized = await readScopedFile(root, "src/./a.js", scope);
+      expect(normalized.path).toBe("src/a.js");
+      const expectOutOfScope = async (path: string): Promise<void> => {
+        try {
+          await readScopedFile(root, path, scope);
+          throw new Error(`Expected ${path} to be rejected`);
+        } catch (error) {
+          expect((error as { code?: string }).code).toBe("out_of_scope");
+        }
+      };
+      await expectOutOfScope("secrets.js");
+      await expectOutOfScope("src/../secrets.js");
+      await expectOutOfScope("src/link.js");
+      await expectOutOfScope("src/outside.js");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("scope matching only compiles patterns reached by short-circuit evaluation", () => {

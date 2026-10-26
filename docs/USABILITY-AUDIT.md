@@ -48,7 +48,7 @@ untuk semua peran audit; validasi tetap berjalan dalam sesi terpisah.
 | Nilai UI menimpa default server | Konfigurasi admin tidak dipakai meskipun pengguna tidak mengubah apa pun | UI mewarisi default server dan hanya mengirim override yang diubah |
 | Start gagal setelah audit tersimpan | Form terlihat gagal total dan bisa menghasilkan audit ganda saat dicoba lagi | Pengguna diarahkan ke audit tersimpan agar bisa melanjutkan dari sana |
 | Tiga belas tujuan navigasi tampil sekaligus | Fitur teknis bersaing dengan pekerjaan utama | Enam tujuan utama; tujuh lainnya di Advanced tools, terbuka otomatis untuk route aktif |
-| Satu runtime harus diatur pada beberapa peran | Pengguna harus memahami setiap peran agar satu CLI dapat dipakai | Use for audits mengatur empat peran sekaligus, memakai model default dan tool baca, tanpa perpindahan runtime otomatis |
+| Satu runtime harus diatur pada beberapa peran | Pengguna harus memahami setiap peran agar satu CLI dapat dipakai | Use for audits mengatur empat peran sekaligus, memakai model default dan seluruh daftar tool runtime; perubahan tool berikutnya otomatis diwarisi |
 | Tes runtime berbayar menjadi aksi utama | Check, Test, dan Configure terlihat sama penting | Penetapan runtime menjadi aksi utama; tes panggilan model berada di Technical details |
 | Tiga belas pengaturan eksekusi tampil sekaligus | Pengguna harus menghadapi policy, timeout, sandbox, dan cap yang jarang diubah | Tiga pengaturan umum; sepuluh pengaturan teknis di Advanced execution settings |
 | Menyimpan pengaturan mengirim semua nilai | Konfirmasi shell/write muncul lagi meskipun tidak diubah | Hanya nilai berubah yang dikirim; API meminta konfirmasi hanya pada transisi nonaktif ke aktif |
@@ -56,7 +56,8 @@ untuk semua peran audit; validasi tetap berjalan dalam sesi terpisah.
 | Provider kredensial wajib diketik untuk setiap variabel | Detail teknis menjadi prasyarat menambah secret | Scope default global; pembatasan provider bersifat opsional |
 | Capability, hash, riwayat, dan uraian internal memenuhi halaman | Pengguna harus menyaring banyak detail untuk mencari aksi utama | Rincian dipindahkan ke bagian yang dapat dibuka saat diperlukan |
 | Settings meminta data admin untuk viewer | Request ditolak lalu error disembunyikan | Request admin tidak dibuat untuk akun non-admin |
-| Daftar tool runtime kosong diganti default diam-diam | Konfigurasi kosong tidak benar-benar dihormati | Daftar kosong dipertahankan; penetapan runtime menolak cap tanpa tool baca |
+| Daftar tool runtime kosong diganti default diam-diam | Konfigurasi kosong tidak benar-benar dihormati | Daftar kosong dipertahankan sampai adapter; tidak mengaktifkan tool bawaan secara diam-diam |
+| Runtime mengizinkan 9 tool tetapi agent tetap memakai 4 | Daftar peran lama dan tombol penetapan memotong izin pengguna | Peran mengikuti tool runtime secara otomatis; UI menampilkan jumlah dan sumber daftar yang benar; pembatasan peran khusus tetap opsional |
 | Isian invalid tersembunyi di bagian lanjutan | Browser tidak dapat memfokuskan field yang perlu diperbaiki | Bagian lanjutan dibuka otomatis ketika validasi native gagal |
 
 Sebagian perbaikan proyek dan folder sudah dimulai pada perubahan sebelumnya;
@@ -82,7 +83,7 @@ perlu dihapus untuk menghasilkan alur biasa yang lebih singkat.
 
 ## Verifikasi
 
-Hasil lokal: **114 tes lulus, 0 gagal**; typecheck, build, dan pemeriksaan shell
+Hasil lokal setelah perbaikan pewarisan tool: **119 tes lulus, 0 gagal**; typecheck, build, dan pemeriksaan shell
 lulus. Pemeriksaan browser mencakup 13 route pada empat ukuran layar, alur
 formulir utama, serta perilaku akun viewer. Pemindaian mekanis Impeccable
 menghasilkan 0 temuan.
@@ -91,7 +92,8 @@ menghasilkan 0 temuan.
 - `bun run build` dan `bash -n install.sh start.sh`.
 - `bun run scripts/check-usability-ui.ts`: alur proyek sampai audit,
   pemulihan kegagalan start, perubahan settings, konfirmasi pertama kali,
-  kredensial, penetapan runtime, field lanjutan, serta semua 13 route pada
+  kredensial, penetapan runtime, perubahan tool yang otomatis diwarisi empat peran,
+  field lanjutan, serta semua 13 route pada
   lebar 320, 768, 1024, dan 1440 piksel. Script memakai server/data sementara
   dan CLI pengujian; tidak memanggil model.
 - Pemeriksaan visual dan keyboard pada formulir serta halaman yang berubah.

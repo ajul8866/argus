@@ -204,12 +204,11 @@ export class PiHarnessAdapter implements HarnessAdapter {
       task.systemPrompt,
     ];
     const tools = [
-      ...(task.allowedTools.length > 0 ? task.allowedTools : this.harnessConfig.allowed_tools),
+      ...task.allowedTools,
       ...(task.resources?.servers ?? []).map((server) => `mcp__${server.key}__*`),
     ];
-    if (tools.length > 0) {
-      args.push("--no-builtin-tools", "--tools", tools.join(","));
-    }
+    args.push("--no-builtin-tools");
+    if (tools.length > 0) args.push("--tools", tools.join(","));
     if (task.resumeSessionRef) {
       args.push("--resume", task.resumeSessionRef);
     }

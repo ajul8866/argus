@@ -24,6 +24,7 @@ type Agent = {
   model: string | null;
   system_instructions: string;
   allowed_tools: string[];
+  inherit_tools: boolean;
   max_duration_ms: number;
   max_retries: number;
   concurrency_limit: number;
@@ -33,7 +34,7 @@ type Agent = {
   updated_at: string;
 };
 
-type Harness = { kind: string; status: string; models: Array<{ id: string; label: string }> };
+type Harness = { kind: string; status: string; config: { allowed_tools: string[] }; models: Array<{ id: string; label: string }> };
 
 export async function renderAgents(root: HTMLElement): Promise<void> {
   root.replaceChildren(loading("Loading agent roles"));
@@ -52,7 +53,10 @@ export async function renderAgents(root: HTMLElement): Promise<void> {
         ),
         h("td", {}, h("span", { class: `chip ${agent.harness === "pi" ? "on" : ""}` }, agent.harness)),
         h("td", { class: "mono small" }, agent.model ?? "harness default"),
-        h("td", { class: "mono tiny" }, agent.allowed_tools.join(", ") || "none"),
+        h("td", {},
+          h("div", { class: "small" }, `${agent.allowed_tools.length} tools · ${agent.inherit_tools ? "from runtime" : "role restriction"}`),
+          h("div", { class: "mono tiny" }, agent.allowed_tools.join(", ") || "none"),
+        ),
         h("td", { class: "small" }, `${Math.round(agent.max_duration_ms / 60000)}m`),
         h("td", { class: "small" }, agent.budget_usd === null ? "unlimited" : `$${agent.budget_usd.toFixed(2)}`),
         h("td", { class: "small" }, String(agent.concurrency_limit)),
@@ -97,6 +101,14 @@ function openAgentEdit(agent: Agent, harnesses: Harness[], refresh: () => void):
   );
   const model = input("model", { value: agent.model ?? "", placeholder: "harness default or model id" });
   const tools = input("allowed_tools", { value: agent.allowed_tools.join(",") });
+  const restrictTools = h("input", { type: "checkbox", checked: !agent.inherit_tools }) as HTMLInputElement;
+  const updateTools = () => {
+    tools.disabled = !restrictTools.checked;
+    if (!restrictTools.checked) tools.value = harnesses.find((harness) => harness.kind === harnessSelect.value)?.config.allowed_tools.join(",") ?? "";
+  };
+  restrictTools.addEventListener("change", updateTools);
+  harnessSelect.addEventListener("change", updateTools);
+  updateTools();
   const systemPrompt = h("textarea", { class: "input textarea", name: "system_instructions", rows: 7 }, agent.system_instructions) as HTMLTextAreaElement;
   const retriesInput = input("max_retries", { type: "number", value: String(agent.max_retries), min: 0, max: 5 });
   const duration = input("max_duration_ms", { type: "number", value: String(Math.round(agent.max_duration_ms / 1000)), min: 10, max: 3600 });
@@ -118,7 +130,8 @@ function openAgentEdit(agent: Agent, harnesses: Harness[], refresh: () => void):
             body: {
               harness: harnessSelect.value,
               model: model.value.trim() || null,
-              allowed_tools: tools.value.split(",").map((tool) => tool.trim()).filter(Boolean),
+              inherit_tools: !restrictTools.checked,
+              ...(restrictTools.checked ? { allowed_tools: tools.value.split(",").map((tool) => tool.trim()).filter(Boolean) } : {}),
               max_duration_ms: Number(duration.value) * 1000,
               budget_usd: budget.value === "" ? null : Number(budget.value),
               max_retries: Number(retriesInput.value),
@@ -142,7 +155,8 @@ function openAgentEdit(agent: Agent, harnesses: Harness[], refresh: () => void):
       field("Model", model, `${models.length} models reported by this harness`),
     ),
     disclosure("Advanced role settings", h("div", { class: "form-grid" },
-      field("Allowed tools", tools), field("System instructions", systemPrompt),
+      h("label", { class: "checkbox full" }, restrictTools, "Restrict tools for this role"),
+      field("Allowed tools", tools, "Uses all tools enabled for the selected runtime unless you set a role restriction."), field("System instructions", systemPrompt),
       field("Max retries", retriesInput), field("Max duration (seconds)", duration),
       field("Budget (USD)", budget, "Empty means no per-task budget."),
       h("label", { class: "checkbox full" }, enabled, "Role enabled"),

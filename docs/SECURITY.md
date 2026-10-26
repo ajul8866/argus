@@ -134,8 +134,13 @@ absence of vulnerabilities. Human review is required.
 
 - `security.allow_shell_tools` is false by default. Enabling it requires an
   administrator and a second explicit confirmation.
-- Any role with shell tools causes tasks to be created in
-  `waiting_approval`; an administrator must decide. Denial cancels the task.
+- Audit roles inherit the runtime's configured tool list unless an administrator
+  saves an explicit role restriction. Changes to runtime tools apply to new
+  sessions; active sessions keep their existing permissions. Empty lists disable
+  native tools rather than falling back to a runtime default.
+- When `security.require_approval_for_shell` is enabled, any role with shell tools
+  causes tasks to be created in `waiting_approval`; an administrator must decide.
+  Denial cancels the task. Execution rechecks global policy and required approval.
   There is no implicit approval and no fallback to an unrestricted mode.
 - `security.allow_writable_workspace` is false by default and follows the same
   shape: administrator confirmation, an explicit per-audit request, and a

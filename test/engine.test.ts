@@ -12,7 +12,7 @@ import { AuditEngine } from "../src/orchestrator/engine.ts";
 import { EvidenceStore } from "../src/orchestrator/evidence.ts";
 import { ReportService } from "../src/reports/generator.ts";
 import { buildInventory } from "../src/repo/inventory.ts";
-import { seedDefaults, setSetting } from "../src/settings.ts";
+import { harnessConfig, saveHarnessConfig, seedDefaults, setSetting } from "../src/settings.ts";
 import { now, toJson, uid } from "../src/util.ts";
 import { LocalCatalog } from "../src/local/catalog.ts";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -28,9 +28,10 @@ type ScriptedHarness = {
   cleanupRun: (runId: string) => Promise<void>;
 };
 
-function fakeManager(): HarnessManager {
+function fakeManager(onTask?: (task: HarnessTask) => void): HarnessManager {
   const manager: ScriptedHarness = {
     async run(kind, task, hooks) {
+      onTask?.(task);
       const startedAt = now();
       hooks.onEvent({ type: "session_start", at: startedAt, meta: { sandbox: "test", harness: kind } });
       const data = scriptedResult(task);
@@ -681,6 +682,57 @@ for (const cap of [0, 1]) {
     }
   }, 30_000);
 }
+
+test("runtime tools reach the actual task and an audit override uses its chosen runtime list", async () => {
+  await engine.stop();
+  const tasks: HarnessTask[] = [];
+  manager = fakeManager((task) => tasks.push(task));
+  engine = createEngine();
+  const tools = ["Read", "Grep", "Glob", "LS", "Bash", "Edit", "Write", "WebFetch", "WebSearch"];
+  saveHarnessConfig(store, "claude-code", { ...harnessConfig(store, "claude-code"), allowed_tools: tools });
+  setSetting(store, "security.allow_shell_tools", true, null);
+  setSetting(store, "security.require_approval_for_shell", false, null);
+  const config = JSON.parse(store.get<{ config: string }>("SELECT config FROM audits WHERE id = ?", auditId)!.config);
+  store.run("UPDATE audits SET config = ?, status = 'running' WHERE id = ?", toJson({ ...config,
+    harness_overrides: { codebase_mapper: { harness: "claude-code" } },
+  }), auditId);
+  const taskId = engine.createTask({ auditId, phase: 1, kind: "phase1.map", taskKey: "runtime-tools",
+    title: "Mapper with configured tools", payload: {}, agentRole: "codebase_mapper" });
+  expect(store.get("SELECT status, harness FROM tasks WHERE id = ?", taskId)).toMatchObject({ status: "queued", harness: "claude-code" });
+  engine.start();
+  await waitFor(() => tasks.some((task) => task.taskId === taskId), 8_000);
+  expect(tasks.find((task) => task.taskId === taskId)?.allowedTools).toEqual(tools);
+  const event = store.get<{ payload: string }>("SELECT payload FROM execution_events WHERE task_id = ? AND type = 'agent.session_started'", taskId);
+  expect(JSON.parse(event!.payload)).toMatchObject({ allowed_tools: tools, inherit_tools: true });
+  await waitFor(() => store.get<{ status: string }>("SELECT status FROM tasks WHERE id = ?", taskId)?.status === "completed");
+});
+
+test("inherited shell tools request approval and an empty runtime cap cannot grant role tools", async () => {
+  setSetting(store, "security.allow_shell_tools", true, null);
+  saveHarnessConfig(store, "pi", { ...harnessConfig(store, "pi"), allowed_tools: ["read", "bash"] });
+  const taskId = engine.createTask({ auditId, phase: 1, kind: "phase1.map", taskKey: "shell-tools",
+    title: "Shell mapper", payload: {}, agentRole: "codebase_mapper" });
+  expect(store.get("SELECT status FROM tasks WHERE id = ?", taskId)).toMatchObject({ status: "waiting_approval" });
+  expect(store.get("SELECT action FROM approvals WHERE task_id = ?", taskId)).toMatchObject({ action: "allow_shell_tools" });
+  saveHarnessConfig(store, "pi", { ...harnessConfig(store, "pi"), allowed_tools: [] });
+  store.run("UPDATE agent_defs SET inherit_tools = 0 WHERE role = 'codebase_mapper'");
+  store.run("UPDATE audits SET status = 'running' WHERE id = ?", auditId);
+  const emptyTask = engine.createTask({ auditId, phase: 1, kind: "phase1.map", taskKey: "empty-tools",
+    title: "Empty cap mapper", payload: {}, agentRole: "codebase_mapper" });
+  await waitFor(() => store.get<{ status: string }>("SELECT status FROM tasks WHERE id = ?", emptyTask)?.status === "failed", 8_000);
+  expect(store.get("SELECT failure_kind FROM tasks WHERE id = ?", emptyTask)).toMatchObject({ failure_kind: "harness_tool_policy" });
+});
+
+test("runtime shell access enabled after queuing still needs approval at execution", async () => {
+  const taskId = engine.createTask({ auditId, phase: 1, kind: "phase1.map", taskKey: "changed-tools",
+    title: "Changed runtime tools", payload: {}, agentRole: "codebase_mapper" });
+  setSetting(store, "security.allow_shell_tools", true, null);
+  saveHarnessConfig(store, "pi", { ...harnessConfig(store, "pi"), allowed_tools: ["read", "bash"] });
+  store.run("UPDATE audits SET status = 'running' WHERE id = ?", auditId);
+  await waitFor(() => store.get<{ status: string }>("SELECT status FROM tasks WHERE id = ?", taskId)?.status === "failed", 8_000);
+  expect(store.get("SELECT failure_kind, attempts FROM tasks WHERE id = ?", taskId)).toMatchObject({ failure_kind: "shell_tools_not_approved", attempts: 1 });
+  expect(store.all("SELECT id FROM agent_sessions WHERE task_id = ?", taskId)).toHaveLength(0);
+});
 
 test("an audit cannot request a writable workspace while the policy is disabled", () => {
   expect(() => engine.createAudit({

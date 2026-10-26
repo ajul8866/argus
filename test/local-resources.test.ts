@@ -258,5 +258,19 @@ if(${JSON.stringify(kind)}==='claude-code') {
       expect(captured.args).toContain("--no-approve");
     } else expect(captured.args).toContain("--strict-mcp-config");
     expect(existsSync(join(config.dataDir, "harness-homes/session"))).toBe(false);
+    for (const nativeTools of [kind === "pi" ? ["read", "grep", "find", "ls", "bash", "edit", "write"] : ["Read", "Grep", "Glob", "LS", "Bash", "Edit", "Write", "WebFetch", "WebSearch"], []]) {
+      const next = await adapter.run({ runId: "session", auditId: "audit", taskId: "tools", role: "codebase_mapper",
+        prompt: "Return JSON", systemPrompt: "Test", workspace: project, model: "test-model", allowedTools: nativeTools, timeoutMs: 5_000, resources }, { onEvent() {} });
+      expect(next.status).toBe("completed");
+      const args: string[] = (await Bun.file(capture).json()).args;
+      const toolList = args[args.indexOf("--tools") + 1];
+      expect(toolList).toBe(kind === "pi" ? [...nativeTools, "mcp__argus_server_id__*"].join(",") : nativeTools.join(","));
+      if (kind === "pi") expect(args).toContain("--no-builtin-tools");
+      else {
+        const disallowed = args[args.indexOf("--disallowedTools") + 1] ?? "";
+        for (const tool of nativeTools) expect(disallowed.split(",")).not.toContain(tool);
+        if (nativeTools.length === 0) expect(disallowed).toContain("Bash");
+      }
+    }
   }, 15_000);
 }

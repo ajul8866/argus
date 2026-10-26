@@ -159,10 +159,19 @@ stored through `/api/credentials`, not harness env. `bypassPermissions` and
 
 `POST /api/harnesses/:kind/assign` atomically assigns the four audit roles to
 the selected runtime, clears role-specific model overrides to inherit its model,
-enables those roles, and uses only native read tools within its configured cap.
-It clears per-role shell access and sets `audit.require_distinct_harness_for_retest`
+enables those roles, and sets `inherit_tools: true` so every tool in the runtime's
+configured `allowed_tools` is used. Later runtime tool changes are inherited
+automatically. It clears the legacy per-role shell flag and sets `audit.require_distinct_harness_for_retest`
 to false for future audits. Existing sessions and audit configurations are not
 rewritten. No tool-cap expansion or runtime substitution is performed.
+
+`GET /api/agents` returns each role's resolved `allowed_tools` and `inherit_tools`
+boolean. New audit roles inherit runtime tools. `PUT /api/agents/:role` accepts
+`inherit_tools: false` with an explicit `allowed_tools` restriction; sending only
+`allowed_tools` also opts out of inheritance for compatibility. Sending
+`inherit_tools: true` restores automatic inheritance. An empty list means no
+native tools. Global shell policy, configured task approvals, workspace write
+access, and linked MCP server assignments remain independent controls.
 
 ## Settings, users, approvals
 

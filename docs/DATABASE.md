@@ -62,6 +62,10 @@ capabilities JSON, config JSON, detection timestamps.
 
 Role-primary-keyed. Harness, model, system instructions, allowed tools JSON,
 max duration, retries, concurrency, budget, shell flag, enabled flag.
+Migration 3 adds `inherit_tools`: inherited roles resolve their tools from the
+chosen runtime, including audit overrides. Existing untouched four-tool audit
+roles are migrated to inheritance; custom restrictions and legacy shell choices
+are preserved. Stored `allowed_tools` remains the explicit list for restricted roles.
 
 ### `projects`
 

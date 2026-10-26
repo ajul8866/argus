@@ -17,6 +17,9 @@ import { redactSecrets } from "../src/security/redact.ts";
 import { credentialEnvironment, decryptSecret, encryptSecret, type StoredCredential } from "../src/security/credentials.ts";
 import { MAP_SCHEMA, validateAgainstSchema } from "../src/orchestrator/schemas.ts";
 import { detectRepositoryRoots, listRepositoryFolders } from "../src/repo/directories.ts";
+import { Database } from "bun:sqlite";
+import { migrations } from "../src/db/migrations.ts";
+import { DEFAULT_AGENTS } from "../src/settings.ts";
 
 const fixture = join(import.meta.dir, "fixtures", "vulnerable-app");
 
@@ -40,6 +43,35 @@ function testConfig(dataDir: string): Config {
     logLevel: "error",
   };
 }
+
+test("upgrading runtime tool inheritance preserves custom role restrictions and shell choices", () => {
+  const directory = mkdtempSync(join(tmpdir(), "argus-tools-upgrade-"));
+  const legacy = new Database(join(directory, "test.sqlite"));
+  legacy.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)");
+  for (const migration of migrations.filter((entry) => entry.version < 3)) {
+    legacy.exec(migration.sql);
+    legacy.query("INSERT INTO schema_migrations VALUES (?, ?, ?)").run(migration.version, migration.name, new Date().toISOString());
+  }
+  for (const agent of DEFAULT_AGENTS) {
+    legacy.query(`INSERT INTO agent_defs (role,label,harness,system_instructions,allowed_tools,max_duration_ms,max_retries,concurrency_limit,allow_shell,enabled,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(agent.role, agent.label, agent.harness, agent.system_instructions,
+      JSON.stringify(agent.allowed_tools), agent.max_duration_ms, agent.max_retries, agent.concurrency_limit, 0, 1, new Date().toISOString());
+  }
+  legacy.exec(`UPDATE agent_defs SET allowed_tools = '["read"]' WHERE role = 'security_researcher';
+    UPDATE agent_defs SET allow_shell = 1 WHERE role = 'retest_auditor';`);
+  legacy.close();
+  const upgraded = new Store(testConfig(directory), "test.sqlite");
+  try {
+    expect(upgraded.get("SELECT inherit_tools FROM agent_defs WHERE role = 'codebase_mapper'")).toEqual({ inherit_tools: 1 });
+    expect(upgraded.get("SELECT inherit_tools FROM agent_defs WHERE role = 'independent_validator'")).toEqual({ inherit_tools: 1 });
+    expect(upgraded.get("SELECT inherit_tools, allowed_tools FROM agent_defs WHERE role = 'security_researcher'")).toEqual({ inherit_tools: 0, allowed_tools: '["read"]' });
+    expect(upgraded.get("SELECT inherit_tools, allow_shell FROM agent_defs WHERE role = 'retest_auditor'")).toEqual({ inherit_tools: 0, allow_shell: 1 });
+    expect(upgraded.all("SELECT version FROM schema_migrations ORDER BY version")).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+  } finally {
+    upgraded.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 describe("host repository folders", () => {
   test("default configuration accepts host folders without environment setup and honors explicit restrictions", async () => {

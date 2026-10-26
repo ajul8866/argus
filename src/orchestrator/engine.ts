@@ -209,6 +209,7 @@ const NON_RETRYABLE_FAILURES = new Set([
   "harness_missing",
   "harness_auth",
   "shell_tools_disabled",
+  "shell_tools_not_approved",
   "harness_tool_policy",
   "audit_closed",
   "local_resources",
@@ -724,7 +725,7 @@ export class AuditEngine {
     let requiresApproval = options.requiresApproval ?? false;
     const approvalRequests: Array<{ action: string; scope: string }> = [];
     if (options.agentRole) {
-      const definition = agentDefinition(this.store, options.agentRole);
+      let definition = agentDefinition(this.store, options.agentRole);
       const audit = this.store.get<{ config: string }>("SELECT config FROM audits WHERE id = ?", options.auditId);
       const auditConfig = parseJson<Record<string, unknown>>(audit?.config ?? "{}", {});
       const overrides = (auditConfig.harness_overrides ?? {}) as Record<
@@ -787,7 +788,8 @@ export class AuditEngine {
           }
         }
       }
-      const shellTools = definition.allow_shell || definition.allowed_tools.some((tool) => /^(bash|Bash)$/.test(tool));
+      definition = agentDefinition(this.store, options.agentRole, harness);
+      const shellTools = definition.allow_shell || definition.allowed_tools.some((tool) => /^(bash|Bash)(?:$|\()/.test(tool));
       if (shellTools) {
         const allowShell = Boolean(getSetting(this.store, "security.allow_shell_tools", false));
         if (!allowShell) {
@@ -1036,6 +1038,8 @@ export class AuditEngine {
       find: "Glob",
       ls: "LS",
       bash: "Bash",
+      edit: "Edit",
+      write: "Write",
     };
     const toPi: Record<string, string> = {
       Read: "read",
@@ -1043,18 +1047,36 @@ export class AuditEngine {
       Glob: "find",
       LS: "ls",
       Bash: "bash",
+      Edit: "edit",
+      Write: "write",
     };
     return tools.map((tool) => (harness === "claude-code" ? toClaude[tool] ?? tool : toPi[tool] ?? tool));
   }
 
   private async runAgentTask(task: TaskRow, audit: AuditRow, signal: AbortSignal): Promise<void> {
     const ctx = this.context(task.audit_id);
-    const definition = agentDefinition(this.store, task.agent_role!);
+    const definition = agentDefinition(this.store, task.agent_role!, task.harness ?? undefined);
     const harness = task.harness ?? definition.harness;
     const supportsRole = definition.enabled;
     if (!supportsRole) {
       this.finishTaskFailure(task.id, "internal", `Agent role ${definition.role} is disabled`);
       return;
+    }
+    const shellTools = definition.allow_shell || definition.allowed_tools.some((tool) => /^(bash|Bash)(?:$|\()/.test(tool));
+    if (shellTools) {
+      if (!getSetting(this.store, "security.allow_shell_tools", false)) {
+        this.finishTaskFailure(task.id, "shell_tools_disabled", "Shell tools are disabled in Settings.");
+        return;
+      }
+      if (getSetting(this.store, "security.require_approval_for_shell", true)) {
+        const approval = this.store.get<{ status: string }>(
+          "SELECT status FROM approvals WHERE task_id = ? AND action = 'allow_shell_tools' ORDER BY created_at DESC LIMIT 1", task.id,
+        );
+        if (approval?.status !== "approved") {
+          this.finishTaskFailure(task.id, "shell_tools_not_approved", "The runtime tool list now includes shell access. This task needs shell approval before it can run.");
+          return;
+        }
+      }
     }
     let writableWorkspace: boolean;
     try {
@@ -1203,19 +1225,14 @@ export class AuditEngine {
     }
 
     const schema = TASK_SCHEMAS[task.kind] ?? null;
-    const shellApproval = this.store.get<{ status: string }>(
-      "SELECT status FROM approvals WHERE task_id = ? AND action = 'allow_shell_tools' ORDER BY created_at DESC LIMIT 1",
-      task.id,
-    );
     const tools = this.toolsForHarness(
-      shellApproval?.status === "approved"
+      definition.allow_shell
         ? [...definition.allowed_tools, harness === "pi" ? "bash" : "Bash"]
         : definition.allowed_tools,
       harness,
     );
     const harnessPolicy = harnessConfig(this.store, harness).allowed_tools;
-    const policyViolations =
-      harnessPolicy.length > 0 ? tools.filter((tool) => !harnessPolicy.includes(tool)) : [];
+    const policyViolations = tools.filter((tool) => !harnessPolicy.includes(tool));
     if (policyViolations.length > 0) {
       finalizeSession(
         "failed",
@@ -1261,6 +1278,8 @@ export class AuditEngine {
           payload: {
             harness,
             model: task.model,
+            allowed_tools: tools,
+            inherit_tools: definition.inherit_tools,
             sandbox: event.meta?.sandbox,
             warnings: event.meta?.warnings ?? [],
             pid: event.meta?.pid,

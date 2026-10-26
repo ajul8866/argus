@@ -408,4 +408,16 @@ CREATE TABLE local_resource_usage (
 CREATE INDEX idx_local_usage_resource ON local_resource_usage(resource_kind, resource_id, id);
 `,
   },
+  {
+    version: 3,
+    name: "inherit_runtime_tools",
+    sql: `
+ALTER TABLE agent_defs ADD COLUMN inherit_tools INTEGER NOT NULL DEFAULT 0 CHECK (inherit_tools IN (0,1));
+UPDATE agent_defs SET inherit_tools = 1
+WHERE role IN ('codebase_mapper','security_researcher','independent_validator','retest_auditor')
+  AND allow_shell = 0
+  AND ((harness = 'pi' AND json(allowed_tools) = '["read","grep","find","ls"]')
+    OR (harness = 'claude-code' AND json(allowed_tools) = '["Read","Grep","Glob","LS"]'));
+`,
+  },
 ];

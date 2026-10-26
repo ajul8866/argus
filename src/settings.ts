@@ -11,6 +11,7 @@ export type AgentDefinition = {
   model: string | null;
   system_instructions: string;
   allowed_tools: string[];
+  inherit_tools: boolean;
   max_duration_ms: number;
   max_retries: number;
   concurrency_limit: number;
@@ -28,7 +29,7 @@ const PLATFORM_GUARD = `Platform safety policy (non-negotiable):
 - Do not invent files, line numbers, runtime behavior, or test executions.
 - Return only the required JSON object, without markdown fences or commentary.`;
 
-export const DEFAULT_AGENTS: Array<Omit<AgentDefinition, "updated_at">> = [
+export const DEFAULT_AGENTS: Array<Omit<AgentDefinition, "updated_at" | "inherit_tools">> = [
   {
     role: "codebase_mapper",
     label: "Codebase Mapper",
@@ -171,8 +172,8 @@ export function seedDefaults(store: Store, config: Config): void {
       store.run(
         `INSERT INTO agent_defs
          (role, label, harness, model, system_instructions, allowed_tools, max_duration_ms,
-          max_retries, concurrency_limit, budget_usd, allow_shell, enabled, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          max_retries, concurrency_limit, budget_usd, allow_shell, enabled, updated_at, inherit_tools)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(role) DO NOTHING`,
         agent.role,
         agent.label,
@@ -187,6 +188,7 @@ export function seedDefaults(store: Store, config: Config): void {
         agent.allow_shell ? 1 : 0,
         agent.enabled ? 1 : 0,
         timestamp,
+        ["codebase_mapper", "security_researcher", "independent_validator", "retest_auditor"].includes(agent.role) ? 1 : 0,
       );
     }
     for (const kind of ["pi", "claude-code"] as const) {
@@ -262,6 +264,7 @@ type AgentDefRow = {
   model: string | null;
   system_instructions: string;
   allowed_tools: string;
+  inherit_tools: number;
   max_duration_ms: number;
   max_retries: number;
   concurrency_limit: number;
@@ -271,14 +274,17 @@ type AgentDefRow = {
   updated_at: string;
 };
 
-function mapAgentDef(row: AgentDefRow): AgentDefinition {
+function mapAgentDef(store: Store, row: AgentDefRow, harness?: HarnessKind): AgentDefinition {
   return {
     role: row.role,
     label: row.label,
     harness: row.harness,
     model: row.model,
     system_instructions: row.system_instructions,
-    allowed_tools: parseJson<string[]>(row.allowed_tools, []),
+    allowed_tools: row.inherit_tools === 1
+      ? harnessConfig(store, harness ?? row.harness).allowed_tools
+      : parseJson<string[]>(row.allowed_tools, []),
+    inherit_tools: row.inherit_tools === 1,
     max_duration_ms: row.max_duration_ms,
     max_retries: row.max_retries,
     concurrency_limit: row.concurrency_limit,
@@ -289,14 +295,14 @@ function mapAgentDef(row: AgentDefRow): AgentDefinition {
   };
 }
 
-export function agentDefinition(store: Store, role: string): AgentDefinition {
+export function agentDefinition(store: Store, role: string, harness?: HarnessKind): AgentDefinition {
   const row = store.get<AgentDefRow>("SELECT * FROM agent_defs WHERE role = ?", role);
   if (!row) throw new Error(`Unknown agent role: ${role}`);
-  return mapAgentDef(row);
+  return mapAgentDef(store, row, harness);
 }
 
 export function listAgents(store: Store): AgentDefinition[] {
-  return store.all<AgentDefRow>("SELECT * FROM agent_defs ORDER BY role").map(mapAgentDef);
+  return store.all<AgentDefRow>("SELECT * FROM agent_defs ORDER BY role").map((row) => mapAgentDef(store, row));
 }
 
 export function harnessConfig(store: Store, kind: HarnessKind): HarnessConfig {

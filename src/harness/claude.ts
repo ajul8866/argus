@@ -222,9 +222,11 @@ export class ClaudeCodeHarnessAdapter implements HarnessAdapter {
     if (task.schema) args.push("--json-schema", JSON.stringify(task.schema));
     if (task.maxBudgetUsd && task.maxBudgetUsd > 0) args.push("--max-budget-usd", String(task.maxBudgetUsd));
     const tools = [
-      ...(task.allowedTools.length > 0 ? task.allowedTools : this.harnessConfig.allowed_tools),
+      ...task.allowedTools,
       ...(task.resources?.servers ?? []).map((server) => `mcp__${server.key}__*`),
     ];
+    const builtinTools = tools.filter((tool) => !tool.startsWith("mcp__")).map((tool) => tool.split("(")[0]!);
+    args.push("--tools", [...new Set(builtinTools)].join(","));
     if (tools.length > 0) args.push("--allowedTools", tools.join(","));
     const disallowed = ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch"].filter(
       (tool) => !tools.some((allowed) => allowed === tool || allowed.startsWith(`${tool}(`)),

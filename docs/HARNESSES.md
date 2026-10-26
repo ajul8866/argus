@@ -20,7 +20,10 @@ that starts Argus. Use `ARGUS_PI_BIN` and `ARGUS_CLAUDE_BIN` for custom binary
 paths. In the dashboard, open **Settings → Open AI setup → Configure** and
 select your provider and model. The initial Pi preset may not exist in your
 provider's model catalog. Press **Use for audits** to assign that runtime and
-its model to all four audit roles in one action. Only the chosen runtime is
+its model and configured tools to all four audit roles in one action. Roles
+inherit subsequent tool changes automatically; the default four read tools are
+not a fixed ceiling. An optional restriction lives in the role's advanced settings.
+Only the chosen runtime is
 needed; validation still runs in separate sessions. Per-role customization is
 available under **Advanced tools → Agents**.
 
@@ -114,6 +117,7 @@ claude -p <prompt> \
   --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
   --append-system-prompt <platform+role policy> \
   --session-id <uuid> \
+  --tools Read,Grep,Glob,LS \
   --allowedTools Read,Grep,Glob,LS \
   --disallowedTools Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch \
   --json-schema <schema>

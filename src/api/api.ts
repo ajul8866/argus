@@ -17,7 +17,7 @@ import { DEFAULT_EXCLUDES } from "../repo/inventory.ts";
 import { importRepository } from "../repo/import.ts";
 import { assertAuthorizedRoot, readScopedFile } from "../repo/workspace.ts";
 import { listRepositoryFolders } from "../repo/directories.ts";
-import { agentDefinition, getSetting, harnessConfig, listSettings, saveHarnessConfig, setSetting } from "../settings.ts";
+import { agentDefinition, getSetting, harnessConfig, listAgents, listSettings, saveHarnessConfig, setSetting } from "../settings.ts";
 import { decryptSecret, encryptSecret, type StoredCredential } from "../security/credentials.ts";
 import { redactObject } from "../security/redact.ts";
 import {
@@ -817,15 +817,12 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
         if (method === "POST" && action === "assign") {
           const current = requireRole("admin");
           const config = harnessConfig(deps.store, kind);
-          const nativeTools = kind === "pi" ? ["read", "grep", "find", "ls"] : ["Read", "Grep", "Glob", "LS"];
-          const tools = nativeTools.filter((tool) => config.allowed_tools.includes(tool));
-          if (tools.length === 0) throw badRequest("Enable read tools in this runtime's advanced settings first");
           const roles = ["codebase_mapper", "security_researcher", "independent_validator", "retest_auditor"];
           deps.store.transaction(() => {
             for (const role of roles) {
               deps.store.run(
-                "UPDATE agent_defs SET harness = ?, model = NULL, allowed_tools = ?, allow_shell = 0, enabled = 1, updated_at = ? WHERE role = ?",
-                kind, toJson(tools), now(), role,
+                "UPDATE agent_defs SET harness = ?, model = NULL, allowed_tools = ?, inherit_tools = 1, allow_shell = 0, enabled = 1, updated_at = ? WHERE role = ?",
+                kind, toJson(config.allowed_tools), now(), role,
               );
             }
             setSetting(deps.store, "audit.require_distinct_harness_for_retest", false, current.id);
@@ -879,20 +876,7 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
 
       if (path === "/api/agents" && method === "GET") {
         requireUser();
-        const rows = deps.store.all("SELECT * FROM agent_defs ORDER BY role");
-        return json({
-          agents: rows.map((row) => {
-            const record = row as Record<string, unknown>;
-            return {
-              ...record,
-              harness: record.harness,
-              model: record.model,
-              allowed_tools: parseJson(String(record.allowed_tools ?? "[]"), []),
-              allow_shell: record.allow_shell === 1,
-              enabled: record.enabled === 1,
-            };
-          }),
-        });
+        return json({ agents: listAgents(deps.store) });
       }
 
       const agentMatch = path.match(/^\/api\/agents\/([a-z_]+)$/);
@@ -909,7 +893,9 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
           body.allowed_tools === undefined
             ? null
             : requireStringArray(body, "allowed_tools");
-        if (allowedTools && allowedTools.some((tool) => /^(bash|Bash)$/.test(tool))) {
+        if (body.inherit_tools !== undefined && typeof body.inherit_tools !== "boolean") throw badRequest("inherit_tools must be a boolean");
+        const inheritTools = typeof body.inherit_tools === "boolean" ? Number(body.inherit_tools) : allowedTools !== null ? 0 : null;
+        if (inheritTools !== 1 && allowedTools && allowedTools.some((tool) => /^(bash|Bash)(?:$|\()/.test(tool))) {
           if (!getSetting(deps.store, "security.allow_shell_tools", false)) {
             throw badRequest("Shell tools are disabled globally. Enable them in Settings and require approval first.");
           }
@@ -928,7 +914,8 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
         }
         deps.store.run(
           `UPDATE agent_defs SET harness = COALESCE(?, harness), model = CASE WHEN ? THEN ? ELSE model END,
-             allowed_tools = COALESCE(?, allowed_tools), enabled = COALESCE(?, enabled),
+             allowed_tools = COALESCE(?, allowed_tools), inherit_tools = COALESCE(?, inherit_tools),
+             allow_shell = CASE WHEN ? THEN 0 ELSE allow_shell END, enabled = COALESCE(?, enabled),
              system_instructions = COALESCE(?, system_instructions), max_retries = COALESCE(?, max_retries),
              budget_usd = CASE WHEN ? THEN ? ELSE budget_usd END,
              max_duration_ms = COALESCE(?, max_duration_ms), updated_at = ?
@@ -937,6 +924,8 @@ export function createApi(deps: ApiDeps): (request: Request) => Promise<Response
           body.model !== undefined ? 1 : 0,
           model ?? null,
           allowedTools ? toJson(allowedTools) : null,
+          inheritTools,
+          inheritTools !== null ? 1 : 0,
           enabled,
           systemInstructions,
           retries ?? null,
@@ -1366,7 +1355,7 @@ function validateHarnessConfig(body: Record<string, unknown>, store: Store): Par
   }
   if (body.allowed_tools !== undefined) {
     const tools = requireStringArray(body, "allowed_tools");
-    if (tools.some((tool) => /^(bash|Bash)$/.test(tool)) && !getSetting(store, "security.allow_shell_tools", false)) {
+    if (tools.some((tool) => /^(bash|Bash)(?:$|\()/.test(tool)) && !getSetting(store, "security.allow_shell_tools", false)) {
       throw badRequest("Shell tools are disabled. Enable security.allow_shell_tools with explicit confirmation first.");
     }
     config.allowed_tools = tools;

@@ -142,7 +142,7 @@ Task result shape for agent tasks:
 | `GET` | `/api/findings?audit_id=&status=` | any | Finding list |
 | `GET` | `/api/findings/:id` | any | Finding + candidate + verifications + evidence + sessions |
 | `POST` | `/api/findings/:id/retest` | auditor | Queue a fresh independent retest |
-| `GET` | `/api/evidence/:id` | auditor/admin | Evidence metadata + content |
+| `GET` | `/api/evidence/:id` | auditor/admin | Evidence metadata + content. `409 conflict` when the file does not match its database record |
 
 Findings are only created by Phase 4 from a `CONFIRMED` verification whose
 excerpts were verified by the platform. Reverification history is immutable.

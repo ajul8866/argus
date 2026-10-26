@@ -544,6 +544,47 @@ describe("evidence chain", () => {
     expect(() => store.run("DELETE FROM evidence WHERE id = ?", row.id)).toThrow();
   });
 
+  test("evidence content fails closed when the sidecar does not match the database record", async () => {
+    const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "one", content: "alpha" });
+    expect((await evidence.content(row.id))?.content).toBe("alpha");
+    const parsed = await Bun.file(row.content_path).json() as { content?: string };
+    parsed.content = "alphb";
+    await Bun.write(row.content_path, `${JSON.stringify(parsed, null, 2)}\n`);
+    await expect(evidence.content(row.id)).rejects.toMatchObject({ status: 409, code: "conflict" });
+    const broken = await evidence.verifyChain("a1");
+    expect(broken).toMatchObject({
+      ok: false,
+      broken_at: row.id,
+      reason: "Evidence file content hash does not match the database record",
+    });
+  });
+
+  test("evidence content rejects a symlink that replaces the sidecar", async () => {
+    const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "one", content: "alpha" });
+    const target = join(dir, "replacement.txt");
+    writeFileSync(target, "alpha");
+    rmSync(row.content_path);
+    symlinkSync(target, row.content_path);
+    await expect(evidence.content(row.id)).rejects.toMatchObject({ status: 409, code: "conflict" });
+    expect((await evidence.verifyChain("a1")).ok).toBe(false);
+  });
+
+  test("evidence content preserves structured excerpts for later parsing", async () => {
+    const row = await evidence.append({
+      auditId: "a1",
+      kind: "code_excerpt",
+      title: "src/a:b.js:1-2",
+      content: { path: "src/a:b.js", start_line: 1, end_line: 2, quote: "const secret = 1;" },
+    });
+    const loaded = await evidence.content(row.id);
+    expect(JSON.parse(loaded?.content ?? "")).toMatchObject({
+      path: "src/a:b.js",
+      start_line: 1,
+      end_line: 2,
+      quote: "const secret = 1;",
+    });
+  });
+
   test("evidence verification detects sidecar metadata tampering", async () => {
     const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "original", content: "alpha" });
     const parsed = await Bun.file(row.content_path).json();

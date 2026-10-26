@@ -1,10 +1,10 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Config } from "../config.ts";
 import { KeyedSerialQueue } from "../concurrency.ts";
 import { EVIDENCE_DIR } from "../config.ts";
 import type { Store } from "../db/index.ts";
-import { now, sha256, toJson, uid } from "../util.ts";
+import { AppError, now, sha256, toJson, uid } from "../util.ts";
 import { redactSecrets } from "../security/redact.ts";
 
 export type EvidenceRow = {
@@ -115,16 +115,11 @@ export class EvidenceStore {
   async content(id: string): Promise<{ row: EvidenceRow; content: string } | null> {
     const row = this.store.get<EvidenceRow>("SELECT * FROM evidence WHERE id = ?", id);
     if (!row) return null;
-    const raw = await readFile(row.content_path, "utf8");
-    try {
-      const parsed = JSON.parse(raw) as { content?: unknown };
-      return {
-        row,
-        content: typeof parsed.content === "string" ? parsed.content : JSON.stringify(parsed.content, null, 2),
-      };
-    } catch {
-      return { row, content: raw };
+    const verified = await this.readVerified(row);
+    if (!verified.ok) {
+      throw new AppError(409, "conflict", `Evidence integrity check failed; ${verified.reason}`);
     }
+    return { row, content: verified.text };
   }
 
   listForAudit(auditId: string, limit = 500): EvidenceRow[] {
@@ -163,72 +158,71 @@ export class EvidenceStore {
           reason: "Stored chain metadata does not match the recomputed chain",
         };
       }
-      try {
-        const raw = await readFile(row.content_path, "utf8");
-        const parsed = JSON.parse(raw) as {
-          id?: string;
-          audit_id?: string;
-          task_id?: string | null;
-          agent_session_id?: string | null;
-          finding_id?: string | null;
-          kind?: string;
-          title?: string;
-          created_at?: string;
-          sha256?: string;
-          prev_hash?: string;
-          chain_hash?: string;
-          content?: unknown;
-        };
-        const metadataMatches =
-          parsed.id === row.id &&
-          parsed.audit_id === row.audit_id &&
-          parsed.task_id === row.task_id &&
-          parsed.agent_session_id === row.agent_session_id &&
-          parsed.finding_id === row.finding_id &&
-          parsed.kind === row.kind &&
-          parsed.title === row.title &&
-          parsed.created_at === row.created_at &&
-          parsed.sha256 === row.sha256 &&
-          parsed.prev_hash === row.prev_hash &&
-          parsed.chain_hash === row.chain_hash;
-        if (!metadataMatches) {
-          return {
-            ok: false,
-            count: rows.length,
-            broken_at: row.id,
-            reason: "Evidence file metadata does not match the database record",
-          };
-        }
-        const text =
-          typeof parsed.content === "string" ? parsed.content : `${JSON.stringify(parsed.content, null, 2)}\n`;
-        if (Buffer.byteLength(text) !== row.size) {
-          return {
-            ok: false,
-            count: rows.length,
-            broken_at: row.id,
-            reason: "Evidence content size does not match the database record",
-          };
-        }
-        const recomputed = sha256(text);
-        if (recomputed !== row.sha256) {
-          return {
-            ok: false,
-            count: rows.length,
-            broken_at: row.id,
-            reason: "Evidence file content hash does not match the database record",
-          };
-        }
-      } catch {
+      const verified = await this.readVerified(row);
+      if (!verified.ok) {
         return {
           ok: false,
           count: rows.length,
           broken_at: row.id,
-          reason: "Evidence file is missing or unreadable",
+          reason: verified.reason,
         };
       }
       prev = row.chain_hash;
     }
     return { ok: true, count: rows.length, broken_at: null, reason: null };
+  }
+
+  private async readVerified(row: EvidenceRow): Promise<{ ok: true; text: string } | { ok: false; reason: string }> {
+    try {
+      const info = await lstat(row.content_path);
+      // Reject symlinks before reading so a replaced sidecar cannot redirect the hash check.
+      if (!info.isFile() || info.size > row.size + 1_000_000) {
+        return { ok: false, reason: "Evidence file is missing or unreadable" };
+      }
+      const raw = await readFile(row.content_path, "utf8");
+      const parsed = JSON.parse(raw) as {
+        id?: string;
+        audit_id?: string;
+        task_id?: string | null;
+        agent_session_id?: string | null;
+        finding_id?: string | null;
+        kind?: string;
+        title?: string;
+        created_at?: string;
+        sha256?: string;
+        prev_hash?: string;
+        chain_hash?: string;
+        content?: unknown;
+      };
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return { ok: false, reason: "Evidence file is missing or unreadable" };
+      }
+      const metadataMatches =
+        parsed.id === row.id &&
+        parsed.audit_id === row.audit_id &&
+        parsed.task_id === row.task_id &&
+        parsed.agent_session_id === row.agent_session_id &&
+        parsed.finding_id === row.finding_id &&
+        parsed.kind === row.kind &&
+        parsed.title === row.title &&
+        parsed.created_at === row.created_at &&
+        parsed.sha256 === row.sha256 &&
+        parsed.prev_hash === row.prev_hash &&
+        parsed.chain_hash === row.chain_hash;
+      if (!metadataMatches) {
+        return { ok: false, reason: "Evidence file metadata does not match the database record" };
+      }
+      const text = typeof parsed.content === "string" ? parsed.content : `${JSON.stringify(parsed.content, null, 2)}\n`;
+      if (Buffer.byteLength(text) !== row.size) {
+        return { ok: false, reason: "Evidence content size does not match the database record" };
+      }
+      if (sha256(text) !== row.sha256) {
+        return { ok: false, reason: "Evidence file content hash does not match the database record" };
+      }
+      return { ok: true, text };
+    } catch {
+      return { ok: false, reason: "Evidence file is missing or unreadable" };
+    }
   }
 
   redactedText(text: string): string {

@@ -541,6 +541,42 @@ test("a zero cost ceiling is saved and stops the audit after reported spend", as
   expect(failed?.error).toContain("$0.0000");
 });
 
+test("a retest refuses a tampered code excerpt instead of quoting it", async () => {
+  store.run("UPDATE audits SET status = 'running', started_at = ? WHERE id = ?", now(), auditId);
+  store.run("UPDATE agent_defs SET max_retries = 0 WHERE role = 'retest_auditor'");
+  const timestamp = now();
+  store.run(
+    `INSERT INTO findings (
+      id, code, audit_id, project_id, title, category, severity, status, files, root_cause,
+      preconditions, reproduction, expected, observed, impact, remediation, created_at, updated_at
+    ) VALUES ('f-tamper', 'ARG-901', ?, 'p1', 'Tampered excerpt', 'injection', 'high', 'confirmed', '[]',
+      'cause', '[]', '[]', 'expected', 'observed', 'impact', 'fix', ?, ?)`,
+    auditId, timestamp, timestamp,
+  );
+  const row = await workflowEvidence.append({
+    auditId,
+    findingId: "f-tamper",
+    kind: "code_excerpt",
+    title: "src/lib/db.js:11-11",
+    content: { path: "src/lib/db.js", start_line: 11, end_line: 11, quote: "db.prepare(query).all()" },
+  });
+  const parsed = await Bun.file(row.content_path).json() as { content?: string };
+  parsed.content = "tampered quote that must not reach the retest prompt";
+  await Bun.write(row.content_path, `${JSON.stringify(parsed, null, 2)}\n`);
+
+  const taskId = await engine.requestRetest("f-tamper", "u1");
+  await waitFor(() => store.get<{ status: string }>("SELECT status FROM tasks WHERE id = ?", taskId)?.status === "failed");
+  const task = store.get<{ status: string; error: string | null; agent_session_id: string | null }>(
+    "SELECT status, error, agent_session_id FROM tasks WHERE id = ?",
+    taskId,
+  );
+  expect(task?.status).toBe("failed");
+  expect(task?.error).toContain("Evidence integrity check failed");
+  expect(store.all("SELECT id FROM evidence WHERE task_id = ? AND kind = 'agent_prompt'", taskId)).toHaveLength(0);
+  expect(store.get<{ status: string }>("SELECT status FROM agent_sessions WHERE id = ?", task?.agent_session_id))
+    .toMatchObject({ status: "failed" });
+}, 20_000);
+
 test("invalid audit overrides are rejected before an audit is saved", () => {
   for (const overrides of [
     { max_areas: "invalid" }, { max_concurrent_agents: 1.5 }, { max_confirmations: -1 },

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuthService } from "../src/auth.ts";
@@ -320,6 +320,38 @@ test("report downloads fail closed when the stored bytes no longer match the rec
   expect((await download()).status).toBe(200);
   writeFileSync(report!.path, "tampered report\n");
   const rejected = await download();
+  expect(rejected.status).toBe(409);
+  expect(await rejected.json()).toMatchObject({ error: { code: "conflict" } });
+});
+
+test("evidence reads fail closed when the stored file no longer matches the database record", async () => {
+  const { api, headers, engine, userId } = await projectClient();
+  const timestamp = new Date().toISOString();
+  store.run(
+    `INSERT INTO projects (id, name, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+     VALUES ('evidence-project', 'Evidence', ?, '["**/*"]', '[]', '', '', ?, ?)`,
+    dir, timestamp, timestamp,
+  );
+  store.run(
+    `INSERT INTO repositories (id, project_id, path, languages, frameworks, inventory, graph, file_count, total_bytes, imported_at)
+     VALUES ('evidence-repo', 'evidence-project', ?, '{}', '[]', '{}', '{}', 0, 0, ?)`,
+    dir, timestamp,
+  );
+  const auditId = engine.createAudit({ projectId: "evidence-project", repositoryId: "evidence-repo", userId });
+  const row = await new EvidenceStore(config(dir), store).append({
+    auditId,
+    kind: "agent_prompt",
+    title: "prompt",
+    content: "alpha",
+  });
+  const read = () => api(new Request(`http://localhost/api/evidence/${row.id}`, { headers }));
+  const accepted = await read();
+  expect(accepted.status).toBe(200);
+  expect(await accepted.json()).toMatchObject({ content: "alpha" });
+  const parsed = JSON.parse(readFileSync(row.content_path, "utf8")) as { content?: string };
+  parsed.content = "tampered";
+  writeFileSync(row.content_path, JSON.stringify(parsed));
+  const rejected = await read();
   expect(rejected.status).toBe(409);
   expect(await rejected.json()).toMatchObject({ error: { code: "conflict" } });
 });

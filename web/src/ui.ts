@@ -145,7 +145,7 @@ export function progress(value: number, total: number, label?: string): HTMLElem
   return h(
     "div",
     { class: "progress-wrap" },
-    h("div", { class: "progress-track", role: "progressbar", "aria-valuenow": percent, "aria-valuemin": 0, "aria-valuemax": 100 },
+    h("div", { class: "progress-track", role: "progressbar", "aria-label": label ?? `${value} of ${total}, ${percent}%`, "aria-valuenow": percent, "aria-valuemin": 0, "aria-valuemax": 100 },
       h("div", { class: "progress-fill", style: { "--progress": String(percent / 100) } }),
     ),
     h("div", { class: "progress-label" }, label ?? `${value} of ${total}, ${percent}%`),
@@ -203,7 +203,7 @@ export function loading(label = "Loading"): HTMLElement {
 export function errorState(message: string, retry?: () => void): HTMLElement {
   return h(
     "div",
-    { class: "error-state" },
+    { class: "error-state", role: "alert" },
     h("h3", {}, "Unable to load this view"),
     h("p", {}, message),
     retry ? button("Retry", retry, "secondary") : null,
@@ -270,96 +270,215 @@ export function select(name: string, options: Array<{ value: string; label: stri
   return element;
 }
 
-export function modal(title: string, content: Child, actions: Child, options: { wide?: boolean } = {}): { close: () => void } {
-  const overlay = h("div", { class: "modal-overlay", role: "dialog", "aria-modal": "true", "aria-label": title });
-  const close = () => {
-    overlay.remove();
-    document.removeEventListener("keydown", onKey);
-  };
-  const onKey = (event: KeyboardEvent) => {
-    if (event.key === "Escape") close();
-  };
-  overlay.addEventListener("click", (event) => {
-    if (event.target === overlay) close();
+type FocusTarget = HTMLElement | (() => HTMLElement | null) | "first" | "close";
+type OverlayOptions = { wide?: boolean; initialFocus?: FocusTarget; onClose?: () => void };
+type OverlayEntry = { overlay: HTMLElement; close: () => void; restoreFocus: HTMLElement | null; onClose?: () => void };
+
+const overlayStack: OverlayEntry[] = [];
+let overlaySeq = 0;
+let overlayListenersInstalled = false;
+const FOCUSABLE = 'a[href], area[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), iframe, object, embed, [contenteditable="true"], [tabindex]:not([tabindex="-1"])';
+
+function focusableElements(root: HTMLElement): HTMLElement[] {
+  return [...root.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(
+    (element) => !element.closest("[inert]") && element.getClientRects().length > 0,
+  );
+}
+
+function resolveInitialFocus(overlay: HTMLElement, target: FocusTarget | undefined): HTMLElement | null {
+  if (typeof target === "function") return target();
+  if (target instanceof HTMLElement) return target.isConnected ? target : null;
+  if (target === "close") return overlay.querySelector<HTMLElement>(".modal-head .icon-btn");
+  const items = focusableElements(overlay);
+  return items.find((element) => !element.closest(".modal-head")) ?? items[0] ?? null;
+}
+
+function syncOverlayInert(): void {
+  const app = document.getElementById("app");
+  if (app) app.inert = overlayStack.length > 0;
+  overlayStack.forEach((entry, index) => {
+    entry.overlay.inert = index !== overlayStack.length - 1;
   });
+}
+
+function removeOverlay(entry: OverlayEntry): void {
+  const index = overlayStack.indexOf(entry);
+  if (index === -1) return;
+  overlayStack.splice(index, 1);
+  entry.overlay.remove();
+  syncOverlayInert();
+  const nextTop = overlayStack[overlayStack.length - 1];
+  if (nextTop) {
+    if (entry.restoreFocus?.isConnected && nextTop.overlay.contains(entry.restoreFocus)) {
+      entry.restoreFocus.focus();
+    } else {
+      const target = resolveInitialFocus(nextTop.overlay, "first");
+      (target ?? nextTop.overlay).focus();
+    }
+  } else if (entry.restoreFocus?.isConnected && entry.restoreFocus !== document.body) {
+    entry.restoreFocus.focus();
+  } else {
+    document.getElementById("view")?.focus();
+  }
+  entry.onClose?.();
+  if (overlayStack.length === 0) {
+    window.dispatchEvent(new CustomEvent("argus:overlays-closed"));
+  }
+}
+
+function closeAllOverlays(): void {
+  for (const entry of [...overlayStack].reverse()) entry.close();
+}
+
+export function closeOverlays(): void {
+  closeAllOverlays();
+}
+
+function onOverlayKeydown(event: KeyboardEvent): void {
+  const top = overlayStack[overlayStack.length - 1];
+  if (!top) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    top.close();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const items = focusableElements(top.overlay);
+  if (items.length === 0) {
+    event.preventDefault();
+    top.overlay.focus();
+    return;
+  }
+  const active = document.activeElement;
+  const index = active instanceof HTMLElement ? items.indexOf(active) : -1;
+  if (event.shiftKey) {
+    if (index <= 0) {
+      event.preventDefault();
+      items[items.length - 1]!.focus();
+    }
+  } else if (index === -1 || index === items.length - 1) {
+    event.preventDefault();
+    items[0]!.focus();
+  }
+}
+
+function installOverlayListeners(): void {
+  if (overlayListenersInstalled) return;
+  overlayListenersInstalled = true;
+  document.addEventListener("keydown", onOverlayKeydown, true);
+  window.addEventListener("hashchange", () => closeAllOverlays());
+}
+
+function mountOverlay(
+  overlay: HTMLElement,
+  options: OverlayOptions,
+  restoreFocus: HTMLElement | null,
+): { close: () => void } {
+  overlay.tabIndex = -1;
+  const entry: OverlayEntry = {
+    overlay,
+    restoreFocus,
+    onClose: options.onClose,
+    close: () => removeOverlay(entry),
+  };
+  overlayStack.push(entry);
+  document.body.appendChild(overlay);
+  installOverlayListeners();
+  syncOverlayInert();
+  requestAnimationFrame(() => {
+    if (!overlayStack.includes(entry)) return;
+    const target = resolveInitialFocus(overlay, options.initialFocus ?? "first");
+    (target ?? overlay).focus();
+  });
+  return { close: entry.close };
+}
+
+function overlayTitle(title: string): { id: string; node: HTMLElement } {
+  const id = `overlay-title-${++overlaySeq}`;
+  return { id, node: h("h2", { id }, title) };
+}
+
+export function modal(title: string, content: Child, actions: Child, options: OverlayOptions = {}): { close: () => void } {
+  const restoreFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const heading = overlayTitle(title);
+  const overlay = h("div", { class: "modal-overlay", role: "dialog", "aria-modal": "true", "aria-labelledby": heading.id });
   const panel = h(
     "div",
     { class: `modal ${options.wide ? "modal-wide" : ""}` },
     h("div", { class: "modal-head" },
-      h("h2", {}, title),
-      h("button", { class: "icon-btn", "aria-label": "Close", onclick: close }, "×"),
+      heading.node,
+      h("button", { class: "icon-btn", "aria-label": "Close", onclick: () => instance.close() }, "×"),
     ),
     h("div", { class: "modal-body" }, content),
     actions ? h("div", { class: "modal-actions" }, actions) : null,
   );
   overlay.appendChild(panel);
-  document.body.appendChild(overlay);
-  document.addEventListener("keydown", onKey);
-  return { close };
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) instance.close();
+  });
+  const instance = mountOverlay(overlay, options, restoreFocus);
+  return instance;
 }
 
-export function drawer(title: string, content: Child, actions?: Child): { close: () => void } {
-  const overlay = h("div", { class: "drawer-overlay", role: "dialog", "aria-modal": "true", "aria-label": title });
-  const close = () => {
-    overlay.remove();
-    document.removeEventListener("keydown", onKey);
-  };
-  const onKey = (event: KeyboardEvent) => {
-    if (event.key === "Escape") close();
-  };
-  overlay.addEventListener("click", (event) => {
-    if (event.target === overlay) close();
-  });
+export function drawer(title: string, content: Child, actions?: Child, options: OverlayOptions = {}): { close: () => void } {
+  const restoreFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const heading = overlayTitle(title);
+  const overlay = h("div", { class: "drawer-overlay", role: "dialog", "aria-modal": "true", "aria-labelledby": heading.id });
   overlay.appendChild(
     h(
       "aside",
       { class: "drawer" },
       h("div", { class: "modal-head" },
-        h("h2", {}, title),
-        h("button", { class: "icon-btn", "aria-label": "Close", onclick: close }, "×"),
+        heading.node,
+        h("button", { class: "icon-btn", "aria-label": "Close", onclick: () => instance.close() }, "×"),
       ),
       h("div", { class: "drawer-body" }, content),
       actions ? h("div", { class: "modal-actions" }, actions) : null,
     ),
   );
-  document.body.appendChild(overlay);
-  document.addEventListener("keydown", onKey);
-  return { close };
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) instance.close();
+  });
+  const instance = mountOverlay(overlay, { ...options, initialFocus: options.initialFocus ?? "close" }, restoreFocus);
+  return instance;
 }
 
-let toastTimer: ReturnType<typeof setTimeout> | null = null;
 export function toast(message: string, tone: "success" | "error" | "info" = "info"): void {
   let host = document.getElementById("toast-host");
   if (!host) {
-    host = document.createElement("div");
-    host.id = "toast-host";
-    host.className = "toast-host";
+    host = h("div", { id: "toast-host", class: "toast-host", "aria-live": "polite", "aria-atomic": "true" });
     document.body.appendChild(host);
   }
-  const node = h("div", { class: `toast toast-${tone}` }, message);
+  const node = h("div", { class: `toast toast-${tone}`, role: tone === "error" ? "alert" : "status" }, message);
   host.appendChild(node);
-  if (toastTimer) clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => node.remove(), 4_500);
+  while (host.children.length > 3) host.firstElementChild?.remove();
+  setTimeout(() => node.remove(), tone === "error" ? 8_000 : 4_500);
 }
 
 export function confirmAction(title: string, message: string, confirmLabel: string): Promise<boolean> {
-  return new Promise((resolvePromise) => {
-    const close = () => {
-      instance.close();
-      resolvePromise(false);
-    };
-    const instance = modal(
-      title,
-      h("p", { class: "modal-copy" }, message),
-      h("div", { class: "action-row" },
-        button("Cancel", close, "secondary"),
-        button(confirmLabel, () => {
-          instance.close();
-          resolvePromise(true);
-        }, "danger"),
-      ),
-    );
-  });
+  const { promise, resolve } = Promise.withResolvers<boolean>();
+  let settled = false;
+  let instance: { close: () => void } | null = null;
+  const finish = (value: boolean) => {
+    if (settled) return;
+    settled = true;
+    resolve(value);
+  };
+  const cancelButton = button("Cancel", () => instance?.close(), "secondary");
+  instance = modal(
+    title,
+    h("p", { class: "modal-copy" }, message),
+    h("div", { class: "action-row" },
+      cancelButton,
+      button(confirmLabel, () => {
+        finish(true);
+        instance?.close();
+      }, "danger"),
+    ),
+    { initialFocus: () => cancelButton, onClose: () => finish(false) },
+  );
+  return promise;
 }
 
 export function jsonBlock(value: unknown): HTMLElement {

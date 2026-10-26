@@ -164,7 +164,8 @@ stored through `/api/credentials`, not harness env. `bypassPermissions` and
 
 The audit stream replays missed events after `after`. Heartbeats keep proxies
 alive. The UI treats REST as authoritative and uses SSE only to schedule
-refreshes.
+refreshes. Refreshes are debounced. A refresh that arrives while a dialog
+or drawer is open is applied when that overlay closes.
 
 ## Example
 

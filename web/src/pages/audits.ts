@@ -85,7 +85,7 @@ type Finding = {
   updated_at: string;
 };
 
-type EventRow = { id: number; type: string; payload: Record<string, unknown>; created_at: string; seq: number };
+type EventRow = { id: number; type: string; payload: Record<string, unknown>; createdAt: string; seq: number };
 type Approval = { id: string; action: string; scope: string; status: string; audit_id: string | null; created_at: string };
 
 export async function renderAudits(root: HTMLElement): Promise<void> {
@@ -97,12 +97,17 @@ export async function renderAudits(root: HTMLElement): Promise<void> {
         h("td", {},
           h("a", { class: "table-title", href: `#/audits/${String(audit.id)}` }, String(audit.project_name)),
           h("div", { class: "table-sub mono" }, `${String(audit.id).slice(0, 10)}, ${String(audit.commit_sha ?? "no commit").slice(0, 10)}`),
+          h("div", { class: "phone-only" },
+            statusBadge(String(audit.status)),
+            h("span", { class: "tiny muted" }, `Phase ${String(audit.current_phase)}`),
+            h("span", { class: "tiny muted" }, `${String(audit.finding_count ?? 0)} findings`),
+          ),
         ),
-        h("td", {}, statusBadge(String(audit.status))),
-        h("td", { class: "small" }, `Phase ${String(audit.current_phase)}, ${phaseLabel(Number(audit.current_phase))}`),
-        h("td", { class: "small" }, String(audit.finding_count ?? 0)),
-        h("td", { class: "small" }, String(audit.active_tasks ?? 0)),
-        h("td", { class: "small muted" }, formatDate(String(audit.created_at))),
+        h("td", { class: "col-optional" }, statusBadge(String(audit.status))),
+        h("td", { class: "small col-optional" }, `Phase ${String(audit.current_phase)}, ${phaseLabel(Number(audit.current_phase))}`),
+        h("td", { class: "small col-optional" }, String(audit.finding_count ?? 0)),
+        h("td", { class: "small col-optional" }, String(audit.active_tasks ?? 0)),
+        h("td", { class: "small muted col-optional" }, formatDate(String(audit.created_at))),
         h("td", {}, h("div", { class: "table-actions" }, h("a", { class: "btn btn-sm btn-secondary", href: `#/audits/${String(audit.id)}` }, "Open"))),
       ),
     );
@@ -110,7 +115,7 @@ export async function renderAudits(root: HTMLElement): Promise<void> {
       pageHeader("Audits", "Six-phase autonomous assessments, execution history, and final reports.", button("New audit", () => void openAuditCreate(), "primary")),
       audits.length
         ? section(`${audits.length} audits`, h("div", { class: "table-wrap" }, h("table", {},
-            h("thead", {}, h("tr", {}, h("th", {}, "Project / audit"), h("th", {}, "Status"), h("th", {}, "Phase"), h("th", {}, "Findings"), h("th", {}, "Active"), h("th", {}, "Created"), h("th", {}, ""))),
+            h("thead", {}, h("tr", {}, h("th", {}, "Project / audit"), h("th", { class: "col-optional" }, "Status"), h("th", { class: "col-optional" }, "Phase"), h("th", { class: "col-optional" }, "Findings"), h("th", { class: "col-optional" }, "Active"), h("th", { class: "col-optional" }, "Created"), h("th", {}, ""))),
             h("tbody", {}, ...rows),
           )))
         : emptyState("No audits", "Create a project, import a repository, and start the first six-phase audit.", button("New audit", () => void openAuditCreate(), "primary")),
@@ -120,12 +125,16 @@ export async function renderAudits(root: HTMLElement): Promise<void> {
   }
 }
 
+const AUDIT_TAB_KEYS = ["tasks", "findings", "coverage", "decisions", "evidence", "reports", "activity", "sessions"] as const;
+let pendingTabFocus: string | null = null;
+
 export async function renderAuditDetail(root: HTMLElement, auditId: string, params: URLSearchParams): Promise<void> {
   root.replaceChildren(loading("Loading audit"));
   try {
     const detail = await api<Detail>(`/api/audits/${auditId}`);
     const audit = detail.audit;
-    const activeTab = params.get("tab") ?? "tasks";
+    const requestedTab = params.get("tab") ?? "tasks";
+    const activeTab = (AUDIT_TAB_KEYS as readonly string[]).includes(requestedTab) ? requestedTab : "tasks";
     const [tasksResult, findingsResult, eventsResult, approvalsResult, evidenceResult] = await Promise.all([
       api<{ tasks: Task[] }>(`/api/audits/${auditId}/tasks`),
       api<{ findings: Finding[] }>(`/api/audits/${auditId}/findings`),
@@ -187,14 +196,40 @@ export async function renderAuditDetail(root: HTMLElement, auditId: string, para
       ["activity", "Activity", String(eventsResult.events.length)],
       ["sessions", "Sessions", String(detail.sessions.length)],
     ];
-    const tabBar = h("div", { class: "tabs" }, ...tabs.map(([key, label, count]) =>
+    const tabButtons = tabs.map(([key, label, count]) =>
       h("button", {
+        id: `audit-tab-${key}`,
         class: `tab ${activeTab === key ? "active" : ""}`,
+        type: "button",
+        role: "tab",
+        "aria-selected": activeTab === key ? "true" : "false",
+        "aria-controls": `audit-panel-${key}`,
+        tabindex: activeTab === key ? "0" : "-1",
         onclick: () => {
+          pendingTabFocus = key;
           location.hash = `#/audits/${auditId}?tab=${key}`;
         },
       }, h("span", {}, label), h("span", { class: "tab-count" }, count)),
-    ));
+    );
+    const tabBar = h("div", { class: "tabs", role: "tablist", "aria-label": "Audit record sections" }, ...tabButtons);
+    tabBar.addEventListener("keydown", (event) => {
+      const target = event.target as HTMLElement;
+      if (!target.matches('[role="tab"]')) return;
+      const index = tabButtons.indexOf(target as HTMLButtonElement);
+      if (index === -1) return;
+      let next = index;
+      if (event.key === "ArrowRight") next = (index + 1) % tabButtons.length;
+      else if (event.key === "ArrowLeft") next = (index - 1 + tabButtons.length) % tabButtons.length;
+      else if (event.key === "Home") next = 0;
+      else if (event.key === "End") next = tabButtons.length - 1;
+      else return;
+      event.preventDefault();
+      const nextButton = tabButtons[next];
+      if (!nextButton) return;
+      pendingTabFocus = nextButton.id.replace("audit-tab-", "");
+      nextButton.focus();
+      nextButton.click();
+    });
 
     let tabContent: HTMLElement;
     if (activeTab === "findings") tabContent = findingsTab(findings, () => void renderAuditDetail(root, auditId, params));
@@ -229,7 +264,10 @@ export async function renderAuditDetail(root: HTMLElement, auditId: string, para
               audit.error ? h("div", { class: "callout bad" }, audit.error) : null,
             ),
           ),
-          section("Phase timeline", h("div", { class: "phase-list" }, ...phaseRows)),
+          section("Phase timeline", h("div", { class: "stack" },
+            h("p", { class: "tiny muted", style: { margin: 0 } }, "Summaries are recorded when each phase finishes; current findings, coverage, and failures are shown in their tabs."),
+            h("div", { class: "phase-list" }, ...phaseRows),
+          )),
         ),
         h("div", { class: "stack" },
           section("Run state", h("div", { class: "metric-row" },
@@ -261,8 +299,13 @@ export async function renderAuditDetail(root: HTMLElement, auditId: string, para
             : null,
         ),
       ),
-      h("div", { class: "panel", style: { marginTop: "14px" } }, tabBar, tabContent),
+      h("div", { class: "panel", style: { marginTop: "14px" } }, tabBar,
+        h("div", { role: "tabpanel", id: `audit-panel-${activeTab}`, "aria-labelledby": `audit-tab-${activeTab}`, tabindex: "0" }, tabContent)),
     );
+    if (pendingTabFocus === activeTab) {
+      pendingTabFocus = null;
+      requestAnimationFrame(() => root.querySelector<HTMLElement>(`#audit-tab-${activeTab}`)?.focus());
+    }
   } catch (error) {
     root.replaceChildren(errorState(error instanceof Error ? error.message : "Unable to load audit", () => void renderAuditDetail(root, auditId, params)));
   }
@@ -298,7 +341,7 @@ function tasksTab(tasks: Task[], refresh: () => void): HTMLElement {
           h("td", { class: "col-optional" }, statusBadge(task.status)),
           h("td", { class: "small mono col-optional" }, `${task.attempts}/${task.max_attempts}`),
           h("td", { class: "small muted col-optional" }, task.started_at ? timeAgo(task.started_at) : "—"),
-          h("td", {}, h("div", { class: "table-actions" }, button("Inspect", () => void openTaskDetail(task.id, refresh), "ghost", { class: "btn-sm" }))),
+          h("td", {}, h("div", { class: "table-actions" }, button("Inspect", () => void openTaskDetail(task.id, refresh), "ghost", { class: "btn-sm", "aria-label": `Inspect task ${task.title}` }))),
         ),
       )),
     ),
@@ -319,7 +362,7 @@ function findingsTab(findings: Finding[], refresh: () => void): HTMLElement {
           h("td", {}, severityBadge(finding.severity)),
           h("td", {}, statusBadge(finding.status)),
           h("td", { class: "small mono" }, String(finding.verification_count)),
-          h("td", {}, h("div", { class: "table-actions" }, button("Open", () => void openFindingDetail(finding.id, refresh), "ghost", { class: "btn-sm" }))),
+          h("td", {}, h("div", { class: "table-actions" }, button("Open", () => void openFindingDetail(finding.id, refresh), "ghost", { class: "btn-sm", "aria-label": `Open finding ${finding.code}: ${finding.title}` }))),
         ),
       )),
     ),
@@ -399,14 +442,18 @@ function evidenceTab(evidence: Array<Record<string, unknown>>, chain: Chain): HT
             h("td", { class: "small" }, String(row.kind)),
             h("td", { class: "mono tiny" }, String(row.sha256).slice(0, 20)),
             h("td", { class: "small muted" }, formatDate(String(row.created_at))),
-            h("td", {}, h("div", { class: "table-actions" }, button("View", async () => {
-              try {
-                const result = await api<{ content: string }>(`/api/evidence/${String(row.id)}`);
-                modal(String(row.title), h("pre", { class: "json-block", style: { maxHeight: "60vh" } }, result.content), null, { wide: true });
-              } catch (error) {
-                toast(error instanceof Error ? error.message : "Unable to load evidence", "error");
-              }
-            }, "ghost", { class: "btn-sm" }))),
+            h("td", {}, h("div", { class: "table-actions" },
+              session.user && ["admin", "auditor"].includes(session.user.role)
+                ? button("View", async () => {
+                    try {
+                      const result = await api<{ content: string }>(`/api/evidence/${String(row.id)}`);
+                      modal(String(row.title), h("pre", { class: "json-block", style: { maxHeight: "60vh" } }, result.content), null, { wide: true });
+                    } catch (error) {
+                      toast(error instanceof Error ? error.message : "Unable to load evidence", "error");
+                    }
+                  }, "ghost", { class: "btn-sm", "aria-label": `View evidence ${String(row.title)}` })
+                : h("span", { class: "tiny muted" }, "Auditor role required"),
+            )),
           ),
         )),
       ),
@@ -443,8 +490,8 @@ function reportsTab(reports: Report[], auditId: string, refresh: () => void): HT
               h("td", { class: "small muted" }, formatDate(report.generated_at)),
               h("td", { class: "mono tiny" }, report.sha256?.slice(0, 18) ?? "—"),
               h("td", {}, h("div", { class: "table-actions" },
-                report.status === "generated" && report.format !== "pdf" ? button("Preview", () => void previewReport(report.id, report.format, "Audit report"), "ghost", { class: "btn-sm" }) : null,
-                report.status === "generated" ? h("a", { class: "btn btn-sm btn-secondary", href: `/api/reports/${report.id}/download` }, "Download") : null,
+                report.status === "generated" && report.format !== "pdf" ? button("Preview", () => void previewReport(report.id, report.format, "Audit report"), "ghost", { class: "btn-sm", "aria-label": `Preview ${report.format} report` }) : null,
+                report.status === "generated" ? h("a", { class: "btn btn-sm btn-secondary", href: `/api/reports/${report.id}/download`, "aria-label": `Download ${report.format} report` }, "Download") : null,
               )),
             ),
           )),
@@ -454,13 +501,19 @@ function reportsTab(reports: Report[], auditId: string, refresh: () => void): HT
 
 function activityTab(events: EventRow[]): HTMLElement {
   if (events.length === 0) return emptyState("No activity", "Runtime events stream in as soon as the audit runs.");
-  return h("div", { class: "event-feed", style: { maxHeight: "620px" } }, ...events.slice(-300).reverse().map((event) =>
-    h("div", { class: "event-row" },
-      h("span", { class: "event-time" }, new Date(event.created_at).toLocaleTimeString()),
-      h("span", { class: "event-type" }, event.type),
-      h("span", { class: "event-detail" }, Object.entries(event.payload).slice(0, 4).map(([key, value]) => `${key}: ${typeof value === "object" ? JSON.stringify(value) : String(value)}`).join(", ")),
-    ),
-  ));
+  const shown = events.slice(-300).reverse();
+  return h("div", { class: "stack" },
+    events.length > shown.length
+      ? h("div", { class: "tiny muted" }, `Showing the last ${shown.length} of ${events.length} events.`)
+      : null,
+    h("div", { class: "event-feed", tabindex: "0", role: "region", "aria-label": "Audit activity", style: { maxHeight: "620px" } }, ...shown.map((event) =>
+      h("div", { class: "event-row" },
+        h("span", { class: "event-time" }, new Date(event.createdAt).toLocaleTimeString()),
+        h("span", { class: "event-type" }, event.type),
+        h("span", { class: "event-detail" }, Object.entries(event.payload).slice(0, 4).map(([key, value]) => `${key}: ${typeof value === "object" ? JSON.stringify(value) : String(value)}`).join(", ")),
+      ),
+    )),
+  );
 }
 
 function sessionsTab(sessions: Session[]): HTMLElement {

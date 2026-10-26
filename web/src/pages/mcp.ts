@@ -68,7 +68,7 @@ export async function renderMcp(root: HTMLElement, params: URLSearchParams): Pro
       table.replaceChildren(h("table", { class: "local-mcp-table" },
         h("thead", {}, h("tr", {}, ...["Server", "Transport", "Availability", "Tool calls"].map((label) => h("th", {}, label)))),
         h("tbody", {}, ...matches.map((server) => h("tr", { class: server.id === selected ? "local-selected-row" : "" },
-          h("td", {}, button(server.name, () => void select(server), "ghost", { class: "local-server-button", "aria-pressed": server.id === selected }),
+          h("td", {}, button(server.name, () => void select(server), "ghost", { class: "local-server-button", "aria-pressed": server.id === selected ? "true" : "false" }),
             h("div", { class: "tiny muted local-endpoint" }, server.endpoint)),
           h("td", {}, badge(server.transport)), h("td", {}, localStatus(server)),
           h("td", { class: "mono" }, String(server.stats.total_calls)),

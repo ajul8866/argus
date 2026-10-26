@@ -1,5 +1,5 @@
-import { chmod, copyFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { chmod, copyFile, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { dirname, join, relative } from "node:path";
 import { AppError, createScopeMatcher, matchesScope, normalizePath, safeJoin } from "../util.ts";
 import type { Scope } from "../util.ts";
 import type { Inventory } from "./inventory.ts";
@@ -42,6 +42,8 @@ export async function createWorkspace(
   );
 }
 
+const OUT_OF_SCOPE = "File is outside the authorized project scope";
+
 export async function readScopedFile(
   root: string,
   relativePath: string,
@@ -49,21 +51,44 @@ export async function readScopedFile(
   maxBytes = 512_000,
 ): Promise<{ path: string; content: string; size: number; truncated: boolean; binary: boolean }> {
   const normalized = normalizePath(relativePath);
-  if (!matchesScope(normalized, scope)) {
-    throw new AppError(403, "out_of_scope", "File is outside the authorized project scope");
+  if (normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized)) {
+    throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
   }
-  const target = safeJoin(root, normalized);
-  const stats = await stat(target);
+  const segments = normalized.split("/").filter((segment) => segment.length > 0 && segment !== ".");
+  if (segments.includes("..")) {
+    throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
+  }
+  const canonical = segments.join("/");
+  if (!canonical || !matchesScope(canonical, scope)) {
+    throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
+  }
+
+  const absoluteRoot = await realpath(root);
+  const target = safeJoin(absoluteRoot, canonical);
+  const resolved = await realpath(target);
+  const resolvedRelative = normalizePath(relative(absoluteRoot, resolved));
+  if (
+    !resolvedRelative ||
+    resolvedRelative === ".." ||
+    resolvedRelative.startsWith("../") ||
+    resolvedRelative.startsWith("/") ||
+    /^[A-Za-z]:\//.test(resolvedRelative) ||
+    !matchesScope(resolvedRelative, scope)
+  ) {
+    throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
+  }
+
+  const stats = await stat(resolved);
   if (!stats.isFile()) throw new AppError(400, "not_a_file", "Path is not a regular file");
   if (stats.size > maxBytes) {
-    const handle = Bun.file(target);
+    const handle = Bun.file(resolved);
     const text = await handle.slice(0, maxBytes).text();
-    return { path: normalized, content: text, size: stats.size, truncated: true, binary: false };
+    return { path: canonical, content: text, size: stats.size, truncated: true, binary: false };
   }
-  const buffer = Buffer.from(await readFile(target));
+  const buffer = Buffer.from(await readFile(resolved));
   const binary = buffer.includes(0);
   return {
-    path: normalized,
+    path: canonical,
     content: binary ? "" : buffer.toString("utf8"),
     size: stats.size,
     truncated: false,

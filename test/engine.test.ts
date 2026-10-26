@@ -609,6 +609,34 @@ test("provider diagnostics are redacted before they are returned as session erro
   expect(session.metadata).not.toContain("must-not-be-returned");
 });
 
+test("a committed confirmation still persists its finding after that task exhausts retries", async () => {
+  store.run("UPDATE agent_defs SET max_retries = 0 WHERE role = 'independent_validator'");
+  const append = workflowEvidence.append.bind(workflowEvidence);
+  workflowEvidence.append = async (input) => {
+    if (input.kind === "verification_result") throw new Error("Injected verification evidence failure");
+    return append(input);
+  };
+
+  await engine.startAudit(auditId, "u1");
+  const deadline = Date.now() + 45_000;
+  let audit = store.get<{ status: string }>("SELECT status FROM audits WHERE id = ?", auditId);
+  while (audit && !["completed", "completed_with_errors", "failed", "cancelled"].includes(audit.status) && Date.now() < deadline) {
+    await Bun.sleep(50);
+    audit = store.get<{ status: string }>("SELECT status FROM audits WHERE id = ?", auditId);
+  }
+
+  expect(store.all(
+    "SELECT id FROM tasks WHERE audit_id = ? AND kind = 'phase3.confirm' AND status = 'failed'",
+    auditId,
+  ).length).toBeGreaterThan(0);
+  expect(store.all(
+    "SELECT id FROM tasks WHERE audit_id = ? AND kind = 'phase4.persist' AND status = 'queued'",
+    auditId,
+  )).toHaveLength(0);
+  expect(store.all("SELECT id FROM findings WHERE audit_id = ?", auditId)).toHaveLength(2);
+  expect(audit?.status).toBe("completed_with_errors");
+}, 60_000);
+
 test("a persistence retry repairs evidence for a finding created by the failed attempt", async () => {
   const append = workflowEvidence.append.bind(workflowEvidence);
   let failed = false;

@@ -1,7 +1,9 @@
 import "./styles.css";
 import { api, clearCsrf, connectEvents, disconnectEvents, loadSession, session } from "./api.ts";
+import { shouldRefreshOnReturn } from "./refresh-policy.ts";
 import {
   button,
+  closeOverlays,
   h,
   input,
   loading,
@@ -59,6 +61,9 @@ let currentParams = new URLSearchParams();
 let renderToken = 0;
 let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 let liveConnected = false;
+const mobileNav = window.matchMedia("(max-width: 900px)");
+let navListenersInstalled = false;
+let loggingOut = false;
 
 function parseRoute(): { route: string; id: string | null; params: URLSearchParams } {
   const raw = location.hash.replace(/^#\/?/, "");
@@ -75,6 +80,34 @@ function routeLabel(route: string): string {
     NAV_GROUPS.flatMap((group) => group.items).find((item) => item.route === route)?.label ??
     (route === "dashboard" ? "Overview" : route)
   );
+}
+
+function setNavOpen(open: boolean, moveFocus = false): void {
+  const next = mobileNav.matches && open;
+  document.body.classList.toggle("nav-open", next);
+  const toggle = document.getElementById("nav-toggle") as HTMLButtonElement | null;
+  toggle?.setAttribute("aria-expanded", String(next));
+  toggle?.setAttribute("aria-label", next ? "Close navigation" : "Open navigation");
+  const sidebar = document.getElementById("sidebar");
+  if (sidebar) sidebar.inert = mobileNav.matches && !next;
+  if (moveFocus) {
+    if (next) sidebar?.querySelector<HTMLElement>(".nav a")?.focus();
+    else toggle?.focus();
+  }
+}
+
+function installNavListeners(): void {
+  if (navListenersInstalled) return;
+  navListenersInstalled = true;
+  mobileNav.addEventListener("change", () => {
+    setNavOpen(mobileNav.matches ? document.body.classList.contains("nav-open") : false);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && document.body.classList.contains("nav-open")) {
+      event.preventDefault();
+      setNavOpen(false, true);
+    }
+  });
 }
 
 function shell(): void {
@@ -100,7 +133,7 @@ function shell(): void {
     ),
     h("nav", { "aria-label": "Main navigation" }, ...nav),
     h("div", { class: "sidebar-foot" },
-      h("div", { class: "live-indicator", id: "live-indicator" },
+      h("div", { class: "live-indicator", id: "live-indicator", role: "status", "aria-live": "polite", "aria-atomic": "true" },
         h("span", { id: "live-label" }, liveConnected ? "Live" : "Offline"),
       ),
       h("div", { class: "user-chip" },
@@ -119,10 +152,14 @@ function shell(): void {
       h("div", { class: "topbar-left" },
         h("button", {
           class: "btn btn-ghost btn-sm mobile-toggle",
+          id: "nav-toggle",
           type: "button",
-          onclick: () => document.body.classList.toggle("nav-open"),
+          "aria-expanded": "false",
+          "aria-controls": "sidebar",
+          "aria-label": "Open navigation",
+          onclick: () => setNavOpen(!document.body.classList.contains("nav-open"), true),
         }, "Menu"),
-        h("div", { class: "breadcrumbs" },
+        h("nav", { class: "breadcrumbs", "aria-label": "Breadcrumb" },
           h("a", { href: "#/dashboard" }, "Argus"),
           h("span", { class: "sep" }, "/"),
           h("span", { id: "breadcrumb-label" }, routeLabel(currentRoute)),
@@ -133,18 +170,35 @@ function shell(): void {
         button("New audit", () => void openAuditCreate(), "secondary", { class: "btn-sm" }),
       ),
     ),
-    h("div", { id: "view" }),
+    h("div", { id: "view", tabindex: "-1" }),
   );
 
-  app.replaceChildren(h("div", { class: "shell" }, sidebar, main));
-  document.body.classList.remove("nav-open");
+  const skipLink = h("a", {
+    class: "skip-link",
+    href: "#view",
+    onclick: (event: Event) => {
+      event.preventDefault();
+      document.getElementById("view")?.focus();
+    },
+  }, "Skip to content");
+  const navBackdrop = h("div", {
+    class: "nav-backdrop",
+    "aria-hidden": "true",
+    onclick: () => setNavOpen(false, true),
+  });
+  app.replaceChildren(skipLink, h("div", { class: "shell" }, sidebar, main), navBackdrop);
+  installNavListeners();
+  setNavOpen(false);
   updateLiveIndicator();
   syncNav();
 }
 
 function syncNav(): void {
   for (const link of document.querySelectorAll<HTMLAnchorElement>(".nav a[data-route]")) {
-    link.classList.toggle("active", link.dataset.route === currentRoute);
+    const active = link.dataset.route === currentRoute;
+    link.classList.toggle("active", active);
+    if (active) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
   }
   const label = document.getElementById("breadcrumb-label");
   if (label) label.textContent = routeLabel(currentRoute);
@@ -164,53 +218,57 @@ async function renderRoute(): Promise<void> {
   const token = ++renderToken;
   const view = document.getElementById("view");
   if (!view) return;
+  const target = document.createElement("div");
+  target.style.display = "contents";
+  view.replaceChildren(target);
+  setNavOpen(false);
   syncNav();
   document.title = `${routeLabel(parsed.route)} | Argus`;
   try {
     switch (parsed.route) {
       case "dashboard":
-        await renderDashboard(view);
+        await renderDashboard(target);
         break;
       case "projects":
-        if (parsed.id) await renderProjectDetail(view, parsed.id);
-        else await renderProjects(view);
+        if (parsed.id) await renderProjectDetail(target, parsed.id);
+        else await renderProjects(target);
         break;
       case "audits":
-        if (parsed.id) await renderAuditDetail(view, parsed.id, parsed.params);
-        else await renderAudits(view);
+        if (parsed.id) await renderAuditDetail(target, parsed.id, parsed.params);
+        else await renderAudits(target);
         break;
       case "explorer":
-        await renderExplorer(view, parsed.params);
+        await renderExplorer(target, parsed.params);
         break;
       case "harnesses":
-        await renderHarnesses(view);
+        await renderHarnesses(target);
         break;
       case "agents":
-        await renderAgents(view);
+        await renderAgents(target);
         break;
       case "skills":
-        await renderSkills(view, parsed.params);
+        await renderSkills(target, parsed.params);
         break;
       case "mcp":
-        await renderMcp(view, parsed.params);
+        await renderMcp(target, parsed.params);
         break;
       case "tasks":
-        await renderTasks(view, parsed.params);
+        await renderTasks(target, parsed.params);
         break;
       case "findings":
-        await renderFindings(view, parsed.params);
+        await renderFindings(target, parsed.params);
         break;
       case "reports":
-        await renderReports(view, parsed.params);
+        await renderReports(target, parsed.params);
         break;
       case "settings":
-        await renderSettings(view);
+        await renderSettings(target);
         break;
       case "approvals":
-        await renderApprovals(view);
+        await renderApprovals(target);
         break;
       default:
-        view.replaceChildren(
+        target.replaceChildren(
           h("div", { class: "empty-state" },
             h("div", { class: "empty-mark" }, "?"),
             h("h3", {}, "Page not found"),
@@ -219,9 +277,15 @@ async function renderRoute(): Promise<void> {
           ),
         );
     }
-    if (token !== renderToken) return;
+    if (token !== renderToken) {
+      target.remove();
+      return;
+    }
   } catch (error) {
-    if (token !== renderToken) return;
+    if (token !== renderToken) {
+      target.remove();
+      return;
+    }
     view.replaceChildren(
       h("div", { class: "error-state" },
         h("h3", {}, "Dashboard error"),
@@ -230,24 +294,38 @@ async function renderRoute(): Promise<void> {
       ),
     );
   }
-  document.body.classList.remove("nav-open");
+  setNavOpen(false);
+}
+
+function hasOpenOverlay(): boolean {
+  return Boolean(document.querySelector(".modal-overlay, .drawer-overlay"));
 }
 
 function scheduleRefresh(): void {
-  const route = currentRoute;
-  if (!["dashboard", "projects", "audits", "tasks", "findings", "reports", "approvals"].includes(route)) return;
+  if (!shouldRefreshOnReturn(currentRoute, hasOpenOverlay())) return;
   if (refreshTimer) clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => {
-    if (document.visibilityState === "visible") void renderRoute();
+    if (document.visibilityState === "visible" && shouldRefreshOnReturn(currentRoute, hasOpenOverlay())) {
+      void renderRoute();
+    }
   }, 1_100);
 }
 
 function loginView(errorMessage?: string): void {
+  closeOverlays();
+  setNavOpen(false);
   disconnectEvents();
-  const email = input("email", { type: "email", placeholder: "admin@argus.local", autocomplete: "username" });
-  const password = input("password", { type: "password", placeholder: "Password", autocomplete: "current-password" });
-  const errorBox = h("div", { class: "login-error hidden" }, errorMessage ?? "");
-  if (errorMessage) errorBox.classList.remove("hidden");
+  const email = input("email", { type: "email", placeholder: "admin@argus.local", autocomplete: "username", required: true });
+  const password = input("password", { type: "password", placeholder: "Password", autocomplete: "current-password", required: true });
+  const errorBox = h("div", { class: "login-error hidden", id: "login-error", role: "alert", tabindex: "-1" }, errorMessage ?? "");
+  email.setAttribute("aria-describedby", "login-error");
+  password.setAttribute("aria-describedby", "login-error");
+  if (errorMessage) {
+    errorBox.classList.remove("hidden");
+    requestAnimationFrame(() => errorBox.focus());
+  } else {
+    requestAnimationFrame(() => email.focus());
+  }
   const submit = h("button", { class: "btn btn-primary", type: "submit", style: { width: "100%" } }, "Sign in");
   const form = h("form", {
     class: "login-form",
@@ -266,6 +344,7 @@ function loginView(errorMessage?: string): void {
       } catch (error) {
         errorBox.textContent = error instanceof Error ? error.message : "Sign-in failed";
         errorBox.classList.remove("hidden");
+        errorBox.focus();
       } finally {
         submit.removeAttribute("disabled");
       }
@@ -309,6 +388,7 @@ async function enterApp(): Promise<void> {
     loginView();
     return;
   }
+  loggingOut = false;
   shell();
   connectEvents((event) => {
     const type = String(event.type ?? "");
@@ -319,18 +399,22 @@ async function enterApp(): Promise<void> {
 }
 
 async function logout(): Promise<void> {
+  loggingOut = true;
+  clearTimeout(refreshTimer ?? undefined);
+  renderToken++;
+  disconnectEvents();
   try {
     await api("/api/auth/logout", { method: "POST", body: {} });
   } catch {
     // session may already be invalid
   }
-  disconnectEvents();
   session.user = null;
   clearCsrf();
   loginView();
 }
 
 window.addEventListener("hashchange", () => {
+  setNavOpen(false);
   if (session.user) void renderRoute();
   else loginView();
 });
@@ -341,17 +425,20 @@ window.addEventListener("argus:live", (event) => {
 });
 
 window.addEventListener("argus:unauthorized", () => {
+  if (loggingOut) return;
   loginView("Your session expired. Sign in again.");
 });
 
 window.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && session.user) void renderRoute();
+  if (document.visibilityState === "visible" && session.user && shouldRefreshOnReturn(currentRoute, hasOpenOverlay())) {
+    void renderRoute();
+  }
 });
 
 document.addEventListener("click", (event) => {
   const target = event.target as HTMLElement;
   if (document.body.classList.contains("nav-open") && !target.closest("#sidebar") && !target.closest(".mobile-toggle")) {
-    document.body.classList.remove("nav-open");
+    setNavOpen(false);
   }
 });
 

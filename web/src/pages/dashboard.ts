@@ -127,7 +127,7 @@ export async function renderDashboard(root: HTMLElement): Promise<void> {
     const events = overview.recent_events.length
       ? h(
           "div",
-          { class: "event-feed" },
+          { class: "event-feed", tabindex: "0", role: "region", "aria-label": "Recent audit activity" },
           ...overview.recent_events.slice(0, 14).map((event) =>
             h(
               "div",

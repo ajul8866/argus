@@ -28,6 +28,17 @@ const listeners = new Set<(event: Record<string, unknown>) => void>();
 let source: EventSource | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
+function readApiError(payload: Record<string, unknown> | string): { code?: string; message?: string; details?: unknown } | undefined {
+  if (typeof payload !== "object" || payload === null || !("error" in payload)) return undefined;
+  const error = payload.error;
+  if (typeof error !== "object" || error === null) return undefined;
+  const result: { code?: string; message?: string; details?: unknown } = {};
+  if ("code" in error && typeof error.code === "string") result.code = error.code;
+  if ("message" in error && typeof error.message === "string") result.message = error.message;
+  if ("details" in error) result.details = error.details;
+  return result;
+}
+
 export async function api<T>(
   path: string,
   options: { method?: string; body?: unknown; raw?: boolean } = {},
@@ -48,11 +59,12 @@ export async function api<T>(
     ? ((await response.json()) as Record<string, unknown>)
     : await response.text();
   if (!response.ok) {
-    if (response.status === 401) {
+    const error = readApiError(payload);
+    const authProbe = path === "/api/auth/login" || path === "/api/auth/me" || path === "/api/auth/logout";
+    if (response.status === 401 && !authProbe) {
       session.user = null;
       window.dispatchEvent(new CustomEvent("argus:unauthorized"));
     }
-    const error = (payload as { error?: { code?: string; message?: string; details?: unknown } }).error;
     throw new ApiError(
       response.status,
       error?.code ?? "request_failed",

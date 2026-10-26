@@ -70,6 +70,36 @@ type RepoDetail = {
 
 type Coverage = { area_id: string; title: string; status: string; files: string[]; notes: string | null };
 
+export function classifyExplorerPath(
+  filePaths: ReadonlySet<string>,
+  currentPath: string,
+): { isFile: boolean; isDirectory: boolean; directory: string } {
+  const isFile = filePaths.has(currentPath);
+  let isDirectory = false;
+  if (currentPath && !isFile) {
+    for (const path of filePaths) {
+      if (path.startsWith(`${currentPath}/`)) {
+        isDirectory = true;
+        break;
+      }
+    }
+  }
+  const directory = isFile
+    ? (currentPath.includes("/") ? currentPath.slice(0, currentPath.lastIndexOf("/")) : "")
+    : isDirectory
+      ? currentPath
+      : "";
+  return { isFile, isDirectory, directory };
+}
+
+const EXPLORER_TAB_KEYS = ["source", "architecture", "coverage"] as const;
+const EXPLORER_TAB_LABELS: Record<(typeof EXPLORER_TAB_KEYS)[number], string> = {
+  source: "Source",
+  architecture: "Architecture",
+  coverage: "Coverage",
+};
+let pendingExplorerTabFocus: string | null = null;
+
 export async function renderExplorer(root: HTMLElement, params: URLSearchParams): Promise<void> {
   root.replaceChildren(loading("Loading repositories"));
   try {
@@ -85,9 +115,21 @@ export async function renderExplorer(root: HTMLElement, params: URLSearchParams)
     if (!repositories.some((repository) => repository.id === selected)) selected = repositories[0]!.id;
     const repositoryDetail = await api<RepoDetail>(`/api/repositories/${selected}`);
     const repo = repositoryDetail.repository;
-    let activeTab = params.get("tab") ?? "source";
-    let currentPath = params.get("path") ?? "";
+    const requestedTab = params.get("tab") ?? "source";
+    const activeTab = (EXPLORER_TAB_KEYS as readonly string[]).includes(requestedTab) ? requestedTab : "source";
+    const currentPath = params.get("path") ?? "";
     let currentFile: { path: string; content: string; size: number; truncated: boolean; binary: boolean; lines: number } | null = null;
+    const filePaths = new Set(repo.inventory.files.map((entry) => entry.path));
+    const pathInfo = classifyExplorerPath(filePaths, currentPath);
+    if (activeTab === "source" && pathInfo.isFile) {
+      try {
+        currentFile = await api(`/api/repositories/${selected}/file?path=${encodeURIComponent(currentPath)}`);
+      } catch (error) {
+        toast(error instanceof Error ? error.message : "Unable to load file", "error");
+      }
+    } else if (activeTab === "source" && currentPath && !pathInfo.isDirectory) {
+      toast("Path is not in the repository snapshot.", "error");
+    }
     let coverage: Coverage[] = [];
     let coverageLoaded = false;
 
@@ -99,17 +141,10 @@ export async function renderExplorer(root: HTMLElement, params: URLSearchParams)
       })),
       selected,
     );
+    repositorySelect.setAttribute("aria-label", "Repository snapshot");
     repositorySelect.addEventListener("change", () => {
       location.hash = `#/explorer?repo=${repositorySelect.value}`;
     });
-
-    if (currentPath) {
-      try {
-        currentFile = await api(`/api/repositories/${selected}/file?path=${encodeURIComponent(currentPath)}`);
-      } catch (error) {
-        toast(error instanceof Error ? error.message : "Unable to load file", "error");
-      }
-    }
 
     async function loadCoverage(): Promise<Coverage[]> {
       if (coverageLoaded) return coverage;
@@ -137,16 +172,40 @@ export async function renderExplorer(root: HTMLElement, params: URLSearchParams)
       ),
     );
 
-    const tabs = h("div", { class: "tabs" },
-      ...[["source", "Source"], ["architecture", "Architecture"], ["coverage", "Coverage"]].map(([key, label]) =>
-        h("button", {
-          class: `tab ${activeTab === key ? "active" : ""}`,
-          onclick: () => {
-            location.hash = `#/explorer?repo=${selected}&tab=${key}${currentPath ? `&path=${encodeURIComponent(currentPath)}` : ""}`;
-          },
-        }, label!),
-      ),
+    const tabButtons = EXPLORER_TAB_KEYS.map((key) =>
+      h("button", {
+        id: `explorer-tab-${key}`,
+        class: `tab ${activeTab === key ? "active" : ""}`,
+        type: "button",
+        role: "tab",
+        "aria-selected": activeTab === key ? "true" : "false",
+        "aria-controls": `explorer-panel-${key}`,
+        tabindex: activeTab === key ? "0" : "-1",
+        onclick: () => {
+          pendingExplorerTabFocus = key;
+          location.hash = `#/explorer?repo=${selected}&tab=${key}${currentPath ? `&path=${encodeURIComponent(currentPath)}` : ""}`;
+        },
+      }, EXPLORER_TAB_LABELS[key]),
     );
+    const tabs = h("div", { class: "tabs", role: "tablist", "aria-label": "Explorer sections" }, ...tabButtons);
+    tabs.addEventListener("keydown", (event) => {
+      const target = event.target as HTMLElement;
+      if (!target.matches('[role="tab"]')) return;
+      const index = tabButtons.indexOf(target as HTMLButtonElement);
+      if (index === -1) return;
+      let next = index;
+      if (event.key === "ArrowRight") next = (index + 1) % tabButtons.length;
+      else if (event.key === "ArrowLeft") next = (index - 1 + tabButtons.length) % tabButtons.length;
+      else if (event.key === "Home") next = 0;
+      else if (event.key === "End") next = tabButtons.length - 1;
+      else return;
+      event.preventDefault();
+      const nextButton = tabButtons[next];
+      if (!nextButton) return;
+      pendingExplorerTabFocus = nextButton.id.replace("explorer-tab-", "");
+      nextButton.focus();
+      nextButton.click();
+    });
 
     let content: HTMLElement;
     if (activeTab === "architecture") {
@@ -155,12 +214,17 @@ export async function renderExplorer(root: HTMLElement, params: URLSearchParams)
       content = h("div", { class: "stack" }, h("div", { class: "loading-state" }, h("span", { class: "spinner" }), "Loading coverage"));
       void loadCoverage().then((rows) => content.replaceChildren(coverageTab(rows)));
     } else {
-      content = sourceTab(repo, currentPath, currentFile, (path) => {
+      content = sourceTab(repo, pathInfo.directory, currentPath, currentFile, (path) => {
         location.hash = `#/explorer?repo=${selected}&tab=source&path=${encodeURIComponent(path)}`;
       });
     }
 
-    root.replaceChildren(header, h("div", { class: "panel" }, tabs, content));
+    root.replaceChildren(header, h("div", { class: "panel" }, tabs,
+      h("div", { role: "tabpanel", id: `explorer-panel-${activeTab}`, "aria-labelledby": `explorer-tab-${activeTab}`, tabindex: "0" }, content)));
+    if (pendingExplorerTabFocus === activeTab) {
+      pendingExplorerTabFocus = null;
+      requestAnimationFrame(() => root.querySelector<HTMLElement>(`#explorer-tab-${activeTab}`)?.focus());
+    }
   } catch (error) {
     root.replaceChildren(errorState(error instanceof Error ? error.message : "Unable to load explorer", () => void renderExplorer(root, params)));
   }
@@ -168,12 +232,24 @@ export async function renderExplorer(root: HTMLElement, params: URLSearchParams)
 
 function sourceTab(
   repo: RepoDetail["repository"],
+  currentDir: string,
   currentPath: string,
   file: { path: string; content: string; size: number; truncated: boolean; binary: boolean; lines: number } | null,
   onSelect: (path: string) => void,
 ): HTMLElement {
   const files = repo.inventory.files;
   const search = input("search", { placeholder: "Filter files…" });
+  const crumbs = currentDir.split("/").filter(Boolean);
+  const breadcrumb = h("div", { class: "row", style: { gap: "2px", flexWrap: "wrap", alignItems: "center" } },
+    h("button", { class: "btn btn-ghost btn-sm", type: "button", onclick: () => onSelect("") }, "root"),
+    ...crumbs.map((crumb, index) => {
+      const path = crumbs.slice(0, index + 1).join("/");
+      return h("span", { class: "row", style: { gap: "2px", alignItems: "center" } },
+        h("span", { class: "tiny muted" }, "/"),
+        h("button", { class: "btn btn-ghost btn-sm", type: "button", onclick: () => onSelect(path) }, crumb),
+      );
+    }),
+  );
   const treeHost = h("div", { class: "stack", style: { maxHeight: "620px", overflowY: "auto" } });
   const renderTree = (filter: string) => {
     if (filter.trim()) {
@@ -182,6 +258,7 @@ function sourceTab(
         ...matches.map((entry) =>
           h("button", {
             class: `tree-file ${entry.path === currentPath ? "active" : ""}`,
+            type: "button",
             onclick: () => onSelect(entry.path),
           },
             h("span", { class: "truncate" }, entry.path),
@@ -191,7 +268,7 @@ function sourceTab(
       );
       return;
     }
-    const prefix = currentPath ? currentPath.split("/").slice(0, -1).join("/") : "";
+    const prefix = currentDir;
     const entries = new Map<string, { path: string; type: "file" | "directory"; lines?: number }>();
     for (const entry of files) {
       if (prefix && !entry.path.startsWith(`${prefix}/`)) continue;
@@ -206,15 +283,16 @@ function sourceTab(
     treeHost.replaceChildren();
     fill(treeHost, [
       prefix
-        ? h("button", { class: "tree-file", onclick: () => onSelect(prefix.split("/").slice(0, -1).join("/")) }, "↑ Parent directory")
+        ? h("button", { class: "tree-file", type: "button", onclick: () => onSelect(prefix.split("/").slice(0, -1).join("/")) }, "↑ Parent directory")
         : null,
       ...list.slice(0, 200).map((entry) =>
         h("button", {
-          class: `tree-file ${entry.path === currentPath ? "active" : ""}`,
+          class: `tree-file ${entry.type === "file" && entry.path === currentPath ? "active" : ""}`,
+          type: "button",
           onclick: () => onSelect(entry.path),
         },
           h("span", { class: "truncate" }, entry.path.split("/").pop()),
-          entry.type === "file" ? h("span", { class: "tiny muted nowrap" }, `${entry.lines} L`) : null,
+          h("span", { class: "tiny muted nowrap" }, entry.type === "file" ? `${entry.lines} L` : "folder"),
         ),
       ),
     ]);
@@ -233,12 +311,15 @@ function sourceTab(
         : emptyState("Empty file", "The file has no text content.")
     : h("div", { class: "explorer-placeholder" },
         h("div", { class: "empty-mark" }, "⌘"),
-        h("h3", {}, "Select a file"),
-        h("p", {}, "Browse the isolated snapshot that agent sessions inspect. File contents are read directly from the authorized repository within the imported scope."),
+        h("h2", {}, "Select a file"),
+        h("p", {}, currentDir
+          ? `Select a file in ${currentDir}.`
+          : "Browse the isolated snapshot that agent sessions inspect. File contents are read directly from the authorized repository within the imported scope."),
       );
 
   return h("div", { class: "explorer-grid" },
     h("aside", { class: "explorer-tree" },
+      breadcrumb,
       search,
       h("div", { class: "tiny muted" }, `${repo.inventory.files.length} files, ${(repo.total_bytes / 1024).toFixed(1)} KiB`),
       treeHost,

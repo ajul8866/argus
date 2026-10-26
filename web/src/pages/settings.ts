@@ -60,16 +60,21 @@ export async function renderSettings(root: HTMLElement): Promise<void> {
 
     const settingRows = SETTING_DEFS.map((definition) => {
       const value = settings[definition.key];
+      const labelId = `setting-${definition.key.replace(/[^a-z0-9]+/gi, "-")}-label`;
+      const descriptionId = `${labelId}-description`;
       let control: HTMLElement;
       if (definition.type === "boolean") {
         const toggle = h("button", {
           class: `toggle ${value === true ? "on" : ""}`,
           type: "button",
-          "aria-pressed": value === true,
+          role: "switch",
+          "aria-checked": value === true ? "true" : "false",
+          "aria-labelledby": labelId,
+          "aria-describedby": descriptionId,
           onclick: () => {
             const next = !toggle.classList.contains("on");
             toggle.classList.toggle("on", next);
-            toggle.setAttribute("aria-pressed", String(next));
+            toggle.setAttribute("aria-checked", String(next));
           },
         });
         controls.set(definition.key, toggle);
@@ -97,8 +102,12 @@ export async function renderSettings(root: HTMLElement): Promise<void> {
         controls.set(definition.key, element);
         control = element;
       }
+      if (control instanceof HTMLInputElement || control instanceof HTMLSelectElement) {
+        control.setAttribute("aria-labelledby", labelId);
+        control.setAttribute("aria-describedby", descriptionId);
+      }
       return h("div", { class: "setting-row" },
-        h("div", {}, h("div", { class: "setting-name" }, definition.label), h("div", { class: "setting-desc" }, definition.description)),
+        h("div", {}, h("div", { id: labelId, class: "setting-name" }, definition.label), h("div", { id: descriptionId, class: "setting-desc" }, definition.description)),
         h("div", { class: "setting-control" }, control),
       );
     });
@@ -111,33 +120,57 @@ export async function renderSettings(root: HTMLElement): Promise<void> {
       }
     }
 
+    const setBooleanControl = (key: string, on: boolean) => {
+      const control = controls.get(key);
+      if (!(control instanceof HTMLButtonElement)) return;
+      control.classList.toggle("on", on);
+      control.setAttribute("aria-checked", String(on));
+    };
+    const resetDangerousToggles = () => {
+      setBooleanControl("security.allow_shell_tools", settings["security.allow_shell_tools"] === true);
+      setBooleanControl("security.allow_writable_workspace", settings["security.allow_writable_workspace"] === true);
+    };
+
     const saveSettings = async () => {
-      const updates: Record<string, unknown> = {};
-      for (const definition of SETTING_DEFS) {
-        const control = controls.get(definition.key);
-        if (!control) continue;
-        if (definition.type === "boolean") {
-          updates[definition.key] = control.classList.contains("on");
-        } else if (definition.type === "number") {
-          updates[definition.key] = Number((control as HTMLInputElement).value);
-        } else if (definition.type === "nullable-text") {
-          updates[definition.key] = (control as HTMLInputElement).value.trim() || null;
-        } else {
-          updates[definition.key] = (control as HTMLInputElement).value;
-        }
-      }
-      if (updates["security.allow_shell_tools"] === true) {
-        if (!(await confirmAction("Enable shell tools?", "This permits agents assigned shell tools to request command execution. Each task still requires explicit administrator approval, but the risk surface expands.", "Enable shell tools"))) return;
-      }
-      if (updates["security.allow_writable_workspace"] === true) {
-        if (!(await confirmAction("Enable writable workspaces?", "This lets an audit request a writable workspace copy for agents, so approved tasks can create scratch files and run PoCs inside the disposable copy. The imported snapshot and evidence quotes stay read-only, but each task still needs its own approval and the risk surface expands.", "Enable writable workspaces"))) return;
-      }
+      const saveButton = root.querySelector<HTMLButtonElement>("[data-save-settings]");
+      if (saveButton?.disabled) return;
+      if (saveButton) saveButton.disabled = true;
       try {
+        const updates: Record<string, unknown> = {};
+        for (const definition of SETTING_DEFS) {
+          const control = controls.get(definition.key);
+          if (!control) continue;
+          if (definition.type === "boolean") {
+            updates[definition.key] = control.classList.contains("on");
+          } else if (definition.type === "number") {
+            updates[definition.key] = Number((control as HTMLInputElement).value);
+          } else if (definition.type === "nullable-text") {
+            updates[definition.key] = (control as HTMLInputElement).value.trim() || null;
+          } else {
+            updates[definition.key] = (control as HTMLInputElement).value;
+          }
+        }
+        if (updates["security.allow_shell_tools"] === true) {
+          if (!(await confirmAction("Enable shell tools?", "This permits agents assigned shell tools to request command execution. Each task still requires explicit administrator approval, but the risk surface expands.", "Enable shell tools"))) {
+            resetDangerousToggles();
+            queueMicrotask(() => saveButton?.focus());
+            return;
+          }
+        }
+        if (updates["security.allow_writable_workspace"] === true) {
+          if (!(await confirmAction("Enable writable workspaces?", "This lets an audit request a writable workspace copy for agents, so approved tasks can create scratch files and run PoCs inside the disposable copy. The imported snapshot and evidence quotes stay read-only, but each task still needs its own approval and the risk surface expands.", "Enable writable workspaces"))) {
+            resetDangerousToggles();
+            queueMicrotask(() => saveButton?.focus());
+            return;
+          }
+        }
         await api("/api/settings", { method: "PUT", body: { settings: updates, confirm_shell: updates["security.allow_shell_tools"] === true, confirm_writable_workspace: updates["security.allow_writable_workspace"] === true } });
         toast("Runtime settings saved.", "success");
         await renderSettings(root);
       } catch (error) {
         toast(error instanceof Error ? error.message : "Unable to save settings", "error");
+      } finally {
+        if (saveButton) saveButton.disabled = false;
       }
     };
 
@@ -146,7 +179,7 @@ export async function renderSettings(root: HTMLElement): Promise<void> {
       h("div", { class: "grid grid-main" },
         h("div", { class: "stack" },
           section("Execution policy", isAdmin
-            ? h("div", {}, ...settingRows, h("div", { class: "form-actions" }, button("Save runtime settings", () => void saveSettings(), "primary")))
+            ? h("div", {}, ...settingRows, h("div", { class: "form-actions" }, button("Save runtime settings", () => void saveSettings(), "primary", { "data-save-settings": "" })))
             : h("div", { class: "callout warn" }, "Only administrators can modify runtime policy. Current values are shown for transparency.")),
           isAdmin ? credentialsSection(settingsResponse, root) : null,
           isAdmin ? usersSection(users, root) : null,
@@ -174,8 +207,9 @@ export async function renderSettings(root: HTMLElement): Promise<void> {
 }
 
 function accountSection(root: HTMLElement): HTMLElement {
-  const currentPassword = input("current_password", { type: "password", autocomplete: "current-password" });
-  const newPassword = input("new_password", { type: "password", autocomplete: "new-password" });
+  const currentPassword = input("current_password", { type: "password", autocomplete: "current-password", required: true });
+  const newPassword = input("new_password", { type: "password", autocomplete: "new-password", required: true });
+  newPassword.minLength = 12;
   return h("form", {
     class: "stack",
     onsubmit: async (event: Event) => {
@@ -199,9 +233,9 @@ function accountSection(root: HTMLElement): HTMLElement {
 }
 
 function credentialsSection(settings: SettingsResponse, root: HTMLElement): HTMLElement {
-  const provider = input("provider", { placeholder: "magpie / anthropic / global" });
-  const envVar = input("env_var", { placeholder: "MCODE_PROVIDER_API_KEY" });
-  const value = input("value", { type: "password", placeholder: "write-only secret" });
+  const provider = input("provider", { placeholder: "magpie / anthropic / global", required: true });
+  const envVar = input("env_var", { placeholder: "MCODE_PROVIDER_API_KEY", required: true });
+  const value = input("value", { type: "password", placeholder: "write-only secret", required: true });
   const form = h("form", {
     class: "form",
     onsubmit: async (event: Event) => {
@@ -354,7 +388,7 @@ function openUserCreate(root: HTMLElement): void {
 
 function auditLogSection(entries: AuditLog[]): HTMLElement {
   return section("Security audit log", entries.length
-    ? h("div", { class: "table-wrap", style: { maxHeight: "420px" } }, h("table", { class: "small-table" },
+    ? h("div", { class: "table-wrap", tabindex: "0", role: "region", "aria-label": "Security audit log", style: { maxHeight: "420px" } }, h("table", { class: "small-table" },
         h("thead", {}, h("tr", {}, h("th", {}, "Time"), h("th", { class: "col-optional" }, "Actor"), h("th", {}, "Action"), h("th", { class: "col-optional" }, "Target"), h("th", { class: "col-optional" }, "IP"))),
         h("tbody", {}, ...entries.slice(0, 100).map((entry) =>
           h("tr", {},

@@ -75,7 +75,7 @@ export async function renderTasks(root: HTMLElement, params: URLSearchParams): P
         h("td", { class: "col-optional" }, statusBadge(task.status)),
         h("td", { class: "small mono col-optional" }, `${task.attempts}/${task.max_attempts}`),
         h("td", { class: "small muted col-optional" }, task.started_at ? timeAgo(task.started_at) : "—"),
-        h("td", {}, h("div", { class: "table-actions" }, button("Inspect", () => void openTaskDetail(task.id, () => void renderTasks(root, params)), "ghost", { class: "btn-sm" }))),
+        h("td", {}, h("div", { class: "table-actions" }, button("Inspect", () => void openTaskDetail(task.id, () => void renderTasks(root, params)), "ghost", { class: "btn-sm", "aria-label": `Inspect task ${task.title}` }))),
       ),
     );
 

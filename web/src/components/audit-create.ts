@@ -38,11 +38,12 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
     defaultProjectId ?? projects[0]!.id,
   );
   const repositorySelect = select("repository_id", []);
-  const repositoryHint = h("span", { class: "field-hint" }, "Loading repositories…");
-  const maxAreas = input("max_areas", { type: "number", value: "3", min: 1, max: 8 });
-  const maxCandidates = input("max_candidates_per_area", { type: "number", value: "3", min: 1, max: 8 });
-  const maxConfirmations = input("max_confirmations", { type: "number", value: "6", min: 0, max: 30 });
-  const maxConcurrent = input("max_concurrent_agents", { type: "number", value: "3", min: 1, max: 12 });
+  const repositoryHint = h("span", { class: "field-hint", id: "repository-hint" }, "Loading repositories…");
+  repositorySelect.setAttribute("aria-describedby", "repository-hint");
+  const maxAreas = input("max_areas", { type: "number", value: "3", min: 1, max: 8, required: true });
+  const maxCandidates = input("max_candidates_per_area", { type: "number", value: "3", min: 1, max: 8, required: true });
+  const maxConfirmations = input("max_confirmations", { type: "number", value: "6", min: 0, max: 30, required: true });
+  const maxConcurrent = input("max_concurrent_agents", { type: "number", value: "3", min: 1, max: 12, required: true });
   const maxCost = input("max_cost_usd", { type: "number", min: 0, step: 0.5, placeholder: "optional" });
   const distinctHarness = h("input", { type: "checkbox", name: "distinct_harness", checked: true }) as HTMLInputElement;
   const startNow = h("input", { type: "checkbox", name: "start_now", checked: true }) as HTMLInputElement;
@@ -51,7 +52,7 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
     name: "writable_workspace",
     disabled: !writablePolicy,
   }) as HTMLInputElement;
-  const errorBox = h("div", { class: "login-error hidden" });
+  const errorBox = h("div", { class: "login-error hidden", role: "alert", tabindex: "-1" });
 
   async function loadRepositories(): Promise<void> {
     repositorySelect.replaceChildren();
@@ -89,6 +90,7 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
         if (repositories.length === 0) {
           errorBox.textContent = "Import a repository before creating an audit.";
           errorBox.classList.remove("hidden");
+          errorBox.focus();
           return;
         }
         const submit = event.currentTarget as HTMLFormElement;
@@ -120,6 +122,7 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
         } catch (error) {
           errorBox.textContent = error instanceof Error ? error.message : "Unable to create audit";
           errorBox.classList.remove("hidden");
+          errorBox.focus();
         } finally {
           if (submitButton) submitButton.disabled = false;
         }
@@ -169,8 +172,8 @@ export async function openProjectCreate(): Promise<void> {
   }, ".git/**,node_modules/**,vendor/**,dist/**,build/**,**/*.min.js,**/*.map");
   const authorizedBy = input("authorized_by", { placeholder: "Security owner / engagement lead", required: true });
   const authorizationRef = input("authorization_ref", { placeholder: "Written authorization ID or ticket", required: true });
-  const maxAgents = input("max_concurrent_agents", { type: "number", value: "3", min: 1, max: 12 });
-  const errorBox = h("div", { class: "login-error hidden" });
+  const maxAgents = input("max_concurrent_agents", { type: "number", value: "3", min: 1, max: 12, required: true });
+  const errorBox = h("div", { class: "login-error hidden", role: "alert", tabindex: "-1" });
 
   const parseGlobs = (value: string): string[] =>
     value
@@ -205,6 +208,7 @@ export async function openProjectCreate(): Promise<void> {
         } catch (error) {
           errorBox.textContent = error instanceof Error ? error.message : "Unable to create project";
           errorBox.classList.remove("hidden");
+          errorBox.focus();
         }
       },
     },

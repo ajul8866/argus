@@ -158,7 +158,7 @@ export async function openFindingDetail(findingId: string, onChange?: () => void
                         } catch (error) {
                           toast(error instanceof Error ? error.message : "Unable to load evidence", "error");
                         }
-                      }, "ghost", { class: "btn-sm" })
+                      }, "ghost", { class: "btn-sm", "aria-label": `View content for ${evidence.title}` })
                     : null,
                 ),
               ),

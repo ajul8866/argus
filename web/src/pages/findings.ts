@@ -59,7 +59,7 @@ export async function renderFindings(root: HTMLElement, params: URLSearchParams)
         h("td", { class: "col-optional" }, statusBadge(finding.status)),
         h("td", { class: "small col-optional" }, String(finding.retest_decision ?? finding.verification_decision ?? "pending").replaceAll("_", " ").toLowerCase()),
         h("td", { class: "small muted col-optional" }, formatDate(finding.updated_at)),
-        h("td", {}, h("a", { class: "btn btn-sm btn-secondary", href: `#/audits/${finding.audit_id}?tab=findings` }, "Audit")),
+        h("td", {}, h("a", { class: "btn btn-sm btn-secondary", href: `#/audits/${finding.audit_id}?tab=findings`, "aria-label": `Open audit for ${finding.code}: ${finding.title}` }, "Audit")),
       ),
     );
 
@@ -83,6 +83,7 @@ export async function renderFindings(root: HTMLElement, params: URLSearchParams)
           h("span", { class: "tiny muted" }, "Audit"),
           h("select", {
             class: "input select",
+            "aria-label": "Filter findings by audit",
             style: { width: "260px" },
             onchange: (event: Event) => {
               const value = (event.target as HTMLSelectElement).value;

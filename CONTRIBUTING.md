@@ -49,6 +49,10 @@ and MCP with an installed Chrome binary. For Pi's native MCP adapter,
 provider request. See [the demo guide](docs/DEMO.md) before running the paid,
 real-harness end-to-end workflow.
 
+`bun run test:ui-overlay` builds the committed overlay fixture and runs it in
+Chrome, checking nested confirmation focus, Escape layering, backdrop
+dismissal, hash cleanup, and the Tab trap. It needs an installed Chrome binary.
+
 ## Useful places to start
 
 - Improve installation on different Linux distributions, macOS, and WSL2.

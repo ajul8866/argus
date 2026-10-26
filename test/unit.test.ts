@@ -581,6 +581,19 @@ describe("evidence chain", () => {
     expect((await evidence.verifyChain("a1")).ok).toBe(false);
   });
 
+  test("evidence content rejects a named pipe without waiting for a writer", async () => {
+    const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "one", content: "alpha" });
+    rmSync(row.content_path);
+    const made = Bun.spawnSync(["mkfifo", row.content_path]);
+    expect(made.exitCode).toBe(0);
+    await expect(evidence.content(row.id)).rejects.toMatchObject({ status: 409, code: "conflict" });
+    expect(await evidence.verifyChain("a1")).toMatchObject({
+      ok: false,
+      broken_at: row.id,
+      reason: "Evidence file is missing or unreadable",
+    });
+  });
+
   test("evidence content accepts a JSON-escaped sidecar larger than the recorded text plus one megabyte", async () => {
     const content = "\u0001".repeat(210_000);
     const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "controls", content });

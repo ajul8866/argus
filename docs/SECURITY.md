@@ -164,7 +164,8 @@ absence of vulnerabilities. Human review is required.
 - `GET /api/evidence/:id`, retest prompts, and report excerpts re-read the sidecar
   only when it is a regular file whose metadata, byte length, and content hash
   match the database record. A mismatch fails closed instead of returning or
-  quoting the file. The sidecar is JSON, so the file may be larger than the
+  quoting the file. The open does not follow a symlink and does not wait when
+  the path is a pipe. The sidecar is JSON, so the file may be larger than the
   recorded content; the reader allows for that escaping and rejects anything
   larger. Report downloads recompute the stored SHA-256 of the report file.
 - Database-level protection assumes the attacker does not have write access to

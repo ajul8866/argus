@@ -201,10 +201,18 @@ export class EvidenceStore {
   private async readVerified(row: EvidenceRow): Promise<{ ok: true; text: string } | { ok: false; reason: string }> {
     const limit = this.maxSidecarBytes(row);
     let handle: Awaited<ReturnType<typeof open>> | undefined;
+    // Both flags are required for the open below to fail closed. A missing
+    // flag is `undefined`, and `number | undefined` becomes `number | 0`.
+    const noFollow = constants.O_NOFOLLOW;
+    const nonBlock = constants.O_NONBLOCK;
+    if (typeof noFollow !== "number" || typeof nonBlock !== "number" || noFollow === 0 || nonBlock === 0) {
+      return { ok: false, reason: "Evidence file is missing or unreadable" };
+    }
     try {
-      // O_NOFOLLOW binds the size check and the read to one inode. A symlink
-      // swapped in for the sidecar cannot redirect the hash check.
-      handle = await open(row.content_path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      // O_NOFOLLOW binds the size check and the read to one inode. O_NONBLOCK
+      // makes a replaced pipe return immediately; opening it for read would
+      // otherwise wait until another process connects a writer.
+      handle = await open(row.content_path, constants.O_RDONLY | noFollow | nonBlock);
       const info = await handle.stat();
       if (!info.isFile()) return { ok: false, reason: "Evidence file is missing or unreadable" };
       if (info.size > limit) return { ok: false, reason: "Evidence file is larger than the recorded content" };

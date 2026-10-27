@@ -25,7 +25,7 @@ import { redactObject, redactSecrets } from "../security/redact.ts";
 import { evaluateEvidence } from "./evidence-gate.ts";
 import { validateAuditOverrides } from "./options.ts";
 import { TargetService, type AuditScopeSnapshot } from "../dynamic/targets.ts";
-import { GraphStore } from "../dynamic/graph.ts";
+import { GraphStore, type Coverage, type ExplorationNode } from "../dynamic/graph.ts";
 import type { Inventory } from "../repo/inventory.ts";
 import { inventoryForAgent, inventorySummary } from "../repo/inventory.ts";
 import {
@@ -64,6 +64,7 @@ type AuditRow = {
   mode: "static" | "dynamic" | "hybrid";
   stop_reason: string | null;
   exploration_status: "not_applicable" | "open" | "closing" | "closed" | null;
+  exploration_cost_usd: number;
   created_by: string | null;
   created_at: string;
   started_at: string | null;
@@ -251,6 +252,23 @@ export type IntentDecision = {
   rejected: Array<{ index: number; reason: string }>;
 };
 
+export type DynamicPlannerContext = {
+  auditId: string;
+  snapshot: AuditScopeSnapshot;
+  coverage: Coverage[];
+  frontier: ExplorationNode[];
+};
+
+export type DynamicExecutionResult = {
+  costUsd: number;
+  facts: Array<{ status: number; assetIds: string[]; summary?: string }>;
+};
+
+export type DynamicExecutor = {
+  plan(context: DynamicPlannerContext): Promise<IntentInput[]>;
+  execute(auditId: string, intent: IntentInput & { nodeId: string }): Promise<DynamicExecutionResult>;
+};
+
 export class AuditEngine {
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
@@ -273,6 +291,11 @@ export class AuditEngine {
 
   private readonly targets: TargetService;
   private readonly graph: GraphStore;
+  private dynamicExecutor: DynamicExecutor | null = null;
+
+  setDynamicExecutor(executor: DynamicExecutor | null): void {
+    this.dynamicExecutor = executor;
+  }
 
   start(): void {
     this.recoverAfterRestart();
@@ -848,6 +871,98 @@ export class AuditEngine {
     });
     await this.reconcile(auditId);
     this.schedule(auditId);
+  }
+
+  async runExplorationStep(auditId: string): Promise<void> {
+    const audit = this.store.get<AuditRow>("SELECT * FROM audits WHERE id = ?", auditId);
+    if (!audit || audit.status !== "running" || audit.mode === "static") return;
+    if (audit.exploration_status !== "open") return;
+    const snapshotRow = this.targets.getSnapshot(auditId);
+    if (!snapshotRow) return;
+    const snapshot = snapshotRow.snapshot;
+
+    if (Date.parse(snapshot.authorization.valid_until) <= Date.now()) {
+      this.store.run(
+        "UPDATE audits SET exploration_status = 'closed', stop_reason = 'authorization_expired' WHERE id = ?",
+        auditId,
+      );
+      this.events.append({ auditId, type: "exploration.stopped", payload: { reason: "authorization_expired" } });
+      await this.reconcile(auditId);
+      return;
+    }
+    if (Number(audit.exploration_cost_usd) >= snapshot.budget.exploration_cap_usd) {
+      this.store.run(
+        "UPDATE audits SET exploration_status = 'closed', stop_reason = 'exploration_budget' WHERE id = ?",
+        auditId,
+      );
+      this.events.append({ auditId, type: "exploration.stopped", payload: { reason: "exploration_budget" } });
+      await this.reconcile(auditId);
+      return;
+    }
+    if (!this.dynamicExecutor) return;
+
+    let approved = this.approvedIntents(auditId);
+    if (approved.length === 0) {
+      const proposed = await this.dynamicExecutor.plan({
+        auditId,
+        snapshot,
+        coverage: this.graph.coverage(auditId),
+        frontier: this.graph.listFrontier(auditId),
+      });
+      if (proposed.length > 0) this.acceptIntents(auditId, proposed);
+      approved = this.approvedIntents(auditId);
+    }
+
+    for (const node of approved.slice(0, 4)) {
+      const payload = parseJson<Record<string, unknown>>(node.payload, {});
+      const intent: IntentInput & { nodeId: string } = {
+        nodeId: node.id,
+        title: String(payload.title ?? ""),
+        assetIds: Array.isArray(payload.assetIds) ? payload.assetIds.map(String) : [],
+        method: String(payload.method ?? "GET"),
+        path: String(payload.path ?? "/"),
+        rationale: typeof payload.rationale === "string" ? payload.rationale : undefined,
+        category: typeof payload.category === "string" ? payload.category : undefined,
+      };
+      this.graph.updateNodeStatus(node.id, "running");
+      const result = await this.dynamicExecutor.execute(auditId, intent);
+      this.store.run(
+        "UPDATE audits SET exploration_cost_usd = exploration_cost_usd + ? WHERE id = ?",
+        Number(result.costUsd) || 0,
+        auditId,
+      );
+      const factNode = this.graph.createNode({
+        auditId,
+        kind: "fact",
+        status: "completed",
+        payload: { summaries: result.facts.map((fact) => fact.summary ?? `status ${fact.status}`) },
+      });
+      this.graph.linkNodes(node.id, factNode.id, "yields");
+      for (const fact of result.facts) {
+        for (const assetId of fact.assetIds) this.graph.anchor(factNode.id, assetId);
+      }
+      this.graph.updateNodeStatus(node.id, "completed");
+    }
+
+    const updated = this.store.get<AuditRow>("SELECT * FROM audits WHERE id = ?", auditId);
+    if (updated && Number(updated.exploration_cost_usd) >= snapshot.budget.exploration_cap_usd) {
+      this.store.run(
+        "UPDATE audits SET exploration_status = 'closed', stop_reason = 'exploration_budget' WHERE id = ?",
+        auditId,
+      );
+      this.events.append({ auditId, type: "exploration.stopped", payload: { reason: "exploration_budget" } });
+      await this.reconcile(auditId);
+    }
+  }
+
+  private approvedIntents(auditId: string): Array<{ id: string; payload: string }> {
+    return this.store.all<{ id: string; payload: string }>(
+      `SELECT n.id, n.payload FROM exploration_nodes n
+       WHERE n.audit_id = ? AND n.kind = 'intent' AND n.status = 'approved'
+         AND NOT EXISTS (SELECT 1 FROM exploration_edges e WHERE e.from_node_id = n.id AND e.kind = 'yields')
+       ORDER BY n.created_at LIMIT 16`,
+      auditId,
+    );
   }
 
   async cancelAudit(auditId: string, userId: string | null): Promise<void> {

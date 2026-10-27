@@ -1420,4 +1420,108 @@ describe("audit modes", () => {
         ?.exploration_status,
     ).toBe("closed");
   });
+
+  test("the exploration loop plans, executes, and advances coverage", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget();
+    targets.createIdentity({ targetId: target.id, label: "User A", role: "user_a", authKind: "none" });
+    const id = engine.createAudit({
+      projectId: "p2",
+      userId: "u1",
+      mode: "dynamic",
+      targetId: target.id,
+      overrides: { max_cost_usd: 10 },
+    });
+    await engine.startAudit(id, "u1");
+    const graph = new GraphStore(store);
+    const asset = graph.upsertAsset({ projectId: "p2", kind: "endpoint", assetKey: "GET /invoices/:id" });
+    let plans = 0;
+    let executes = 0;
+    engine.setDynamicExecutor({
+      async plan() {
+        plans += 1;
+        return [
+          {
+            title: "read invoice",
+            assetIds: [asset.id],
+            method: "GET",
+            path: "/invoices/123",
+            rationale: "check ownership",
+          },
+        ];
+      },
+      async execute() {
+        executes += 1;
+        return { costUsd: 0.1, facts: [{ status: 200, assetIds: [asset.id] }] };
+      },
+    });
+
+    await engine.runExplorationStep(id);
+
+    expect(plans).toBe(1);
+    expect(executes).toBe(1);
+    expect(
+      store.get<{ status: string }>(
+        "SELECT status FROM exploration_nodes WHERE audit_id = ? AND kind = 'intent'",
+        id,
+      )?.status,
+    ).toBe("completed");
+    expect(graph.coverage(id).find((entry) => entry.assetId === asset.id)?.tested).toBe(true);
+
+    await engine.runExplorationStep(id);
+    expect(executes).toBe(1);
+  });
+
+  test("the exploration cap closes exploration", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget();
+    targets.createIdentity({ targetId: target.id, label: "User A", role: "user_a", authKind: "none" });
+    const id = engine.createAudit({
+      projectId: "p2",
+      userId: "u1",
+      mode: "dynamic",
+      targetId: target.id,
+      overrides: { max_cost_usd: 0.1 },
+    });
+    await engine.startAudit(id, "u1");
+    const graph = new GraphStore(store);
+    const asset = graph.upsertAsset({ projectId: "p2", kind: "endpoint", assetKey: "GET /invoices/:id" });
+    engine.setDynamicExecutor({
+      async plan() {
+        return [{ title: "read", assetIds: [asset.id], method: "GET", path: "/invoices/1" }];
+      },
+      async execute() {
+        return { costUsd: 0.1, facts: [{ status: 200, assetIds: [asset.id] }] };
+      },
+    });
+
+    await engine.runExplorationStep(id);
+
+    expect(
+      store.get<{ exploration_status: string; stop_reason: string }>(
+        "SELECT exploration_status, stop_reason FROM audits WHERE id = ?",
+        id,
+      ),
+    ).toMatchObject({ exploration_status: "closed", stop_reason: "exploration_budget" });
+  });
+
+  test("an expired authorization stops exploration", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget("2026-10-28T00:00:00.000Z");
+    targets.createIdentity({ targetId: target.id, label: "User A", role: "user_a", authKind: "none" });
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+    await engine.startAudit(id, "u1");
+    try {
+      setSystemTime(new Date("2026-11-01T00:00:00.000Z"));
+      await engine.runExplorationStep(id);
+      expect(
+        store.get<{ exploration_status: string; stop_reason: string }>(
+          "SELECT exploration_status, stop_reason FROM audits WHERE id = ?",
+          id,
+        ),
+      ).toMatchObject({ exploration_status: "closed", stop_reason: "authorization_expired" });
+    } finally {
+      setSystemTime();
+    }
+  });
 });

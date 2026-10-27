@@ -622,4 +622,11 @@ CREATE TABLE retests (
 CREATE INDEX idx_retests_finding ON retests(finding_id, created_at);
 `,
   },
+  {
+    version: 10,
+    name: "audit_exploration_cost",
+    sql: `
+ALTER TABLE audits ADD COLUMN exploration_cost_usd REAL NOT NULL DEFAULT 0;
+`,
+  },
 ];

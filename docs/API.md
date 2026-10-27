@@ -38,7 +38,7 @@ change the throttle bucket.
 | `GET` | `/api/projects/:id` | any | Project + snapshots + audits |
 | `PUT` | `/api/projects/:id` | auditor | Update metadata/scope/status |
 | `DELETE` | `/api/projects/:id` | admin | Delete only if no audits |
-| `POST` | `/api/projects/:id/import` | auditor | Import current worktree or `{ref}`. A ref import rejects Git metadata that points outside the selected work tree, including a different common directory, does not run Git filter commands, and does not apply system or global attribute files |
+| `POST` | `/api/projects/:id/import` | auditor | Import current worktree or `{ref}`. A ref import rejects Git metadata that points outside the selected work tree, including a different common directory, does not run Git filter commands, does not apply system or global attribute files, and does not expand `export-subst` placeholders |
 | `GET` | `/api/repository-folders?path=&search=&offset=` | auditor | Browse existing host folders, with Git markers and pages of 100 |
 | `GET` | `/api/repositories` | any | All snapshots |
 | `GET` | `/api/repositories/:id` | any | Snapshot + inventory + architecture map |

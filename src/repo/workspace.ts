@@ -668,6 +668,27 @@ async function readAlternateLines(objects: OpenedFile): Promise<Buffer[]> {
 // re-encode a byte path as UTF-8. Git's resolver follows the symlink first and
 // keeps the raw bytes, so those routines authorize a different directory from
 // the one `git archive` reads. Walk the bytes the way Git does.
+//
+// `/proc/self` and `/dev/fd` belong to the process that calls `lstat`. This
+// check runs in the server. The git child sees its own binary at
+// `/proc/self/exe` and the git directory at fd 3. Authorizing the server's
+// resolution would accept a different directory from the one git reads.
+function isProcessLocalGitPath(candidate: Buffer): boolean {
+  for (const prefix of ["/proc", "/dev/fd"]) {
+    const marker = Buffer.from(prefix);
+    if (candidate.equals(marker)) return true;
+    const next = candidate[marker.length];
+    if (
+      candidate.length > marker.length &&
+      candidate.subarray(0, marker.length).equals(marker) &&
+      next === 0x2f
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function splitGitComponents(path: Buffer): Buffer[] {
   const parts: Buffer[] = [];
   let start = 0;
@@ -705,6 +726,7 @@ function resolveGitPath(path: Buffer): Buffer {
       continue;
     }
     const candidate = gitPathBuffer([...resolved, part]);
+    if (isProcessLocalGitPath(candidate)) throw gitObjectsError();
     let info;
     try {
       info = lstatSync(candidate);

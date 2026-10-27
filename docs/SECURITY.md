@@ -52,7 +52,9 @@ LLM agents. Use it only on repositories you are authorized to assess.
   that object store, with no path separator. An alternate object directory is
   resolved the way Git resolves it, including a raw byte in a symlink name, and
   that directory, its symlinks, and its nested alternates must stay inside an
-  allowed location. When the source is a subdirectory of a repository, the
+  allowed location. A path that enters `/proc` or `/dev/fd` is rejected: those
+  locations describe the checking process, not the git process that reads the
+  object store. When the source is a subdirectory of a repository, the
   archive contains only that subdirectory.
 
 ## Execution isolation

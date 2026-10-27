@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { stat } from "node:fs/promises";
+import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Config } from "../src/config.ts";
@@ -8,7 +8,9 @@ import { loadConfig, PHASE_NAMES } from "../src/config.ts";
 import { KeyedSerialQueue } from "../src/concurrency.ts";
 import { Store } from "../src/db/index.ts";
 import { buildFallbackPdf } from "../src/reports/pdf.ts";
+import { EventLog } from "../src/events.ts";
 import { EvidenceStore } from "../src/orchestrator/evidence.ts";
+import { ReportService } from "../src/reports/generator.ts";
 import { buildInventory, gitInfo } from "../src/repo/inventory.ts";
 import { importRepository } from "../src/repo/import.ts";
 import { createWorkspace, readScopedFile, verifyQuote } from "../src/repo/workspace.ts";
@@ -542,6 +544,230 @@ describe("evidence chain", () => {
     const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "one", content: "alpha" });
     expect(() => store.run("UPDATE evidence SET title = 'changed' WHERE id = ?", row.id)).toThrow();
     expect(() => store.run("DELETE FROM evidence WHERE id = ?", row.id)).toThrow();
+  });
+
+  test("evidence content fails closed when the sidecar does not match the database record", async () => {
+    const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "one", content: "alpha" });
+    expect((await evidence.content(row.id))?.content).toBe("alpha");
+    const parsed = await Bun.file(row.content_path).json() as { content?: string };
+    parsed.content = "alphb";
+    await Bun.write(row.content_path, `${JSON.stringify(parsed, null, 2)}\n`);
+    await expect(evidence.content(row.id)).rejects.toMatchObject({ status: 409, code: "conflict" });
+    const broken = await evidence.verifyChain("a1");
+    expect(broken).toMatchObject({
+      ok: false,
+      broken_at: row.id,
+      reason: "Evidence file content hash does not match the database record",
+    });
+  });
+
+  test("evidence content rejects a symlink that replaces the sidecar", async () => {
+    const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "one", content: "alpha" });
+    const target = join(dir, "replacement.txt");
+    writeFileSync(target, "alpha");
+    rmSync(row.content_path);
+    symlinkSync(target, row.content_path);
+    await expect(evidence.content(row.id)).rejects.toMatchObject({ status: 409, code: "conflict" });
+    expect((await evidence.verifyChain("a1")).ok).toBe(false);
+  });
+
+  test("evidence content rejects a symlink even when the target copies the sidecar", async () => {
+    const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "one", content: "alpha" });
+    const target = join(dir, "sidecar-copy.json");
+    await Bun.write(target, await Bun.file(row.content_path).arrayBuffer());
+    rmSync(row.content_path);
+    symlinkSync(target, row.content_path);
+    await expect(evidence.content(row.id)).rejects.toMatchObject({ status: 409, code: "conflict" });
+    expect((await evidence.verifyChain("a1")).ok).toBe(false);
+  });
+
+  test("evidence content rejects a named pipe without waiting for a writer", async () => {
+    const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "one", content: "alpha" });
+    rmSync(row.content_path);
+    const made = Bun.spawnSync(["mkfifo", row.content_path]);
+    expect(made.exitCode).toBe(0);
+    await expect(evidence.content(row.id)).rejects.toMatchObject({ status: 409, code: "conflict" });
+    expect(await evidence.verifyChain("a1")).toMatchObject({
+      ok: false,
+      broken_at: row.id,
+      reason: "Evidence file is missing or unreadable",
+    });
+  });
+
+  test("evidence content accepts a JSON-escaped sidecar larger than the recorded text plus one megabyte", async () => {
+    const content = "\u0001".repeat(210_000);
+    const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "controls", content });
+    expect(Bun.file(row.content_path).size - row.size).toBeGreaterThan(1_000_000);
+    expect((await evidence.content(row.id))?.content).toBe(content);
+    expect((await evidence.verifyChain("a1")).ok).toBe(true);
+  });
+
+  test("evidence content reads only the size it checked when the sidecar grows", async () => {
+    const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "one", content: "alpha" });
+    const before = (await stat(row.content_path)).size;
+    const probe = await open(row.content_path, "r");
+    const proto = Object.getPrototypeOf(probe) as {
+      stat: (this: unknown, ...args: unknown[]) => Promise<{ isFile: () => boolean; size: number }>;
+      read: (
+        this: unknown,
+        buffer: Buffer,
+        offset?: number,
+        length?: number,
+        position?: number | null,
+      ) => Promise<{ bytesRead: number }>;
+      readFile: (this: unknown, ...args: unknown[]) => Promise<unknown>;
+    };
+    await probe.close();
+    const originalStat = proto.stat;
+    const originalRead = proto.read;
+    const originalReadFile = proto.readFile;
+    let readFileCalls = 0;
+    let bytesRequested = 0;
+    proto.stat = async function (this: unknown, ...args: unknown[]) {
+      const info = await originalStat.apply(this, args);
+      const size = info.size;
+      const file = info.isFile();
+      if (file && size === before) writeFileSync(row.content_path, "Q".repeat(1024 * 1024));
+      return { isFile: () => file, size };
+    };
+    proto.read = async function (
+      this: unknown,
+      buffer: Buffer,
+      offset?: number,
+      length?: number,
+      position?: number | null,
+    ) {
+      if (length === undefined || length > before) {
+        throw new Error(`unbounded evidence read of ${String(length)} bytes`);
+      }
+      bytesRequested += length;
+      return originalRead.call(this, buffer, offset, length, position);
+    };
+    proto.readFile = async function (this: unknown, ...args: unknown[]) {
+      readFileCalls += 1;
+      return originalReadFile.apply(this, args);
+    };
+    try {
+      await expect(evidence.content(row.id)).rejects.toMatchObject({ status: 409, code: "conflict" });
+      expect(readFileCalls).toBe(0);
+      expect(bytesRequested).toBeGreaterThan(0);
+      expect(bytesRequested).toBeLessThanOrEqual(before);
+    } finally {
+      proto.stat = originalStat;
+      proto.read = originalRead;
+      proto.readFile = originalReadFile;
+    }
+  });
+
+  test("evidence content rejects a sidecar larger than the recorded content can encode", async () => {
+    const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "one", content: "alpha" });
+    await Bun.write(row.content_path, "x".repeat(64 * 1024));
+    await expect(evidence.content(row.id)).rejects.toMatchObject({ status: 409, code: "conflict" });
+    const broken = await evidence.verifyChain("a1");
+    expect(broken).toMatchObject({
+      ok: false,
+      broken_at: row.id,
+      reason: "Evidence file is larger than the recorded content",
+    });
+  });
+
+  test("reports omit a code excerpt whose sidecar does not match the database record", async () => {
+    store.run(
+      `INSERT INTO findings (
+        id, code, audit_id, project_id, title, category, severity, status, files, root_cause,
+        preconditions, reproduction, expected, observed, impact, remediation, created_at, updated_at
+      ) VALUES (
+        'f-report', 'ARG-1', 'a1', 'p1', 'Tampered excerpt', 'injection', 'high', 'reverified', '[]',
+        'cause', '[]', '[]', 'expected', 'observed', 'impact', 'fix', '2026-01-01', '2026-01-01'
+      )`,
+    );
+    await evidence.append({
+      auditId: "a1",
+      findingId: "f-report",
+      kind: "code_excerpt",
+      title: "src/ok.js:1-1",
+      content: { path: "src/ok.js", start_line: 1, end_line: 1, quote: "intact quote stays" },
+    });
+    const tampered = await evidence.append({
+      auditId: "a1",
+      findingId: "f-report",
+      kind: "code_excerpt",
+      title: "src/bad.js:2-2",
+      content: { path: "src/bad.js", start_line: 2, end_line: 2, quote: "original quote" },
+    });
+    const parsed = await Bun.file(tampered.content_path).json() as { content?: string };
+    parsed.content = JSON.stringify(
+      { path: "src/bad.js", start_line: 2, end_line: 2, quote: "TAMPERED_QUOTE_SENTINEL" },
+      null,
+      2,
+    );
+    await Bun.write(tampered.content_path, `${JSON.stringify(parsed, null, 2)}\n`);
+    const generated = await new ReportService(testConfig(dir), store, evidence, new EventLog(store)).generate(
+      "a1",
+      ["markdown", "json"],
+      "test",
+    );
+    const jsonReport = generated.find((report) => report.format === "json");
+    expect(jsonReport).toBeTruthy();
+    const body = JSON.parse(await Bun.file(jsonReport!.path).text()) as {
+      evidence_chain: { ok: boolean };
+      findings: Array<{ verified_excerpts: Array<{ quote: string }> }>;
+    };
+    expect(body.evidence_chain.ok).toBe(false);
+    expect(body.findings[0]?.verified_excerpts.map((excerpt) => excerpt.quote)).toEqual(["intact quote stays"]);
+    for (const report of generated) {
+      const text = await Bun.file(report.path).text();
+      expect(text).toContain("intact quote stays");
+      expect(text).not.toContain("TAMPERED_QUOTE_SENTINEL");
+      expect(text).not.toContain("original quote");
+    }
+  });
+
+  test("reports still generate when a code excerpt is not structured JSON", async () => {
+    store.run(
+      `INSERT INTO findings (
+        id, code, audit_id, project_id, title, category, severity, status, files, root_cause,
+        preconditions, reproduction, expected, observed, impact, remediation, created_at, updated_at
+      ) VALUES (
+        'f-plain', 'ARG-2', 'a1', 'p1', 'Plain excerpt', 'injection', 'low', 'reverified', '[]',
+        'cause', '[]', '[]', 'expected', 'observed', 'impact', 'fix', '2026-01-01', '2026-01-01'
+      )`,
+    );
+    await evidence.append({
+      auditId: "a1",
+      findingId: "f-plain",
+      kind: "code_excerpt",
+      title: "note",
+      content: "not a structured excerpt",
+    });
+    const generated = await new ReportService(testConfig(dir), store, evidence, new EventLog(store)).generate(
+      "a1",
+      ["markdown", "json"],
+      "test",
+    );
+    expect(generated).toHaveLength(2);
+    const body = JSON.parse(await Bun.file(generated.find((report) => report.format === "json")!.path).text()) as {
+      evidence_chain: { ok: boolean };
+      findings: Array<{ verified_excerpts: unknown[] }>;
+    };
+    expect(body.evidence_chain.ok).toBe(true);
+    expect(body.findings[0]?.verified_excerpts).toEqual([]);
+  });
+
+  test("evidence content preserves structured excerpts for later parsing", async () => {
+    const row = await evidence.append({
+      auditId: "a1",
+      kind: "code_excerpt",
+      title: "src/a:b.js:1-2",
+      content: { path: "src/a:b.js", start_line: 1, end_line: 2, quote: "const secret = 1;" },
+    });
+    const loaded = await evidence.content(row.id);
+    expect(JSON.parse(loaded?.content ?? "")).toMatchObject({
+      path: "src/a:b.js",
+      start_line: 1,
+      end_line: 2,
+      quote: "const secret = 1;",
+    });
   });
 
   test("evidence verification detects sidecar metadata tampering", async () => {

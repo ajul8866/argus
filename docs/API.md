@@ -142,7 +142,7 @@ Task result shape for agent tasks:
 | `GET` | `/api/findings?audit_id=&status=` | any | Finding list |
 | `GET` | `/api/findings/:id` | any | Finding + candidate + verifications + evidence + sessions |
 | `POST` | `/api/findings/:id/retest` | auditor | Queue a fresh independent retest |
-| `GET` | `/api/evidence/:id` | auditor/admin | Evidence metadata + content |
+| `GET` | `/api/evidence/:id` | auditor/admin | Evidence metadata + content. `409 conflict` when the file does not match its database record |
 
 Findings are only created by Phase 4 from a `CONFIRMED` verification whose
 excerpts were verified by the platform. Reverification history is immutable.
@@ -196,7 +196,7 @@ access, and linked MCP server assignments remain independent controls.
 | `GET` | `/api/approvals?status=` | any | Approval queue/history |
 | `POST` | `/api/approvals/:id/decide` | admin | `{approved,reason}` |
 | `GET` | `/api/reports?audit_id=` | any | Report metadata |
-| `GET` | `/api/reports/:id/download` | any | Download generated file |
+| `GET` | `/api/reports/:id/download` | any | Download a generated file. A missing file is 404. A symlink, pipe, or size or hash mismatch is 409. The read stops at the recorded size |
 | `GET` | `/api/audit-log` | admin | Security log |
 
 ## SSE

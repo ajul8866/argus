@@ -1270,7 +1270,15 @@ export class AuditEngine {
       return;
     }
     const resourceContext = { auditId: task.audit_id, taskId: task.id, sessionId, role: definition.role, harness };
-    const prompt = await this.buildPrompt(task, ctx);
+    let prompt: string | null;
+    try {
+      prompt = await this.buildPrompt(task, ctx);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      finalizeSession("failed", null, message);
+      this.finishTaskFailure(task.id, "internal", message);
+      return;
+    }
     if (!prompt) {
       finalizeSession("failed", null, "No prompt builder for task kind");
       this.finishTaskFailure(task.id, "internal", `No prompt builder for task kind ${task.kind}`);
@@ -1680,29 +1688,22 @@ export class AuditEngine {
     if (task.kind === "phase5.reverify") {
       const finding = this.store.get<FindingRow>("SELECT * FROM findings WHERE id = ?", String(payload.finding_id));
       if (!finding) return null;
-      const evidence = this.store.all<{ kind: string; title: string; content_path: string }>(
-        "SELECT kind, title, content_path FROM evidence WHERE finding_id = ? AND kind = 'code_excerpt' ORDER BY rowid",
+      const evidence = this.store.all<{ id: string }>(
+        "SELECT id FROM evidence WHERE finding_id = ? AND kind = 'code_excerpt' ORDER BY rowid",
         finding.id,
       );
       const excerpts: Array<{ path: string; start_line: number; end_line: number; quote: string }> = [];
       for (const item of evidence) {
+        const verified = await this.evidence.content(item.id);
+        if (!verified) continue;
+        let content: unknown;
         try {
-          const raw = await Bun.file(item.content_path).json() as {
-            content?: string | { path: string; start_line: number; end_line: number; quote: string };
-          };
-          let content = raw.content;
-          if (typeof content === "string") {
-            try {
-              content = JSON.parse(content) as { path: string; start_line: number; end_line: number; quote: string };
-            } catch {
-              continue;
-            }
-          }
-          if (content && typeof content === "object" && "quote" in content) {
-            excerpts.push(content);
-          }
+          content = JSON.parse(verified.content);
         } catch {
-          // skip unreadable evidence; the platform evidence chain check reports it separately
+          continue;
+        }
+        if (content && typeof content === "object" && "quote" in content) {
+          excerpts.push(content as { path: string; start_line: number; end_line: number; quote: string });
         }
       }
       return retestPrompt({

@@ -1,10 +1,11 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdir, open, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Config } from "../config.ts";
 import { KeyedSerialQueue } from "../concurrency.ts";
 import { EVIDENCE_DIR } from "../config.ts";
 import type { Store } from "../db/index.ts";
-import { now, sha256, toJson, uid } from "../util.ts";
+import { AppError, now, sha256, toJson, uid } from "../util.ts";
 import { redactSecrets } from "../security/redact.ts";
 
 export type EvidenceRow = {
@@ -115,16 +116,11 @@ export class EvidenceStore {
   async content(id: string): Promise<{ row: EvidenceRow; content: string } | null> {
     const row = this.store.get<EvidenceRow>("SELECT * FROM evidence WHERE id = ?", id);
     if (!row) return null;
-    const raw = await readFile(row.content_path, "utf8");
-    try {
-      const parsed = JSON.parse(raw) as { content?: unknown };
-      return {
-        row,
-        content: typeof parsed.content === "string" ? parsed.content : JSON.stringify(parsed.content, null, 2),
-      };
-    } catch {
-      return { row, content: raw };
+    const verified = await this.readVerified(row);
+    if (!verified.ok) {
+      throw new AppError(409, "conflict", `Evidence integrity check failed; ${verified.reason}`);
     }
+    return { row, content: verified.text };
   }
 
   listForAudit(auditId: string, limit = 500): EvidenceRow[] {
@@ -163,72 +159,126 @@ export class EvidenceStore {
           reason: "Stored chain metadata does not match the recomputed chain",
         };
       }
-      try {
-        const raw = await readFile(row.content_path, "utf8");
-        const parsed = JSON.parse(raw) as {
-          id?: string;
-          audit_id?: string;
-          task_id?: string | null;
-          agent_session_id?: string | null;
-          finding_id?: string | null;
-          kind?: string;
-          title?: string;
-          created_at?: string;
-          sha256?: string;
-          prev_hash?: string;
-          chain_hash?: string;
-          content?: unknown;
-        };
-        const metadataMatches =
-          parsed.id === row.id &&
-          parsed.audit_id === row.audit_id &&
-          parsed.task_id === row.task_id &&
-          parsed.agent_session_id === row.agent_session_id &&
-          parsed.finding_id === row.finding_id &&
-          parsed.kind === row.kind &&
-          parsed.title === row.title &&
-          parsed.created_at === row.created_at &&
-          parsed.sha256 === row.sha256 &&
-          parsed.prev_hash === row.prev_hash &&
-          parsed.chain_hash === row.chain_hash;
-        if (!metadataMatches) {
-          return {
-            ok: false,
-            count: rows.length,
-            broken_at: row.id,
-            reason: "Evidence file metadata does not match the database record",
-          };
-        }
-        const text =
-          typeof parsed.content === "string" ? parsed.content : `${JSON.stringify(parsed.content, null, 2)}\n`;
-        if (Buffer.byteLength(text) !== row.size) {
-          return {
-            ok: false,
-            count: rows.length,
-            broken_at: row.id,
-            reason: "Evidence content size does not match the database record",
-          };
-        }
-        const recomputed = sha256(text);
-        if (recomputed !== row.sha256) {
-          return {
-            ok: false,
-            count: rows.length,
-            broken_at: row.id,
-            reason: "Evidence file content hash does not match the database record",
-          };
-        }
-      } catch {
+      const verified = await this.readVerified(row);
+      if (!verified.ok) {
         return {
           ok: false,
           count: rows.length,
           broken_at: row.id,
-          reason: "Evidence file is missing or unreadable",
+          reason: verified.reason,
         };
       }
       prev = row.chain_hash;
     }
     return { ok: true, count: rows.length, broken_at: null, reason: null };
+  }
+
+  private maxSidecarBytes(row: EvidenceRow): number {
+    // JSON.stringify writes one UTF-16 code unit as at most six bytes (\uXXXX).
+    // UTF-8 size is at least that code-unit count, so six times the recorded
+    // content size bounds the embedded string. Metadata values are known here
+    // and use the same bound. Keep the list aligned with the object written by
+    // appendInternal. The fixed allowance covers keys, nulls, and pretty-print.
+    const fields = [
+      row.id,
+      row.audit_id,
+      row.task_id ?? "",
+      row.agent_session_id ?? "",
+      row.finding_id ?? "",
+      row.kind,
+      row.title,
+      row.created_at,
+      row.sha256,
+      row.prev_hash,
+      row.chain_hash,
+    ];
+    const contentBytes = Number.isFinite(row.size) ? Math.max(0, row.size) : 0;
+    let bound = contentBytes * 6 + 2;
+    for (const field of fields) bound += field.length * 6 + 2;
+    return bound + 1024;
+  }
+
+  private async readVerified(row: EvidenceRow): Promise<{ ok: true; text: string } | { ok: false; reason: string }> {
+    const limit = this.maxSidecarBytes(row);
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    // Both flags are required for the open below to fail closed. A missing
+    // flag is `undefined`, and `number | undefined` becomes `number | 0`.
+    const noFollow = constants.O_NOFOLLOW;
+    const nonBlock = constants.O_NONBLOCK;
+    if (typeof noFollow !== "number" || typeof nonBlock !== "number" || noFollow === 0 || nonBlock === 0) {
+      return { ok: false, reason: "Evidence file is missing or unreadable" };
+    }
+    try {
+      // O_NOFOLLOW binds the size check and the read to one inode. O_NONBLOCK
+      // makes a replaced pipe return immediately; opening it for read would
+      // otherwise wait until another process connects a writer.
+      handle = await open(row.content_path, constants.O_RDONLY | noFollow | nonBlock);
+      const info = await handle.stat();
+      if (!info.isFile()) return { ok: false, reason: "Evidence file is missing or unreadable" };
+      // Cap the read at the size just observed. readFile() stats again and would
+      // load a file that grew past the bound after this check.
+      const expected = info.size;
+      if (!Number.isSafeInteger(expected) || expected < 0) {
+        return { ok: false, reason: "Evidence file is missing or unreadable" };
+      }
+      if (expected > limit) return { ok: false, reason: "Evidence file is larger than the recorded content" };
+      const buffer = Buffer.alloc(expected);
+      let offset = 0;
+      while (offset < expected) {
+        const { bytesRead } = await handle.read(buffer, offset, expected - offset, offset);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+      }
+      if (offset !== expected) return { ok: false, reason: "Evidence file is missing or unreadable" };
+      const raw = buffer.toString("utf8");
+      if (Buffer.byteLength(raw) > limit) {
+        return { ok: false, reason: "Evidence file is larger than the recorded content" };
+      }
+      const parsed = JSON.parse(raw) as {
+        id?: string;
+        audit_id?: string;
+        task_id?: string | null;
+        agent_session_id?: string | null;
+        finding_id?: string | null;
+        kind?: string;
+        title?: string;
+        created_at?: string;
+        sha256?: string;
+        prev_hash?: string;
+        chain_hash?: string;
+        content?: unknown;
+      };
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return { ok: false, reason: "Evidence file is missing or unreadable" };
+      }
+      const metadataMatches =
+        parsed.id === row.id &&
+        parsed.audit_id === row.audit_id &&
+        parsed.task_id === row.task_id &&
+        parsed.agent_session_id === row.agent_session_id &&
+        parsed.finding_id === row.finding_id &&
+        parsed.kind === row.kind &&
+        parsed.title === row.title &&
+        parsed.created_at === row.created_at &&
+        parsed.sha256 === row.sha256 &&
+        parsed.prev_hash === row.prev_hash &&
+        parsed.chain_hash === row.chain_hash;
+      if (!metadataMatches) {
+        return { ok: false, reason: "Evidence file metadata does not match the database record" };
+      }
+      const text = typeof parsed.content === "string" ? parsed.content : `${JSON.stringify(parsed.content, null, 2)}\n`;
+      if (Buffer.byteLength(text) !== row.size) {
+        return { ok: false, reason: "Evidence content size does not match the database record" };
+      }
+      if (sha256(text) !== row.sha256) {
+        return { ok: false, reason: "Evidence file content hash does not match the database record" };
+      }
+      return { ok: true, text };
+    } catch {
+      return { ok: false, reason: "Evidence file is missing or unreadable" };
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
   }
 
   redactedText(text: string): string {

@@ -1,6 +1,6 @@
+import { constants } from "node:fs";
+import { open } from "node:fs/promises";
 import { resolve } from "node:path";
-import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import type { Config } from "../config.ts";
 import { APP_NAME, APP_VERSION, PHASE_NAMES } from "../config.ts";
 import { DEFAULT_SETTINGS } from "../settings.ts";
@@ -1143,12 +1143,17 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
           status: string;
           path: string | null;
           sha256: string | null;
+          size: number | null;
         }>("SELECT * FROM reports WHERE id = ?", reportDownload[1]);
         if (!report) throw notFound("Report not found");
-        if (report.status !== "generated" || !report.path || !existsSync(report.path)) {
+        if (report.status !== "generated" || !report.path) {
           throw notFound("Report file is not available");
         }
-        const bytes = await readFile(report.path);
+        const expectedSize = report.size;
+        if (typeof expectedSize !== "number" || !Number.isSafeInteger(expectedSize) || expectedSize < 0) {
+          throw conflict("Report file is missing or unreadable");
+        }
+        const bytes = await readRegularFile(report.path, expectedSize);
         if (!report.sha256 || sha256(bytes) !== report.sha256) {
           throw conflict("Report integrity check failed; the stored file does not match its recorded hash");
         }
@@ -1289,6 +1294,53 @@ function streamGlobalEvents(deps: ApiDeps, request: Request): Response {
     subscribe: (send) => deps.events.bus.subscribe(send),
     includeEventId: false,
   });
+}
+
+function fsErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object" || !("code" in error)) return undefined;
+  const code = error.code;
+  return typeof code === "string" ? code : undefined;
+}
+
+async function readRegularFile(path: string, expectedSize: number): Promise<Uint8Array<ArrayBuffer>> {
+  // Both flags are required for the open below to fail closed. A missing flag
+  // is `undefined`, and `number | undefined` becomes `number | 0`.
+  const noFollow = constants.O_NOFOLLOW;
+  const nonBlock = constants.O_NONBLOCK;
+  if (typeof noFollow !== "number" || typeof nonBlock !== "number" || noFollow === 0 || nonBlock === 0) {
+    throw conflict("Report file is missing or unreadable");
+  }
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    // O_NOFOLLOW binds the size check and the read to one inode. O_NONBLOCK
+    // makes a replaced pipe return immediately; opening it for read would
+    // otherwise wait until another process connects a writer.
+    handle = await open(path, constants.O_RDONLY | noFollow | nonBlock);
+    const info = await handle.stat();
+    if (!info.isFile()) throw conflict("Report file is missing or unreadable");
+    if (info.size !== expectedSize) {
+      throw conflict("Report integrity check failed; the stored file does not match its recorded size");
+    }
+    // Cap the read at the size just observed. readFile() stats again and would
+    // load a file that grew past the bound after this check.
+    const buffer = Buffer.alloc(expectedSize);
+    let offset = 0;
+    while (offset < expectedSize) {
+      const { bytesRead } = await handle.read(buffer, offset, expectedSize - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset !== expectedSize) {
+      throw conflict("Report integrity check failed; the stored file does not match its recorded size");
+    }
+    return new Uint8Array(buffer);
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    if (fsErrorCode(error) === "ENOENT") throw notFound("Report file is not available");
+    throw conflict("Report file is missing or unreadable");
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
 }
 
 function projectJson(row: unknown): Record<string, unknown> {

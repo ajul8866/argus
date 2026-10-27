@@ -267,14 +267,16 @@ function isGitRefSpace(char: string): boolean {
 }
 
 function looseSymrefTarget(text: string): string | null {
-  const line = text.split("\n", 1)[0] ?? "";
-  let end = line.length;
-  while (end > 0 && isGitRefSpace(line[end - 1] ?? "")) end -= 1;
-  const body = line.slice(0, end);
+  let end = text.length;
+  while (end > 0 && isGitRefSpace(text[end - 1] ?? "")) end -= 1;
+  const body = text.slice(0, end);
   if (!body.startsWith("ref:")) return null;
   let index = "ref:".length;
   while (index < body.length && isGitRefSpace(body[index] ?? "")) index += 1;
   const target = body.slice(index);
+  // Git skips every isspace byte after "ref:", so the target can start on a
+  // later line. An interior break is not a ref Git can resolve.
+  if (target.includes("\n") || target.includes("\r")) return null;
   return target ? target : null;
 }
 

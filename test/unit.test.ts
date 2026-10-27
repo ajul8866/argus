@@ -909,6 +909,143 @@ describe("repository import", () => {
     expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
   });
 
+  test("import does not wait on a pipe in git metadata", async () => {
+    const gitEnv = {
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      GIT_AUTHOR_NAME: "Tester",
+      GIT_AUTHOR_EMAIL: "tester@example.com",
+      GIT_COMMITTER_NAME: "Tester",
+      GIT_COMMITTER_EMAIL: "tester@example.com",
+    };
+    const git = (cwd: string, args: string[]): void => {
+      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+        env: gitEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+    };
+    const fifo = (path: string): void => {
+      if (existsSync(path)) rmSync(path);
+      const created = Bun.spawnSync(["mkfifo", path]);
+      expect(created.exitCode).toBe(0);
+    };
+    const prepare = (name: string): string => {
+      const source = join(dir, name);
+      mkdirSync(source);
+      git(source, ["init", "-q"]);
+      writeFileSync(join(source, "a.js"), "LOCAL_ONLY\n");
+      git(source, ["add", "a.js"]);
+      git(source, ["commit", "-qm", "local"]);
+      return source;
+    };
+    const insert = (id: string, source: string): void => {
+      store.run(
+        `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+         VALUES (?, ?, '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+        id, id, source, JSON.stringify(["**/*.js"]),
+      );
+    };
+    const attempt = async (id: string, source: string, ref: string | null): Promise<string> => {
+      return Promise.race([
+        importRepository({ config, store }, {
+          id,
+          source_path: source,
+          scope_include: JSON.stringify(["**/*.js"]),
+          scope_exclude: "[]",
+        }, ref, "tester").then(() => "imported").catch((error: { code?: string }) => error.code ?? "error"),
+        Bun.sleep(500).then(() => "blocked"),
+      ]);
+    };
+
+    const exclude = prepare("fifo-exclude");
+    fifo(join(exclude, ".git", "info", "exclude"));
+    insert("p-fifo-exclude", exclude);
+
+    const attributes = prepare("fifo-attributes");
+    fifo(join(attributes, ".git", "info", "attributes"));
+    insert("p-fifo-attributes", attributes);
+
+    const common = prepare("fifo-commondir");
+    fifo(join(common, ".git", "commondir"));
+    insert("p-fifo-commondir", common);
+
+    const packed = prepare("fifo-packed");
+    fifo(join(packed, ".git", "packed-refs"));
+    insert("p-fifo-packed", packed);
+
+    const branch = prepare("fifo-branch");
+    const refName = Bun.spawnSync(["git", "-C", branch, "symbolic-ref", "HEAD"], {
+      env: gitEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    }).stdout.toString().trim();
+    expect(refName.startsWith("refs/")).toBe(true);
+    fifo(join(branch, ".git", refName));
+    insert("p-fifo-branch", branch);
+
+    const infoLink = prepare("fifo-info-link");
+    const infoTarget = join(dir, "fifo-info-target");
+    mkdirSync(infoTarget);
+    fifo(join(infoTarget, "grafts"));
+    rmSync(join(infoLink, ".git", "info"), { recursive: true });
+    symlinkSync(infoTarget, join(infoLink, ".git", "info"));
+    insert("p-fifo-info-link", infoLink);
+
+    const chain = prepare("fifo-symref");
+    const chainTarget = Bun.spawnSync(["git", "-C", chain, "symbolic-ref", "HEAD"], {
+      env: gitEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    }).stdout.toString().trim();
+    expect(chainTarget.startsWith("refs/")).toBe(true);
+    git(chain, ["symbolic-ref", "refs/heads/next", chainTarget]);
+    git(chain, ["symbolic-ref", "HEAD", "refs/heads/next"]);
+    fifo(join(chain, ".git", chainTarget));
+    insert("p-fifo-symref", chain);
+
+    const parent = prepare("fifo-parent");
+    const child = join(parent, "child");
+    mkdirSync(child);
+    writeFileSync(join(child, "a.js"), "LOCAL_CHILD\n");
+    git(parent, ["add", "child/a.js"]);
+    git(parent, ["commit", "-qm", "child"]);
+    fifo(join(parent, ".git", "commondir"));
+    insert("p-fifo-child", child);
+
+    const cases = [
+      ["p-fifo-exclude", exclude, "HEAD"],
+      ["p-fifo-attributes", attributes, "HEAD"],
+      ["p-fifo-commondir", common, "HEAD"],
+      ["p-fifo-packed", packed, null],
+      ["p-fifo-branch", branch, null],
+      ["p-fifo-info-link", infoLink, "HEAD"],
+      ["p-fifo-symref", chain, "HEAD"],
+      ["p-fifo-child", child, "HEAD"],
+    ] as const;
+    for (const [id, source, ref] of cases) {
+      expect(await attempt(id, source, ref)).toBe("invalid_repository");
+    }
+    expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+
+    const linked = prepare("symref-ok");
+    const linkedTarget = Bun.spawnSync(["git", "-C", linked, "symbolic-ref", "HEAD"], {
+      env: gitEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    }).stdout.toString().trim();
+    git(linked, ["symbolic-ref", "refs/heads/next", linkedTarget]);
+    git(linked, ["symbolic-ref", "HEAD", "refs/heads/next"]);
+    insert("p-symref-ok", linked);
+    const imported = await importRepository({ config, store }, {
+      id: "p-symref-ok",
+      source_path: linked,
+      scope_include: JSON.stringify(["**/*.js"]),
+      scope_exclude: "[]",
+    }, "HEAD", "tester");
+    expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+  });
+
   test("workspaces are read-only by default and owner-writable only on explicit request", async () => {
     const scope = { include: ["**/*.js", "**/*.json", "README.md"], exclude: ["src/routes/media.js"] };
     const inventory = await buildInventory(fixture, { scope, maxFiles: 100, maxFileBytes: 1_000_000 });

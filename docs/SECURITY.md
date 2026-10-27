@@ -47,8 +47,10 @@ LLM agents. Use it only on repositories you are authorized to assess.
   symlink or gitfile, a Git common directory other than that Git directory, an
   alternate object database, a symlink inside the object store, and `GIT_*`
   environment variables are rejected or ignored, so a ref import cannot copy
-  commits stored outside that work tree. A subdirectory of a repository
-  archives only that subdirectory.
+  commits stored outside that work tree. A pipe or symlink in the metadata Git
+  reads before that archive, including the common directory, packed refs, the
+  current ref, and exclude or attribute files, is rejected before Git starts.
+  A subdirectory of a repository archives only that subdirectory.
 
 ## Execution isolation
 

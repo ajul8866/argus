@@ -1,5 +1,6 @@
-import { lstat, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
-import { join, relative, sep } from "node:path";
+import { constants } from "node:fs";
+import { lstat, mkdir, mkdtemp, open, readdir, rm } from "node:fs/promises";
+import { dirname, join, relative, sep } from "node:path";
 import type { Config } from "../config.ts";
 import type { Store } from "../db/index.ts";
 import { runCommand } from "../harness/process.ts";
@@ -50,21 +51,144 @@ async function assertRegularGitEntry(path: string): Promise<void> {
   if (info.isSymbolicLink() || !info.isFile()) throw invalidGitMetadata();
 }
 
-// A pipe or symlink named .git would block or escape before git runs. A gitfile
-// is a regular file; ref imports reject it separately so worktree snapshots can
-// still copy the selected files.
-async function assertLocalGitReadable(sourceRoot: string): Promise<void> {
-  const gitPath = join(sourceRoot, ".git");
+async function assertRealGitDirectory(path: string): Promise<void> {
   let info;
   try {
-    info = await lstat(gitPath);
+    info = await lstat(path);
   } catch {
     return;
   }
-  if (info.isSymbolicLink() || (!info.isDirectory() && !info.isFile())) throw invalidGitMetadata();
-  if (!info.isDirectory()) return;
-  await assertRegularGitEntry(join(gitPath, "HEAD"));
-  await assertRegularGitEntry(join(gitPath, "config"));
+  if (info.isSymbolicLink() || !info.isDirectory()) throw invalidGitMetadata();
+}
+
+// HEAD and loose refs are tiny text files. A larger file is not a ref Git can
+// use, and reading it could block or pull in an unrelated payload.
+async function readSmallGitText(path: string): Promise<string | null> {
+  const noFollow = constants.O_NOFOLLOW;
+  const nonBlock = constants.O_NONBLOCK;
+  if (typeof noFollow !== "number" || typeof nonBlock !== "number" || noFollow === 0 || nonBlock === 0) {
+    throw invalidGitMetadata();
+  }
+  let info;
+  try {
+    info = await lstat(path);
+  } catch {
+    return null;
+  }
+  if (info.isSymbolicLink() || !info.isFile()) throw invalidGitMetadata();
+  if (!Number.isSafeInteger(info.size) || info.size < 0 || info.size > 4_096) throw invalidGitMetadata();
+  let handle;
+  try {
+    handle = await open(path, constants.O_RDONLY | noFollow | nonBlock);
+  } catch {
+    throw invalidGitMetadata();
+  }
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.size !== info.size) throw invalidGitMetadata();
+    const buffer = Buffer.alloc(opened.size);
+    let offset = 0;
+    while (offset < opened.size) {
+      const { bytesRead } = await handle.read(buffer, offset, opened.size - offset, offset);
+      if (bytesRead === 0) throw invalidGitMetadata();
+      offset += bytesRead;
+    }
+    return buffer.toString("utf8");
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+function gitRefParts(refName: string): string[] {
+  const parts = refName.split("/");
+  if (
+    !refName ||
+    refName.startsWith("/") ||
+    refName.includes("\\") ||
+    refName.includes("\0") ||
+    parts.some((part) => part.length === 0 || part === "." || part === "..")
+  ) {
+    throw invalidGitMetadata();
+  }
+  return parts;
+}
+
+// Follow a symref chain without opening a pipe or a symlink. Git opens the
+// same path while resolving HEAD, and a fifo there waits until another process
+// connects a writer.
+async function assertLooseRef(gitDir: string, refName: string, depth: number): Promise<void> {
+  if (depth > 8) throw invalidGitMetadata();
+  const parts = gitRefParts(refName);
+  let current = gitDir;
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (!part) throw invalidGitMetadata();
+    current = join(current, part);
+    let entry;
+    try {
+      entry = await lstat(current);
+    } catch {
+      return;
+    }
+    if (entry.isSymbolicLink()) throw invalidGitMetadata();
+    const last = index === parts.length - 1;
+    if (!last) {
+      if (!entry.isDirectory()) throw invalidGitMetadata();
+      continue;
+    }
+    if (!entry.isFile()) throw invalidGitMetadata();
+  }
+  const text = await readSmallGitText(current);
+  const line = text?.split("\n", 1)[0] ?? "";
+  if (!line.startsWith("ref:")) return;
+  await assertLooseRef(gitDir, line.slice("ref:".length).trim(), depth + 1);
+}
+
+async function assertGitDirectoryMetadata(gitDir: string): Promise<void> {
+  await assertRegularGitEntry(join(gitDir, "config"));
+  await assertRegularGitEntry(join(gitDir, "commondir"));
+  await assertRegularGitEntry(join(gitDir, "packed-refs"));
+  await assertRegularGitEntry(join(gitDir, "shallow"));
+  await assertRealGitDirectory(join(gitDir, "info"));
+  await assertRegularGitEntry(join(gitDir, "info", "exclude"));
+  await assertRegularGitEntry(join(gitDir, "info", "attributes"));
+  await assertRegularGitEntry(join(gitDir, "info", "grafts"));
+  await assertRealGitDirectory(join(gitDir, "refs"));
+  const head = await readSmallGitText(join(gitDir, "HEAD"));
+  const headLine = head?.split("\n", 1)[0] ?? "";
+  if (headLine.startsWith("ref:")) await assertLooseRef(gitDir, headLine.slice("ref:".length).trim(), 0);
+}
+
+// A pipe or symlink named .git would block or escape before git runs. A gitfile
+// is a regular file; ref imports reject it separately so worktree snapshots can
+// still copy the selected files. Metadata inside the discovered git directory
+// is checked too: archive and rev-parse open those paths themselves.
+async function assertLocalGitReadable(sourceRoot: string): Promise<void> {
+  let current = sourceRoot;
+  let atSource = true;
+  while (true) {
+    const gitPath = join(current, ".git");
+    let info;
+    try {
+      info = await lstat(gitPath);
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return;
+      current = parent;
+      atSource = false;
+      continue;
+    }
+    if (info.isDirectory()) {
+      await assertGitDirectoryMetadata(gitPath);
+      return;
+    }
+    if (info.isSymbolicLink()) {
+      if (atSource) throw invalidGitMetadata();
+      return;
+    }
+    if (!info.isFile()) throw invalidGitMetadata();
+    return;
+  }
 }
 
 // Alternate object databases and symlinked packs live outside the repository

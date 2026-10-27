@@ -47,8 +47,12 @@ LLM agents. Use it only on repositories you are authorized to assess.
   symlink or gitfile, a Git common directory other than that Git directory, an
   alternate object database, a symlink inside the object store, and `GIT_*`
   environment variables are rejected or ignored, so a ref import cannot copy
-  commits stored outside that work tree. A subdirectory of a repository
-  archives only that subdirectory.
+  commits stored outside that work tree. The archive is produced from that
+  object store with repository, system, and global Git configuration replaced,
+  so a smudge or process filter cannot run during import. Settings such as
+  `core.autocrlf` are not applied. Committed attributes can still request
+  line-ending conversion. A subdirectory of a repository archives only that
+  subdirectory.
 
 ## Execution isolation
 

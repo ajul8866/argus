@@ -885,6 +885,86 @@ describe("repository import", () => {
     }
   });
 
+  test("a git ref import does not run smudge or process filters", async () => {
+    const source = join(dir, "filter-repo");
+    const globalHome = join(dir, "filter-home");
+    const localMarker = join(dir, "local-filter-ran");
+    const processMarker = join(dir, "process-filter-ran");
+    const globalMarker = join(dir, "global-filter-ran");
+    const previousHome = process.env.HOME;
+    const git = (cwd: string, args: string[]): void => {
+      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          GIT_AUTHOR_NAME: "Tester",
+          GIT_AUTHOR_EMAIL: "tester@example.com",
+          GIT_COMMITTER_NAME: "Tester",
+          GIT_COMMITTER_EMAIL: "tester@example.com",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+    };
+    mkdirSync(source, { recursive: true });
+    writeFileSync(join(source, "a.js"), "PLAIN_FILTER_BYTES\n");
+    git(source, ["init", "-q"]);
+    git(source, ["add", "a.js"]);
+    git(source, ["commit", "-qm", "init"]);
+    writeFileSync(join(source, ".gitattributes"), "* filter=pwn\n");
+    git(source, ["add", ".gitattributes"]);
+    git(source, ["commit", "-qm", "attrs"]);
+    git(source, ["config", "filter.pwn.smudge", `touch ${localMarker}; echo LOCAL_SMUDGE`]);
+    git(source, ["config", "filter.pwn.process", `touch ${processMarker}`]);
+    git(source, ["config", "filter.pwn.required", "true"]);
+
+    const globalSource = join(dir, "global-filter-repo");
+    mkdirSync(join(globalHome, ".config"), { recursive: true });
+    writeFileSync(join(globalHome, ".gitconfig"), `[filter "pwn"]\n\tsmudge = touch ${globalMarker}; echo GLOBAL_SMUDGE\n\trequired = true\n`);
+    mkdirSync(globalSource, { recursive: true });
+    writeFileSync(join(globalSource, "a.js"), "PLAIN_GLOBAL_BYTES\n");
+    git(globalSource, ["init", "-q"]);
+    git(globalSource, ["add", "a.js"]);
+    git(globalSource, ["commit", "-qm", "init"]);
+    writeFileSync(join(globalSource, ".gitattributes"), "* filter=pwn\n");
+    git(globalSource, ["add", ".gitattributes"]);
+    git(globalSource, ["commit", "-qm", "attrs"]);
+
+    const insert = (id: string, path: string): void => {
+      store.run(
+        `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+         VALUES (?, ?, '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+        id, id, path, JSON.stringify(["**/*.js"]),
+      );
+    };
+    insert("p-filter-local", source);
+    insert("p-filter-global", globalSource);
+    process.env.HOME = globalHome;
+    try {
+      const local = await importRepository({ config, store }, {
+        id: "p-filter-local",
+        source_path: source,
+        scope_include: JSON.stringify(["**/*.js"]),
+        scope_exclude: "[]",
+      }, "HEAD", "tester");
+      expect(await Bun.file(join(local.path, "a.js")).text()).toBe("PLAIN_FILTER_BYTES\n");
+      expect(existsSync(localMarker)).toBe(false);
+      expect(existsSync(processMarker)).toBe(false);
+
+      const global = await importRepository({ config, store }, {
+        id: "p-filter-global",
+        source_path: globalSource,
+        scope_include: JSON.stringify(["**/*.js"]),
+        scope_exclude: "[]",
+      }, "HEAD", "tester");
+      expect(await Bun.file(join(global.path, "a.js")).text()).toBe("PLAIN_GLOBAL_BYTES\n");
+      expect(existsSync(globalMarker)).toBe(false);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
   test("import does not wait when git HEAD is a pipe", async () => {
     const source = join(dir, "fifo-head");
     mkdirSync(join(source, ".git"), { recursive: true });

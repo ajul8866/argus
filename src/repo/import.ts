@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import type { Config } from "../config.ts";
 import type { Store } from "../db/index.ts";
@@ -103,7 +103,7 @@ async function assertContainedObjectStore(gitDir: string): Promise<void> {
 // when that discovered metadata is the work tree containing this source path,
 // and the object store does not point at another repository. subpath is the
 // directory to archive when the source sits below the work tree root.
-async function prepareRefArchive(sourceRoot: string): Promise<{ toplevel: string; subpath: string | null }> {
+async function prepareRefArchive(sourceRoot: string): Promise<{ subpath: string | null; gitDir: string }> {
   const gitPath = join(sourceRoot, ".git");
   let localGit;
   try {
@@ -155,7 +155,7 @@ async function prepareRefArchive(sourceRoot: string): Promise<{ toplevel: string
   if (pinnedCommon !== pinnedGit) throw invalidGitMetadata();
   await assertContainedObjectStore(pinnedGit);
   const relativePath = relative(pinnedTop, sourceRoot);
-  if (!relativePath) return { toplevel: pinnedTop, subpath: null };
+  if (!relativePath) return { subpath: null, gitDir: pinnedGit };
   if (
     relativePath.startsWith("..") ||
     relativePath.startsWith("/") ||
@@ -163,7 +163,35 @@ async function prepareRefArchive(sourceRoot: string): Promise<{ toplevel: string
   ) {
     throw invalidGitMetadata();
   }
-  return { toplevel: pinnedTop, subpath: relativePath.split(sep).join("/") };
+  return { subpath: relativePath.split(sep).join("/"), gitDir: pinnedGit };
+}
+
+// `git archive` runs smudge and process filters named by attributes. The
+// command is taken from the repository config, the system Git config, or the
+// user's global Git config. Archive through a Git directory we created and
+// the object store checked above, with those config sources replaced.
+async function archivePinnedCommit(
+  gitDir: string,
+  treeish: string,
+  archivePath: string,
+  staging: string,
+): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> {
+  const archiveGit = join(staging, "archive.git");
+  await mkdir(join(archiveGit, "objects"), { recursive: true, mode: 0o700 });
+  await mkdir(join(archiveGit, "refs"), { mode: 0o700 });
+  await writeFile(join(archiveGit, "config"), "[core]\n\trepositoryformatversion = 0\n", { mode: 0o600 });
+  await writeFile(join(archiveGit, "HEAD"), "ref: refs/heads/argus\n", { mode: 0o600 });
+  const globalConfig = join(staging, "gitconfig");
+  await writeFile(globalConfig, "", { mode: 0o600 });
+  const env = gitCommandEnv();
+  env.GIT_DIR = archiveGit;
+  env.GIT_OBJECT_DIRECTORY = join(gitDir, "objects");
+  env.GIT_CONFIG_NOSYSTEM = "1";
+  env.GIT_CONFIG_GLOBAL = globalConfig;
+  return runCommand(
+    ["git", "archive", "--format=tar", "--output", archivePath, treeish],
+    { env, timeoutMs: 180_000 },
+  );
 }
 
 export async function importRepository(
@@ -204,7 +232,7 @@ export async function importRepository(
   let staging: string | null = null;
   try {
     if (ref) {
-      if (!git.commit) throw badRequest("Git refs require a git repository");
+      if (!git.commit || !refArchive) throw badRequest("Git refs require a git repository");
       const env = gitCommandEnv();
       const resolved = await runCommand(
         ["git", "-C", sourceRoot, "rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`],
@@ -212,15 +240,12 @@ export async function importRepository(
       );
       if (resolved.code !== 0 || resolved.timedOut) throw badRequest(`Unknown git ref: ${ref}`);
       commit = resolved.stdout.trim();
-      const treeish = refArchive?.subpath ? `${commit}:${refArchive.subpath}` : commit;
+      const treeish = refArchive.subpath ? `${commit}:${refArchive.subpath}` : commit;
       staging = await mkdtemp(join(deps.config.dataDir, "repo-import-"));
       const archivePath = join(staging, "snapshot.tar");
       const extractedRoot = join(staging, "source");
       await mkdir(extractedRoot, { mode: 0o700 });
-      const archived = await runCommand(
-        ["git", "-C", refArchive?.toplevel ?? sourceRoot, "archive", "--format=tar", "--output", archivePath, treeish],
-        { env, timeoutMs: 180_000 },
-      );
+      const archived = await archivePinnedCommit(refArchive.gitDir, treeish, archivePath, staging);
       if (archived.code !== 0 || archived.timedOut) {
         throw badRequest(`Failed to archive ${ref}: ${archived.stderr.slice(0, 500)}`);
       }

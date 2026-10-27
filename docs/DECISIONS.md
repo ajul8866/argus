@@ -61,6 +61,24 @@ suite asserts report creation happens after the last retest.
 snapshot (or `git archive` for a ref) and rebuilds the inventory there. This
 prevents a later worktree edit from invalidating evidence. The original commit
 and branch are recorded; uncommitted worktree state is represented by the file
+hashes in the inventory. A ref archive uses the Git directory discovered for
+that work tree and ignores `GIT_*` overrides. Metadata that points at another
+object store, including a different Git common directory, is rejected instead
+of being copied into the snapshot. The archive command runs in a separate
+repository with the `filter` attribute unset, so Git config cannot turn a
+smudge or process filter into a read of files outside the commit.
+of being copied into the snapshot. That archive does not load repository,
+system, or global Git configuration, so filter commands do not run and
+`core.autocrlf` is not applied. System and global attribute files are not
+read. The archive Git directory uses the pinned repository's object format,
+including SHA-256. Committed `export-subst` attributes are disabled, so a
+signature placeholder cannot run `gpg`. Committed attributes can still request
+line-ending conversion.
+that work tree and does not pass inherited `GIT_*` overrides through.
+Metadata that points at another object store, including a different Git common
+directory, is rejected instead of being copied into the snapshot. A promisor
+remote is not consulted: lazy fetch is disabled, so a missing object fails the
+ref import instead of being downloaded.
 hashes in the inventory. A ref archive reads a git directory opened without
 following a symlink. A git common directory that does not resolve to that git
 directory, an alternate object directory Git would resolve outside the allowed

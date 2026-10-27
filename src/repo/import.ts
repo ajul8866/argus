@@ -276,6 +276,16 @@ function isWorktreePrivateRef(refName: string): boolean {
   return true;
 }
 
+// `main-worktree/HEAD` and `main-worktree/refs/bisect/...` name the main
+// worktree's private refs. Git reads them from the common directory under
+// the bare name, not from a `main-worktree` directory.
+function mainWorktreeRefName(refName: string): string | null {
+  const prefix = "main-worktree/";
+  if (!refName.startsWith(prefix)) return null;
+  const bare = refName.slice(prefix.length);
+  return isWorktreePrivateRef(bare) ? bare : null;
+}
+
 // `--abbrev-ref HEAD` follows the symref chain and shortens the final ref.
 // A linked worktree stores shared refs in the common directory. The next hop
 // of a private ref is still the file next to HEAD.
@@ -290,7 +300,8 @@ async function finalHeadRef(headDir: string, refRoot: string): Promise<string | 
     if (!target || seen.has(target)) throw invalidGitMetadata();
     seen.add(target);
     full = target;
-    const next = await looseRefLine(isWorktreePrivateRef(target) ? headDir : refRoot, target);
+    const bare = mainWorktreeRefName(target);
+    const next = await looseRefLine(bare ? refRoot : isWorktreePrivateRef(target) ? headDir : refRoot, bare ?? target);
     if (next === null) break;
     line = next;
   }

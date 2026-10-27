@@ -541,4 +541,57 @@ CREATE TABLE api_tokens (
 CREATE INDEX idx_api_tokens_user ON api_tokens(user_id);
 `,
   },
+  {
+    version: 8,
+    name: "asset_and_exploration_graphs",
+    sql: `
+CREATE TABLE assets (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('root_domain','subdomain','ip','service','app','endpoint')),
+  asset_key TEXT NOT NULL,
+  parent_id TEXT REFERENCES assets(id),
+  data TEXT NOT NULL,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  UNIQUE (project_id, kind, asset_key)
+);
+CREATE INDEX idx_assets_project ON assets(project_id);
+
+CREATE TABLE asset_edges (
+  from_asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  to_asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  PRIMARY KEY (from_asset_id, to_asset_id, kind)
+);
+
+CREATE TABLE exploration_nodes (
+  id TEXT PRIMARY KEY,
+  audit_id TEXT NOT NULL REFERENCES audits(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('goal','intent','fact','finding','hint')),
+  status TEXT NOT NULL CHECK (status IN ('proposed','approved','claimed','running','completed','failed','rejected')),
+  task_id TEXT REFERENCES tasks(id),
+  session_id TEXT REFERENCES agent_sessions(id),
+  payload TEXT NOT NULL,
+  retry_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_exploration_audit ON exploration_nodes(audit_id, status, kind);
+
+CREATE TABLE exploration_edges (
+  from_node_id TEXT NOT NULL REFERENCES exploration_nodes(id) ON DELETE CASCADE,
+  to_node_id TEXT NOT NULL REFERENCES exploration_nodes(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('spawns','derived_from','yields','proves','rejects')),
+  PRIMARY KEY (from_node_id, to_node_id, kind)
+);
+
+CREATE TABLE anchors (
+  node_id TEXT NOT NULL REFERENCES exploration_nodes(id) ON DELETE CASCADE,
+  asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  PRIMARY KEY (node_id, asset_id)
+);
+CREATE INDEX idx_anchors_asset ON anchors(asset_id);
+`,
+  },
 ];

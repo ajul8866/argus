@@ -82,7 +82,7 @@ test("upgrading runtime tool inheritance preserves custom role restrictions and 
     expect(upgraded.get("SELECT inherit_tools FROM agent_defs WHERE role = 'independent_validator'")).toEqual({ inherit_tools: 1 });
     expect(upgraded.get("SELECT inherit_tools, allowed_tools FROM agent_defs WHERE role = 'security_researcher'")).toEqual({ inherit_tools: 0, allowed_tools: '["read"]' });
     expect(upgraded.get("SELECT inherit_tools, allow_shell FROM agent_defs WHERE role = 'retest_auditor'")).toEqual({ inherit_tools: 0, allow_shell: 1 });
-    expect(upgraded.all("SELECT version FROM schema_migrations ORDER BY version")).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }]);
+    expect(upgraded.all("SELECT version FROM schema_migrations ORDER BY version")).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }]);
   } finally {
     upgraded.close();
     rmSync(directory, { recursive: true, force: true });

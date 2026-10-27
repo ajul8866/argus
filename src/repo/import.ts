@@ -346,6 +346,21 @@ async function addSymrefAbbreviations(
   names: Set<string>,
   follow: readonly SymrefFollow[],
   sharedRefsElsewhere: boolean,
+// Git keeps only HEAD and a few namespaces in a linked worktree's own
+// directory; every other ref is read from the common directory, so a
+// same-named file in the worktree directory is a decoy Git never opens.
+function isPerWorktreeRef(refName: string): boolean {
+  return refName === "HEAD"
+    || refName.startsWith("refs/bisect/")
+    || refName.startsWith("refs/worktree/")
+    || refName.startsWith("refs/rewritten/");
+}
+
+async function addSymrefAbbreviations(
+  gitDir: string,
+  common: string | null,
+  names: Set<string>,
+  follow: readonly SymrefFollow[],
 ): Promise<SymrefFollow[]> {
   const carry: SymrefFollow[] = [];
   const pending = [...follow];
@@ -354,11 +369,8 @@ async function addSymrefAbbreviations(
     const item = pending.pop();
     if (!item || visited.has(item.name)) continue;
     visited.add(item.name);
-    if (sharedRefsElsewhere && !isCurrentWorktreeRef(item.name)) {
-      carry.push(item);
-      continue;
-    }
-    const line = await readLooseRefLine(gitDir, item.name);
+    const store = common && !isPerWorktreeRef(item.name) ? common : gitDir;
+    const line = await readLooseRefLine(store, item.name);
     if (line === null) {
       carry.push(item);
       continue;

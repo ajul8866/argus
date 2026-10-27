@@ -1634,10 +1634,74 @@ describe("repository import", () => {
     insert("p-main-worktree-linked", mainWorktreeChild);
     expect(await attempt("p-main-worktree-linked", mainWorktreeChild, null)).toBe("invalid_repository");
 
+    const dwimMain = prepare("dwim-main-worktree");
+    mkdirSync(join(dwimMain, ".git", "refs", "tags"), { recursive: true });
+    writeFileSync(join(dwimMain, ".git", "refs", "tags", "master"), "ref: main-worktree/ORIG_HEAD\n");
+    fifo(join(dwimMain, ".git", "ORIG_HEAD"));
+    insert("p-dwim-main-worktree", dwimMain);
+    expect(await attempt("p-dwim-main-worktree", dwimMain, null)).toBe("invalid_repository");
+
+    const dwimRoot = prepare("dwim-private-root");
+    git(dwimRoot, ["branch", "feature"]);
+    const dwimChild = join(dir, "dwim-private-child");
+    git(dwimRoot, ["worktree", "add", "-q", "-b", "child-branch", dwimChild, "feature"]);
+    const dwimGitdir = readFileSync(join(dwimChild, ".git"), "utf8").trim();
+    const dwimDeclared = dwimGitdir.startsWith("gitdir: ") ? dwimGitdir.slice("gitdir: ".length).trim() : "";
+    const dwimGit = dwimDeclared.startsWith("/") ? dwimDeclared : join(dwimChild, dwimDeclared);
+    mkdirSync(join(dwimRoot, ".git", "refs", "tags"), { recursive: true });
+    writeFileSync(join(dwimRoot, ".git", "refs", "tags", "child-branch"), "ref: refs/bisect/bad\n");
+    mkdirSync(join(dwimGit, "refs", "bisect"), { recursive: true });
+    fifo(join(dwimGit, "refs", "bisect", "bad"));
+    mkdirSync(join(dwimRoot, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(dwimRoot, ".git", "refs", "bisect", "bad"), `${"b".repeat(40)}\n`);
+    insert("p-dwim-private", dwimChild);
+    expect(await attempt("p-dwim-private", dwimChild, null)).toBe("invalid_repository");
+
+    const dwimAliasRoot = prepare("dwim-alias-root");
+    git(dwimAliasRoot, ["branch", "feature"]);
+    const dwimAliasChild = join(dir, "dwim-alias-child");
+    git(dwimAliasRoot, ["worktree", "add", "-q", "-b", "alias-branch", dwimAliasChild, "feature"]);
+    const dwimAliasGitdir = readFileSync(join(dwimAliasChild, ".git"), "utf8").trim();
+    const dwimAliasDeclared = dwimAliasGitdir.startsWith("gitdir: ") ? dwimAliasGitdir.slice("gitdir: ".length).trim() : "";
+    const dwimAliasGit = dwimAliasDeclared.startsWith("/") ? dwimAliasDeclared : join(dwimAliasChild, dwimAliasDeclared);
+    writeFileSync(join(dwimAliasRoot, ".git", "refs", "heads", "alias"), "ref: refs/bisect/bad\n");
+    mkdirSync(join(dwimAliasRoot, ".git", "refs", "tags"), { recursive: true });
+    writeFileSync(join(dwimAliasRoot, ".git", "refs", "tags", "alias-branch"), "ref: refs/heads/alias\n");
+    mkdirSync(join(dwimAliasGit, "refs", "bisect"), { recursive: true });
+    fifo(join(dwimAliasGit, "refs", "bisect", "bad"));
+    mkdirSync(join(dwimAliasRoot, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(dwimAliasRoot, ".git", "refs", "bisect", "bad"), `${"c".repeat(40)}\n`);
+    insert("p-dwim-alias", dwimAliasChild);
+    expect(await attempt("p-dwim-alias", dwimAliasChild, null)).toBe("invalid_repository");
+
     const healthy = prepare("branch-healthy");
     insert("p-branch-healthy", healthy);
     const imported = await importRepository({ config, store }, projectFor("p-branch-healthy", healthy), null, "tester");
     expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const healthyDwim = prepare("dwim-main-worktree-healthy");
+    mkdirSync(join(healthyDwim, ".git", "refs", "tags"), { recursive: true });
+    writeFileSync(join(healthyDwim, ".git", "ORIG_HEAD"), "ref: refs/heads/master\n");
+    writeFileSync(join(healthyDwim, ".git", "refs", "tags", "master"), "ref: main-worktree/ORIG_HEAD\n");
+    insert("p-dwim-main-worktree-healthy", healthyDwim);
+    const dwimImported = await importRepository({ config, store }, projectFor("p-dwim-main-worktree-healthy", healthyDwim), null, "tester");
+    expect(await Bun.file(join(dwimImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const healthyPrivateRoot = prepare("dwim-private-healthy-root");
+    git(healthyPrivateRoot, ["branch", "feature"]);
+    const healthyPrivate = join(dir, "dwim-private-healthy-child");
+    git(healthyPrivateRoot, ["worktree", "add", "-q", "-b", "child-branch", healthyPrivate, "feature"]);
+    const healthyPrivateGitdir = readFileSync(join(healthyPrivate, ".git"), "utf8").trim();
+    const healthyPrivateDeclared = healthyPrivateGitdir.startsWith("gitdir: ") ? healthyPrivateGitdir.slice("gitdir: ".length).trim() : "";
+    const healthyPrivateGit = healthyPrivateDeclared.startsWith("/") ? healthyPrivateDeclared : join(healthyPrivate, healthyPrivateDeclared);
+    mkdirSync(join(healthyPrivateGit, "refs", "bisect"), { recursive: true });
+    writeFileSync(join(healthyPrivateGit, "refs", "bisect", "bad"), "ref: refs/heads/feature\n");
+    mkdirSync(join(healthyPrivateRoot, ".git", "refs", "tags"), { recursive: true });
+    writeFileSync(join(healthyPrivateRoot, ".git", "refs", "tags", "child-branch"), "ref: refs/heads/alias\n");
+    writeFileSync(join(healthyPrivateRoot, ".git", "refs", "heads", "alias"), "ref: refs/bisect/bad\n");
+    insert("p-dwim-private-healthy", healthyPrivate);
+    const privateImported = await importRepository({ config, store }, projectFor("p-dwim-private-healthy", healthyPrivate), null, "tester");
+    expect(await Bun.file(join(privateImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
 
     const healthyChain = prepare("branch-chain-healthy");
     writeFileSync(join(healthyChain, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");

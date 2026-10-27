@@ -123,13 +123,34 @@ function gitRefParts(refName: string): string[] {
   return parts;
 }
 
-// Follow a symref chain without opening a pipe or a symlink. Git opens the
-// same path while resolving HEAD and while resolving the requested revision,
-// and a fifo there waits until another process connects a writer.
-async function assertLooseRef(gitDir: string, refName: string, depth: number): Promise<void> {
+// The file Git opens for this ref. Private names live beside the worktree
+// HEAD. `main-worktree/` on one of those names is the bare file in the common
+// directory. Every other name, including `worktrees/<id>/...`, is the path
+// under the common directory.
+function resolvedLooseRef(
+  scope: { worktree: string; common: string },
+  refName: string,
+): { dir: string; name: string } {
+  const bare = mainWorktreeRefName(refName);
+  if (bare) return { dir: scope.common, name: bare };
+  if (isWorktreePrivateRef(refName)) return { dir: scope.worktree, name: refName };
+  return { dir: scope.common, name: refName };
+}
+
+// Follow a symref chain without opening a pipe or a symlink. The first hop is
+// the loose file in `gitDir` (a dwim probe may look in both git directories).
+// Later hops are the files Git opens for that ref, which can be in the other
+// directory. A fifo there waits until another process connects a writer.
+async function assertLooseRef(
+  gitDir: string,
+  refName: string,
+  depth: number,
+  scope?: { worktree: string; common: string },
+): Promise<void> {
   if (depth > 8) throw invalidGitMetadata();
-  const parts = gitRefParts(refName);
-  let current = gitDir;
+  const located = scope && depth > 0 ? resolvedLooseRef(scope, refName) : { dir: gitDir, name: refName };
+  const parts = gitRefParts(located.name);
+  let current = located.dir;
   for (let index = 0; index < parts.length; index += 1) {
     const part = parts[index];
     if (!part) throw invalidGitMetadata();
@@ -151,7 +172,9 @@ async function assertLooseRef(gitDir: string, refName: string, depth: number): P
   const text = await readSmallGitText(current);
   const line = text?.split("\n", 1)[0] ?? "";
   if (!line.startsWith("ref:")) return;
-  await assertLooseRef(gitDir, line.slice("ref:".length).trim(), depth + 1);
+  const next = line.slice("ref:".length).trim();
+  if (scope) await assertLooseRef(located.dir, next, depth + 1, scope);
+  else await assertLooseRef(gitDir, next, depth + 1);
 }
 
 // "name~3" and "name^2" select an ancestor. Git opens the loose ref for the
@@ -184,7 +207,11 @@ function revisionRefName(ref: string): string {
 // longer probe cannot be opened as a directory, so that one probe stops.
 // A symlink can be followed into a pipe, and the final file can be a symref
 // to a pipe outside refs/.
-async function assertProbedRef(gitDir: string, refName: string): Promise<void> {
+async function assertProbedRef(
+  gitDir: string,
+  refName: string,
+  scope?: { worktree: string; common: string },
+): Promise<void> {
   if (!refName) return;
   const parts = gitRefParts(refName);
   let current = gitDir;
@@ -207,13 +234,17 @@ async function assertProbedRef(gitDir: string, refName: string): Promise<void> {
     if (entry.isDirectory()) return;
     if (!entry.isFile()) throw invalidGitMetadata();
   }
-  await assertLooseRef(gitDir, refName, 0);
+  await assertLooseRef(gitDir, refName, 0, scope);
 }
 
 // repo_dwim_ref tries these six shapes and, when ambiguous-ref warnings are
 // on, opens every one of them. A pipe at refs/tags/<name> blocks verification
 // of the branch <name> before Git reaches refs/heads/<name>.
-async function assertRequestedRevision(gitDir: string, ref: string): Promise<void> {
+async function assertRequestedRevision(
+  gitDir: string,
+  ref: string,
+  scope?: { worktree: string; common: string },
+): Promise<void> {
   const name = revisionRefName(ref);
   if (!name) return;
   const probes = [
@@ -224,7 +255,7 @@ async function assertRequestedRevision(gitDir: string, ref: string): Promise<voi
     `refs/remotes/${name}`,
     `refs/remotes/${name}/HEAD`,
   ];
-  for (const probe of probes) await assertProbedRef(gitDir, probe);
+  for (const probe of probes) await assertProbedRef(gitDir, probe, scope);
 }
 
 // Git walks these abbreviations from the most specific rule. Strict mode
@@ -300,8 +331,8 @@ async function finalHeadRef(headDir: string, refRoot: string): Promise<string | 
     if (!target || seen.has(target)) throw invalidGitMetadata();
     seen.add(target);
     full = target;
-    const bare = mainWorktreeRefName(target);
-    const next = await looseRefLine(bare ? refRoot : isWorktreePrivateRef(target) ? headDir : refRoot, bare ?? target);
+    const located = resolvedLooseRef({ worktree: headDir, common: refRoot }, target);
+    const next = await looseRefLine(located.dir, located.name);
     if (next === null) break;
     line = next;
   }
@@ -317,6 +348,7 @@ async function assertGitLookups(
   ref: string | null,
   inherited: readonly string[] = [],
   seen = new Set<string>(),
+  scope?: { worktree: string; common: string },
 ): Promise<void> {
   let identity;
   try {
@@ -333,14 +365,17 @@ async function assertGitLookups(
     const base = revisionRefName(ref);
     if (base) names.add(base);
   }
-  const common = await linkedGitDirectory(gitDir);
-  const finalRef = await finalHeadRef(gitDir, common ?? gitDir);
+  // Git reads commondir from the git directory the command started in. The
+  // recursive call probes that common directory with the same worktree.
+  const linked = scope ? null : await linkedGitDirectory(gitDir);
+  const resolved = scope ?? { worktree: gitDir, common: linked ?? gitDir };
+  const finalRef = await finalHeadRef(gitDir, resolved.common);
   if (finalRef) {
     names.add(finalRef);
     for (const shortName of gitShortRefNames(finalRef)) names.add(shortName);
   }
-  for (const name of names) await assertRequestedRevision(gitDir, name);
-  if (common) await assertGitLookups(common, ref, [...names], seen);
+  for (const name of names) await assertRequestedRevision(gitDir, name, resolved);
+  if (linked) await assertGitLookups(linked, ref, [...names], seen, resolved);
 }
 
 // Git opens include.path while parsing config, before a command-line -c

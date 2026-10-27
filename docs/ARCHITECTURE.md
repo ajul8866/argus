@@ -149,7 +149,8 @@ The content file is written mode 0600; DB rows are append-only via triggers.
 Content reads for the evidence API, retest prompts, and report excerpts verify
 that sidecar against the database record and fail closed when it does not match.
 Replacing the sidecar with a symlink or a pipe fails closed. The read does not
-follow the symlink or wait for a pipe writer.
+follow the symlink or wait for a pipe writer, and it stops at the size observed
+on that open file.
 Verification rows are also append-only. Finding provenance columns are
 immutable; retest session can be set once, never changed.
 
@@ -177,8 +178,11 @@ This is the step that makes two agreeing LLMs insufficient.
   writer. Report bytes are hashed and recorded.
 - Every generation uses its report UUID in the filename and exclusive file
   creation, so simultaneous requests cannot overwrite another report even when
-  their timestamps match. Downloads recompute the stored SHA-256 and fail closed
-  when the file no longer matches its database record.
+  their timestamps match. Downloads recompute the stored size and SHA-256 and
+  fail closed when the file no longer matches its database record. Replacing
+  the file with a symlink or a pipe fails closed. The open does not follow the
+  symlink or wait for a pipe writer, and it stops at the size observed on that
+  open file.
 
 ## 3. Persistence and recovery
 

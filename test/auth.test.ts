@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { constants, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuthService } from "../src/auth.ts";
@@ -317,11 +318,157 @@ test("report downloads fail closed when the stored bytes no longer match the rec
   const service = new ReportService(config(dir), store, new EvidenceStore(config(dir), store), new EventLog(store));
   const [report] = await service.generate(auditId, ["markdown"], "test");
   const download = () => api(new Request(`http://localhost/api/reports/${report!.id}/download`, { headers }));
-  expect((await download()).status).toBe(200);
+  const accepted = await download();
+  expect(accepted.status).toBe(200);
+  expect(Buffer.from(await accepted.arrayBuffer()).equals(readFileSync(report!.path))).toBe(true);
+  const sameSize = Buffer.from(readFileSync(report!.path));
+  const first = sameSize[0] ?? 0;
+  sameSize[0] = first === 0x41 ? 0x42 : 0x41;
+  writeFileSync(report!.path, sameSize);
+  const sameLength = await download();
+  expect(sameLength.status).toBe(409);
+  expect(await sameLength.json()).toMatchObject({ error: { code: "conflict" } });
   writeFileSync(report!.path, "tampered report\n");
   const rejected = await download();
   expect(rejected.status).toBe(409);
-  expect(await rejected.json()).toMatchObject({ error: { code: "conflict" } });
+  expect(await rejected.json()).toMatchObject({
+    error: { code: "conflict", message: "Report integrity check failed; the stored file does not match its recorded size" },
+  });
+});
+
+test("report downloads reject a pipe or symlink without waiting or following it", async () => {
+  const { api, headers, engine, userId } = await projectClient();
+  const timestamp = new Date().toISOString();
+  store.run(
+    `INSERT INTO projects (id, name, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+     VALUES ('report-pipe-project', 'Report pipe', ?, '["**/*"]', '[]', '', '', ?, ?)`,
+    dir, timestamp, timestamp,
+  );
+  store.run(
+    `INSERT INTO repositories (id, project_id, path, languages, frameworks, inventory, graph, file_count, total_bytes, imported_at)
+     VALUES ('report-pipe-repo', 'report-pipe-project', ?, '{}', '[]', '{}', '{}', 0, 0, ?)`,
+    dir, timestamp,
+  );
+  const auditId = engine.createAudit({ projectId: "report-pipe-project", repositoryId: "report-pipe-repo", userId });
+  const service = new ReportService(config(dir), store, new EvidenceStore(config(dir), store), new EventLog(store));
+  const [report] = await service.generate(auditId, ["markdown"], "test");
+  const reportPath = report!.path;
+  const original = readFileSync(reportPath);
+  const download = () => api(new Request(`http://localhost/api/reports/${report!.id}/download`, { headers }));
+  const finished = async () => Promise.race([
+    download(),
+    Bun.sleep(1_000).then(() => {
+      throw new Error("report download blocked");
+    }),
+  ]);
+
+  rmSync(reportPath);
+  expect((await finished()).status).toBe(404);
+
+  expect(Bun.spawnSync(["mkfifo", reportPath]).exitCode).toBe(0);
+  const unwritable = await finished();
+  expect(unwritable.status).toBe(409);
+  expect(await unwritable.json()).toMatchObject({
+    error: { code: "conflict", message: "Report file is missing or unreadable" },
+  });
+
+  const reader = await open(reportPath, constants.O_RDONLY | constants.O_NONBLOCK);
+  const writer = await open(reportPath, constants.O_WRONLY);
+  await reader.close();
+  try {
+    const held = await finished();
+    expect(held.status).toBe(409);
+    expect(await held.json()).toMatchObject({ error: { code: "conflict" } });
+  } finally {
+    await writer.close();
+  }
+
+  rmSync(reportPath);
+  const target = join(dir, "report-copy.md");
+  writeFileSync(target, original);
+  symlinkSync(target, reportPath);
+  const linked = await finished();
+  expect(linked.status).toBe(409);
+  expect(await linked.json()).toMatchObject({
+    error: { code: "conflict", message: "Report file is missing or unreadable" },
+  });
+});
+
+test("report downloads read only the size checked when the file grows", async () => {
+  const { api, headers, engine, userId } = await projectClient();
+  const timestamp = new Date().toISOString();
+  store.run(
+    `INSERT INTO projects (id, name, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+     VALUES ('report-grow-project', 'Report grow', ?, '["**/*"]', '[]', '', '', ?, ?)`,
+    dir, timestamp, timestamp,
+  );
+  store.run(
+    `INSERT INTO repositories (id, project_id, path, languages, frameworks, inventory, graph, file_count, total_bytes, imported_at)
+     VALUES ('report-grow-repo', 'report-grow-project', ?, '{}', '[]', '{}', '{}', 0, 0, ?)`,
+    dir, timestamp,
+  );
+  const auditId = engine.createAudit({ projectId: "report-grow-project", repositoryId: "report-grow-repo", userId });
+  const service = new ReportService(config(dir), store, new EvidenceStore(config(dir), store), new EventLog(store));
+  const [report] = await service.generate(auditId, ["markdown"], "test");
+  const reportPath = report!.path;
+  const original = readFileSync(reportPath);
+  const before = original.length;
+  const probe = await open(reportPath, "r");
+  const proto = Object.getPrototypeOf(probe) as {
+    stat: (this: unknown, ...args: unknown[]) => Promise<{ isFile: () => boolean; size: number }>;
+    read: (
+      this: unknown,
+      buffer: Buffer,
+      offset?: number,
+      length?: number,
+      position?: number | null,
+    ) => Promise<{ bytesRead: number }>;
+    readFile: (this: unknown, ...args: unknown[]) => Promise<unknown>;
+  };
+  await probe.close();
+  const originalStat = proto.stat;
+  const originalRead = proto.read;
+  const originalReadFile = proto.readFile;
+  let readFileCalls = 0;
+  let maxRequested = 0;
+  proto.stat = async function (this: unknown, ...args: unknown[]) {
+    const info = await originalStat.apply(this, args);
+    const size = info.size;
+    const file = info.isFile();
+    if (file && size === before) {
+      writeFileSync(reportPath, Buffer.concat([original, Buffer.alloc(1024 * 1024, 0x51)]));
+    }
+    return { isFile: () => file, size };
+  };
+  proto.read = async function (
+    this: unknown,
+    buffer: Buffer,
+    offset?: number,
+    length?: number,
+    position?: number | null,
+  ) {
+    if (length === undefined || length > before) {
+      throw new Error(`unbounded report read of ${String(length)} bytes`);
+    }
+    maxRequested = Math.max(maxRequested, length);
+    return originalRead.call(this, buffer, offset, length, position);
+  };
+  proto.readFile = async function (this: unknown, ...args: unknown[]) {
+    readFileCalls += 1;
+    return originalReadFile.apply(this, args);
+  };
+  try {
+    const response = await api(new Request(`http://localhost/api/reports/${report!.id}/download`, { headers }));
+    expect(response.status).toBe(200);
+    expect(Buffer.from(await response.arrayBuffer()).equals(original)).toBe(true);
+    expect(readFileCalls).toBe(0);
+    expect(maxRequested).toBeGreaterThan(0);
+    expect(maxRequested).toBeLessThanOrEqual(before);
+  } finally {
+    proto.stat = originalStat;
+    proto.read = originalRead;
+    proto.readFile = originalReadFile;
+  }
 });
 
 test("evidence reads fail closed when the stored file no longer matches the database record", async () => {

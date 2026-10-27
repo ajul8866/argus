@@ -196,7 +196,7 @@ access, and linked MCP server assignments remain independent controls.
 | `GET` | `/api/approvals?status=` | any | Approval queue/history |
 | `POST` | `/api/approvals/:id/decide` | admin | `{approved,reason}` |
 | `GET` | `/api/reports?audit_id=` | any | Report metadata |
-| `GET` | `/api/reports/:id/download` | any | Download generated file |
+| `GET` | `/api/reports/:id/download` | any | Download a generated file. A missing file is 404. A symlink, pipe, or size or hash mismatch is 409. The read stops at the recorded size |
 | `GET` | `/api/audit-log` | admin | Security log |
 
 ## SSE

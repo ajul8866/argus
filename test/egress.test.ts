@@ -388,3 +388,53 @@ describe("broker container handshake", () => {
     expect(call!.join(" ")).toContain("token-a");
   });
 });
+
+describe("worker control plane", () => {
+  test("the worker joins an internal control network and learns the Argus API URL", async () => {
+    const { calls, executor } = fakeExecutor();
+    const runtime = new ContainerRuntime({
+      executor,
+      which: async () => "/usr/bin/docker",
+      ...images,
+    });
+    const plan = await runtime.create("a3", {
+      control: { network: "argus-control", apiUrl: "http://argus:8787" },
+    });
+    const created = calls.map((argv) => argv.join(" "));
+    expect(created).toContain("docker network create --internal argus-control");
+    expect(created).toContain("docker network connect argus-control argus-worker-a3");
+    const worker = calls.find((argv) => argv.join(" ").includes("argus/worker:test"))!.join(" ");
+    expect(worker).toContain("ARGUS_API_BASE_URL=http://argus:8787");
+    expect(plan.controlUrl).toBe("http://argus:8787");
+  });
+
+  test("a worker without a control plane gets no Argus API URL", async () => {
+    const { calls, executor } = fakeExecutor();
+    const runtime = new ContainerRuntime({
+      executor,
+      which: async () => "/usr/bin/docker",
+      ...images,
+    });
+    await runtime.create("a4");
+    const worker = calls.find((argv) => argv.join(" ").includes("argus/worker:test"))!.join(" ");
+    expect(worker).not.toContain("ARGUS_API_BASE_URL");
+  });
+});
+
+describe("worker control plane routing", () => {
+  test("the worker reaches Argus directly with no proxy while target traffic goes through the broker", async () => {
+    const { calls, executor } = fakeExecutor();
+    const runtime = new ContainerRuntime({
+      executor,
+      which: async () => "/usr/bin/docker",
+      ...images,
+    });
+    await runtime.create("a5", {
+      control: { network: "argus-control", apiUrl: "http://argus:8787" },
+    });
+    const worker = calls.find((argv) => argv.join(" ").includes("argus/worker:test"))!.join(" ");
+    // NO_PROXY must cover the Argus host, or the API token would be sent to the broker.
+    expect(worker).toContain("NO_PROXY=argus");
+    expect(worker).toContain("no_proxy=argus");
+  });
+});

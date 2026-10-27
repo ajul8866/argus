@@ -947,3 +947,46 @@ test("exploration route returns assets, nodes, edges, anchors, and coverage", as
     expect.objectContaining({ assetId: asset.id, assetKey: "https://graph.test", tested: true }),
   ]);
 });
+
+test("a user can issue and revoke an API token for a worker", async () => {
+  const { api, headers } = await projectClient();
+  const created = await api(new Request("http://localhost/api/tokens", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ label: "worker", scopes: ["audit:propose_candidate"], audit_id: "a_missing" }),
+  }));
+  expect(created.status).toBe(400);
+
+  store.run(
+    `INSERT INTO projects (id, name, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+     VALUES ('p_tok','Tokens', ?, '**/*', '', 'Tester', 'AUTH-TOK', ?, ?)`,
+    dir,
+    now(),
+    now(),
+  );
+  store.run(
+    `INSERT INTO audits (id, project_id, repository_id, status, current_phase, config, mode, created_at)
+     VALUES ('a_tok','p_tok',NULL,'running',2,'{}','dynamic',?)`,
+    now(),
+  );
+  const issued = await api(new Request("http://localhost/api/tokens", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ label: "worker", scopes: ["audit:propose_candidate"], audit_id: "a_tok" }),
+  }));
+  expect(issued.status).toBe(201);
+  const body = await issued.json();
+  expect(body.token.raw).toStartWith("argus_");
+  expect(body.token.scopes).toEqual(["audit:propose_candidate"]);
+  const listed = await api(new Request("http://localhost/api/tokens", { headers }));
+  expect(listed.status).toBe(200);
+  const listedBody = await listed.json();
+  expect(listedBody.tokens).toHaveLength(1);
+  // The raw value is returned once and must never be readable again.
+  expect(JSON.stringify(listedBody)).not.toContain(body.token.raw);
+
+  const revoked = await api(new Request(`http://localhost/api/tokens/${body.token.id}`, { method: "DELETE", headers }));
+  expect(revoked.status).toBe(200);
+  const after = await api(new Request("http://localhost/api/tokens", { headers }));
+  expect((await after.json()).tokens).toEqual([]);
+});

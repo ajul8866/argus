@@ -20,10 +20,14 @@ export type RuntimePlan = {
   brokerPort: number;
   /** Where the orchestrator writes the one-time identity handshake. */
   handshakePath: string;
+  /** Argus API address the worker uses to report observations. */
+  controlUrl: string | null;
 };
 
 export type CreateRuntimeOptions = {
   workspacePath?: string;
+  /** Internal network and API address that let the worker reach Argus itself. */
+  control?: { network: string; apiUrl: string };
   workerImage?: string;
   brokerImage?: string;
   brokerPort?: number;
@@ -90,11 +94,16 @@ export class ContainerRuntime {
       brokerUrl: `http://${nameFor("argus-broker", auditId)}:${brokerPort}`,
       brokerPort,
       handshakePath: "/run/argus/handshake.json",
+      controlUrl: options.control?.apiUrl ?? null,
     };
     await this.run(kind, ["network", "create", "--internal", plan.network]);
     try {
       // The broker needs a route to the target; the worker never gets one.
       await this.run(kind, ["network", "create", plan.egressNetwork]);
+      if (options.control) {
+        // Internal: the worker can reach Argus, but not the internet.
+        await this.run(kind, ["network", "create", "--internal", options.control.network]);
+      }
       await this.run(kind, [
         "run",
         "-d",
@@ -109,6 +118,9 @@ export class ContainerRuntime {
         plan.brokerImage,
       ]);
       await this.run(kind, ["network", "connect", plan.egressNetwork, plan.brokerName]);
+      // The Argus control host must bypass the proxy; every other host is
+      // forced through the broker.
+      const bypass = options.control ? new URL(options.control.apiUrl).hostname : "";
       const workerArgs = [
         "run",
         "-d",
@@ -136,17 +148,17 @@ export class ContainerRuntime {
         "-e",
         `https_proxy=${plan.brokerUrl}`,
         "-e",
-        `http_proxy=${plan.brokerUrl}`,
+        `NO_PROXY=${bypass}`,
         "-e",
-        `https_proxy=${plan.brokerUrl}`,
-        "-e",
-        "NO_PROXY=",
-        "-e",
-        "no_proxy=",
+        `no_proxy=${bypass}`,
       ];
+      if (options.control) workerArgs.push("-e", `ARGUS_API_BASE_URL=${options.control.apiUrl}`);
       if (options.workspacePath) workerArgs.push("-v", `${options.workspacePath}:/workspace:rw`);
       workerArgs.push(plan.workerImage, "sleep", "infinity");
       await this.run(kind, workerArgs);
+      if (options.control) {
+        await this.run(kind, ["network", "connect", options.control.network, plan.workerName]);
+      }
     } catch (error) {
       await this.destroyPlan(plan);
       throw error;

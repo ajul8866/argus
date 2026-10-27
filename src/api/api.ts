@@ -1402,6 +1402,69 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         return json({ ok: true });
       }
 
+      if (path === "/api/tokens") {
+        if (method === "GET") {
+          const current = requireUser();
+          requireRole("auditor");
+          const owned = tokens.listForUser(current.id);
+          return json({
+            tokens: owned
+              .filter((token) => !token.revokedAt)
+              .map((token) => ({
+                id: token.id,
+                label: token.label,
+                scopes: token.scopes,
+                project_id: token.projectId,
+                audit_id: token.auditId,
+                expires_at: token.expiresAt,
+                last_used_at: token.lastUsedAt,
+                created_at: token.createdAt,
+              })),
+          });
+        }
+        if (method === "POST") {
+          const current = requireRole("auditor");
+          const body = await readJson(request);
+          const scopes = requireStringArray(body, "scopes");
+          const auditId = optionalString(body, "audit_id", 100);
+          const projectId = optionalString(body, "project_id", 100);
+          if (auditId) {
+            const audit = deps.store.get<{ project_id: string }>(
+              "SELECT project_id FROM audits WHERE id = ?",
+              auditId,
+            );
+            if (!audit) throw badRequest("audit_id does not exist");
+            requireAuditScope(auditId);
+            requireProjectScope(audit.project_id);
+          }
+          const created = tokens.create({
+            userId: current.id,
+            label: requireString(body, "label", 200),
+            scopes,
+            projectId,
+            auditId,
+            expiresAt: optionalString(body, "expires_at", 100) ?? undefined,
+          });
+          deps.auth.logAction(current.email, "token.created", created.token.id, {
+            scopes,
+            project_id: projectId ?? null,
+            audit_id: auditId ?? null,
+          }, ip);
+          // The raw value is returned once and never stored or listed again.
+          return json({ token: { ...created.token, raw: created.raw } }, 201);
+        }
+      }
+
+      const tokenRevokeMatch = path.match(/^\/api\/tokens\/([^/]+)$/);
+      if (tokenRevokeMatch && method === "DELETE") {
+        const current = requireRole("auditor");
+        const owned = tokens.listForUser(current.id).find((token) => token.id === tokenRevokeMatch[1]);
+        if (!owned) throw notFound("Token not found");
+        tokens.revoke(owned.id);
+        deps.auth.logAction(current.email, "token.revoked", owned.id, {}, ip);
+        return json({ ok: true });
+      }
+
       if (path === "/api/users" && method === "GET") {
         requireRole("admin");
         return json({ users: deps.auth.listUsers() });

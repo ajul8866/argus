@@ -65,6 +65,14 @@ LLM agents. Use it only on repositories you are authorized to assess.
   target keeps Unicode spaces Git does not treat as whitespace, and a symref
   that is not valid UTF-8 is rejected. The
   short names of that chain are probed before Git starts. A config `include` or
+  the same way. `rev-parse --abbrev-ref HEAD` follows the HEAD symref chain and
+  probes each abbreviation of the final ref, including the longer name used when
+  a shorter one is ambiguous. Those probes run for every import, including one
+  that does not request a revision, and a linked worktree probes them in its
+  common directory too. A private ref in that chain, such as `refs/bisect/`, is read
+  from the worktree git directory rather than the common directory. The same private
+  name prefixed with `main-worktree/` is the main worktree's copy and is read from
+  the common directory under the bare name. A config `include` or
   `includeIf` is rejected wherever Git would start that section, including
   after another section on the same line. The directory named by a gitfile or
   `commondir` is the path Git opens: trailing CR and LF are removed, spaces

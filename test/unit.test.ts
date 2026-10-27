@@ -1458,6 +1458,7 @@ describe("repository import", () => {
     writeFileSync(join(symref, ".git", "refs", "heads", "alias"), "ref: root.fifo\n");
     insert("p-ref-symref", symref);
     expect(await attempt("p-ref-symref", symref, "alias")).toBe("invalid_repository");
+    expect(await attempt("p-ref-symref", symref, "alias:a.js")).toBe("invalid_repository");
 
     const linkedRef = prepare("ref-symlink");
     fifo(join(dir, "feature.fifo"));
@@ -1474,13 +1475,446 @@ describe("repository import", () => {
     insert("p-ref-child", join(parent, "child"));
     expect(await attempt("p-ref-child", join(parent, "child"), "HEAD")).toBe("invalid_repository");
 
+    const syntax = prepare("ref-syntax");
+    git(syntax, ["branch", "other"]);
+    fifo(join(syntax, ".git", "refs", "tags", "master"));
+    insert("p-ref-syntax", syntax);
+    expect(await attempt("p-ref-syntax", syntax, "master:a.js")).toBe("invalid_repository");
+    expect(await attempt("p-ref-syntax", syntax, "master~1:a.js")).toBe("invalid_repository");
+    expect(await attempt("p-ref-syntax", syntax, "master..other")).toBe("invalid_repository");
+    expect(await attempt("p-ref-syntax", syntax, "master...other")).toBe("invalid_repository");
+    expect(await attempt("p-ref-syntax", syntax, "other..master")).toBe("invalid_repository");
+
+    const qualified = prepare("ref-qualified");
+    const qualifiedFifo = join(qualified, ".git", "refs", "tags", "refs", "heads");
+    mkdirSync(qualifiedFifo, { recursive: true });
+    fifo(join(qualifiedFifo, "master"));
+    insert("p-ref-qualified", qualified);
+    expect(await attempt("p-ref-qualified", qualified, "refs/heads/master:a.js")).toBe("invalid_repository");
+
     const healthy = prepare("ref-healthy");
     git(healthy, ["tag", "v1"]);
+    git(healthy, ["tag", "v1.2"]);
+    git(healthy, ["branch", "other"]);
     git(healthy, ["update-ref", "refs/remotes/origin/master", "HEAD"]);
     git(healthy, ["update-ref", "refs/remotes/master/HEAD", "HEAD"]);
     insert("p-ref-healthy", healthy);
-    const imported = await importRepository({ config, store }, project("p-ref-healthy", healthy), "master", "tester");
+    const imported = await importRepository({ config, store }, project("p-ref-healthy", healthy), "v1.2", "tester");
     expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+    expect(await attempt("p-ref-healthy", healthy, "master:a.js")).toBe("bad_request");
+    expect(await attempt("p-ref-healthy", healthy, "master..other")).toBe("bad_request");
+  });
+
+  test("import does not wait on a pipe Git opens for the current branch", async () => {
+    const gitEnv = {
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      GIT_AUTHOR_NAME: "Tester",
+      GIT_AUTHOR_EMAIL: "tester@example.com",
+      GIT_COMMITTER_NAME: "Tester",
+      GIT_COMMITTER_EMAIL: "tester@example.com",
+    };
+    const git = (cwd: string, args: string[]): void => {
+      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+        env: gitEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+    };
+    const fifo = (path: string): void => {
+      mkdirSync(join(path, ".."), { recursive: true });
+      expect(Bun.spawnSync(["mkfifo", path]).exitCode).toBe(0);
+    };
+    const prepare = (name: string): string => {
+      const source = join(dir, name);
+      mkdirSync(source);
+      git(source, ["init", "-q", "-b", "master"]);
+      writeFileSync(join(source, "a.js"), "LOCAL_ONLY\n");
+      git(source, ["add", "a.js"]);
+      git(source, ["commit", "-qm", "local"]);
+      return source;
+    };
+    const insert = (id: string, source: string): void => {
+      store.run(
+        `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+         VALUES (?, ?, '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+        id, id, source, JSON.stringify(["**/*.js"]),
+      );
+    };
+    const projectFor = (id: string, source: string) => ({
+      id,
+      source_path: source,
+      scope_include: JSON.stringify(["**/*.js"]),
+      scope_exclude: "[]",
+    });
+    const attempt = async (id: string, source: string, ref: string | null): Promise<string> => {
+      return Promise.race([
+        importRepository({ config, store }, projectFor(id, source), ref, "tester")
+          .then(() => "imported")
+          .catch((error: { code?: string }) => error.code ?? "error"),
+        Bun.sleep(800).then(() => "blocked"),
+      ]);
+    };
+
+    const tagged = prepare("branch-tags");
+    fifo(join(tagged, ".git", "refs", "tags", "master"));
+    insert("p-branch-tags", tagged);
+    expect(await attempt("p-branch-tags", tagged, null)).toBe("invalid_repository");
+
+    const headImport = prepare("branch-head");
+    fifo(join(headImport, ".git", "refs", "tags", "master"));
+    insert("p-branch-head", headImport);
+    expect(await attempt("p-branch-head", headImport, "HEAD")).toBe("invalid_repository");
+
+    const topLevel = prepare("branch-top");
+    fifo(join(topLevel, ".git", "master"));
+    insert("p-branch-top", topLevel);
+    expect(await attempt("p-branch-top", topLevel, null)).toBe("invalid_repository");
+
+    const remoteHead = prepare("branch-remote");
+    fifo(join(remoteHead, ".git", "refs", "remotes", "master", "HEAD"));
+    insert("p-branch-remote", remoteHead);
+    expect(await attempt("p-branch-remote", remoteHead, null)).toBe("invalid_repository");
+
+    // A tag named master makes the short branch name ambiguous, so Git probes heads/master next.
+    const ambiguous = prepare("branch-ambiguous");
+    git(ambiguous, ["tag", "master"]);
+    fifo(join(ambiguous, ".git", "heads", "master"));
+    insert("p-branch-ambiguous", ambiguous);
+    expect(await attempt("p-branch-ambiguous", ambiguous, null)).toBe("invalid_repository");
+
+    const main = prepare("branch-worktree-main");
+    const linked = join(dir, "branch-worktree");
+    git(main, ["worktree", "add", "-q", linked, "HEAD"]);
+    fifo(join(main, ".git", "refs", "tags", "master"));
+    insert("p-branch-worktree", linked);
+    expect(await attempt("p-branch-worktree", linked, null)).toBe("invalid_repository");
+
+    // abbrev-ref shortens the resolved ref, not the first symref in the chain.
+    const chained = prepare("branch-chain");
+    git(chained, ["symbolic-ref", "refs/heads/link", "refs/heads/master"]);
+    git(chained, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    fifo(join(chained, ".git", "refs", "tags", "master"));
+    insert("p-branch-chain", chained);
+    expect(await attempt("p-branch-chain", chained, null)).toBe("invalid_repository");
+
+    const chainedAmbiguous = prepare("branch-chain-ambiguous");
+    git(chainedAmbiguous, ["symbolic-ref", "refs/heads/link", "refs/heads/master"]);
+    git(chainedAmbiguous, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    git(chainedAmbiguous, ["tag", "master"]);
+    fifo(join(chainedAmbiguous, ".git", "heads", "master"));
+    insert("p-branch-chain-ambiguous", chainedAmbiguous);
+    expect(await attempt("p-branch-chain-ambiguous", chainedAmbiguous, null)).toBe("invalid_repository");
+
+    const chainMain = prepare("branch-chain-worktree-main");
+    git(chainMain, ["branch", "real"]);
+    git(chainMain, ["symbolic-ref", "refs/heads/link", "refs/heads/real"]);
+    const chainLinked = join(dir, "branch-chain-worktree");
+    git(chainMain, ["worktree", "add", "-q", chainLinked, "link"]);
+    fifo(join(chainMain, ".git", "refs", "tags", "real"));
+    insert("p-branch-chain-worktree", chainLinked);
+    expect(await attempt("p-branch-chain-worktree", chainLinked, null)).toBe("invalid_repository");
+
+    // A file of the same name in the worktree git directory is not the ref Git reads.
+    const shadowMain = prepare("branch-shadow-main");
+    git(shadowMain, ["branch", "real"]);
+    git(shadowMain, ["symbolic-ref", "refs/heads/link", "refs/heads/real"]);
+    const shadowLinked = join(dir, "branch-shadow");
+    git(shadowMain, ["worktree", "add", "-q", shadowLinked, "link"]);
+    const shadowGit = join(shadowMain, ".git", "worktrees", "branch-shadow");
+    mkdirSync(join(shadowGit, "refs", "heads"), { recursive: true });
+    writeFileSync(join(shadowGit, "refs", "heads", "link"), "ref: refs/heads/decoy\n");
+    fifo(join(shadowMain, ".git", "refs", "tags", "real"));
+    insert("p-branch-shadow", shadowLinked);
+    expect(await attempt("p-branch-shadow", shadowLinked, null)).toBe("invalid_repository");
+
+    // Git keeps a trailing UTF-8 NBSP in the symref target and abbreviates that name.
+    const nbsp = "master\u00a0";
+    const nbspRepo = prepare("branch-nbsp");
+    writeFileSync(join(nbspRepo, ".git", "refs", "heads", nbsp), readFileSync(join(nbspRepo, ".git", "refs", "heads", "master")));
+    writeFileSync(join(nbspRepo, ".git", "HEAD"), `ref: refs/heads/${nbsp}\n`);
+    fifo(join(nbspRepo, ".git", "refs", "tags", nbsp));
+    insert("p-branch-nbsp", nbspRepo);
+    expect(await attempt("p-branch-nbsp", nbspRepo, null)).toBe("invalid_repository");
+
+    // A byte that is not UTF-8 is part of the path Git opens.
+    const rawRepo = prepare("branch-raw");
+    const rawName = Buffer.concat([Buffer.from("master"), Buffer.from([0xa0])]);
+    const rawPath = (directory: string): Buffer => Buffer.concat([Buffer.from(`${directory}/`), rawName]);
+    writeFileSync(join(rawRepo, ".git", "HEAD"), Buffer.concat([
+      Buffer.from("ref: refs/heads/"),
+      rawName,
+      Buffer.from("\n"),
+    ]));
+    const rawHeadRef = rawPath(join(rawRepo, ".git", "refs", "heads"));
+    writeFileSync(rawHeadRef as unknown as string, readFileSync(join(rawRepo, ".git", "refs", "heads", "master")));
+    mkdirSync(join(rawRepo, ".git", "refs", "tags"), { recursive: true });
+    const rawFifo = Bun.spawnSync([
+      "python3", "-c",
+      "import os,sys; os.mkfifo(bytes.fromhex(sys.argv[1]))",
+      rawPath(join(rawRepo, ".git", "refs", "tags")).toString("hex"),
+    ]);
+    expect(rawFifo.exitCode).toBe(0);
+    insert("p-branch-raw", rawRepo);
+    expect(await attempt("p-branch-raw", rawRepo, null)).toBe("invalid_repository");
+
+    // main-worktree/<ref> is the common directory's file only for a per-worktree ref.
+    const mainWorktree = prepare("branch-main-worktree");
+    git(mainWorktree, ["branch", "feature"]);
+    git(mainWorktree, ["branch", "link"]);
+    mkdirSync(join(mainWorktree, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(mainWorktree, ".git", "refs", "bisect", "bad"), "ref: refs/heads/feature\n");
+    writeFileSync(join(mainWorktree, ".git", "refs", "heads", "link"), "ref: main-worktree/refs/bisect/bad\n");
+    git(mainWorktree, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    fifo(join(mainWorktree, ".git", "refs", "tags", "feature"));
+    insert("p-branch-main-worktree", mainWorktree);
+    expect(await attempt("p-branch-main-worktree", mainWorktree, null)).toBe("invalid_repository");
+
+    const mainWorktreeLinkedMain = prepare("branch-main-worktree-linked-main");
+    git(mainWorktreeLinkedMain, ["branch", "feature"]);
+    git(mainWorktreeLinkedMain, ["branch", "link"]);
+    const mainWorktreeLinked = join(dir, "branch-main-worktree-linked");
+    git(mainWorktreeLinkedMain, ["worktree", "add", "-q", mainWorktreeLinked, "link"]);
+    mkdirSync(join(mainWorktreeLinkedMain, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(mainWorktreeLinkedMain, ".git", "refs", "bisect", "bad"), "ref: refs/heads/feature\n");
+    writeFileSync(join(mainWorktreeLinkedMain, ".git", "refs", "heads", "link"), "ref: main-worktree/refs/bisect/bad\n");
+    fifo(join(mainWorktreeLinkedMain, ".git", "refs", "tags", "feature"));
+    insert("p-branch-main-worktree-linked", mainWorktreeLinked);
+    expect(await attempt("p-branch-main-worktree-linked", mainWorktreeLinked, null)).toBe("invalid_repository");
+
+    const mainWorktreeOrigin = prepare("branch-main-worktree-origin-main");
+    git(mainWorktreeOrigin, ["branch", "feature"]);
+    git(mainWorktreeOrigin, ["branch", "link"]);
+    const mainWorktreeOriginLinked = join(dir, "branch-main-worktree-origin");
+    git(mainWorktreeOrigin, ["worktree", "add", "-q", mainWorktreeOriginLinked, "link"]);
+    writeFileSync(join(mainWorktreeOrigin, ".git", "ORIG_HEAD"), "ref: refs/heads/feature\n");
+    writeFileSync(join(mainWorktreeOrigin, ".git", "refs", "heads", "link"), "ref: main-worktree/ORIG_HEAD\n");
+    fifo(join(mainWorktreeOrigin, ".git", "refs", "tags", "feature"));
+    insert("p-branch-main-worktree-origin", mainWorktreeOriginLinked);
+    expect(await attempt("p-branch-main-worktree-origin", mainWorktreeOriginLinked, null)).toBe("invalid_repository");
+
+    const rewritten = prepare("branch-main-worktree-rewritten");
+    git(rewritten, ["branch", "feature"]);
+    git(rewritten, ["branch", "link"]);
+    mkdirSync(join(rewritten, ".git", "refs", "rewritten"), { recursive: true });
+    writeFileSync(join(rewritten, ".git", "refs", "rewritten", "old"), "ref: refs/heads/feature\n");
+    writeFileSync(join(rewritten, ".git", "refs", "heads", "link"), "ref: main-worktree/refs/rewritten/old\n");
+    git(rewritten, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    fifo(join(rewritten, ".git", "refs", "tags", "feature"));
+    insert("p-branch-main-worktree-rewritten", rewritten);
+    expect(await attempt("p-branch-main-worktree-rewritten", rewritten, null)).toBe("invalid_repository");
+
+    const worktreeNs = prepare("branch-main-worktree-namespace");
+    git(worktreeNs, ["branch", "feature"]);
+    git(worktreeNs, ["branch", "link"]);
+    mkdirSync(join(worktreeNs, ".git", "refs", "worktree"), { recursive: true });
+    writeFileSync(join(worktreeNs, ".git", "refs", "worktree", "hold"), "ref: refs/heads/feature\n");
+    writeFileSync(join(worktreeNs, ".git", "refs", "heads", "link"), "ref: main-worktree/refs/worktree/hold\n");
+    git(worktreeNs, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    fifo(join(worktreeNs, ".git", "refs", "tags", "feature"));
+    insert("p-branch-main-worktree-namespace", worktreeNs);
+    expect(await attempt("p-branch-main-worktree-namespace", worktreeNs, null)).toBe("invalid_repository");
+
+    // A shared ref under that prefix is literal. Git does not abbreviate it to the branch.
+    const literal = prepare("branch-main-worktree-literal");
+    git(literal, ["branch", "feature"]);
+    git(literal, ["branch", "link"]);
+    mkdirSync(join(literal, ".git", "main-worktree", "refs", "heads"), { recursive: true });
+    writeFileSync(
+      join(literal, ".git", "main-worktree", "refs", "heads", "feature"),
+      readFileSync(join(literal, ".git", "refs", "heads", "feature")),
+    );
+    writeFileSync(join(literal, ".git", "refs", "heads", "link"), "ref: main-worktree/refs/heads/feature\n");
+    git(literal, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    fifo(join(literal, ".git", "refs", "tags", "feature"));
+    insert("p-branch-main-worktree-literal", literal);
+    expect(await attempt("p-branch-main-worktree-literal", literal, null)).toBe("imported");
+
+    const otherMain = prepare("branch-other-worktree-main");
+    git(otherMain, ["branch", "feature"]);
+    git(otherMain, ["branch", "link"]);
+    const otherA = join(dir, "branch-other-a");
+    const otherB = join(dir, "branch-other-b");
+    git(otherMain, ["worktree", "add", "-q", otherA, "link"]);
+    git(otherMain, ["worktree", "add", "-q", otherB, "feature"]);
+    writeFileSync(join(otherMain, ".git", "refs", "heads", "link"), "ref: worktrees/branch-other-b/HEAD\n");
+    fifo(join(otherMain, ".git", "refs", "tags", "feature"));
+    insert("p-branch-other-worktree", otherA);
+    expect(await attempt("p-branch-other-worktree", otherA, null)).toBe("invalid_repository");
+    const chain = prepare("branch-chain");
+    writeFileSync(join(chain, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
+    writeFileSync(join(chain, ".git", "HEAD"), "ref: refs/heads/alias\n");
+    fifo(join(chain, ".git", "refs", "tags", "master"));
+    insert("p-branch-chain", chain);
+    expect(await attempt("p-branch-chain", chain, null)).toBe("invalid_repository");
+
+    const chainRef = prepare("branch-chain-ref");
+    writeFileSync(join(chainRef, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
+    writeFileSync(join(chainRef, ".git", "HEAD"), "ref: refs/heads/alias\n");
+    git(chainRef, ["tag", "v1"]);
+    fifo(join(chainRef, ".git", "master"));
+    insert("p-branch-chain-ref", chainRef);
+    expect(await attempt("p-branch-chain-ref", chainRef, "v1")).toBe("invalid_repository");
+
+    const ambiguous = prepare("branch-chain-ambiguous");
+    writeFileSync(join(ambiguous, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
+    writeFileSync(join(ambiguous, ".git", "HEAD"), "ref: refs/heads/alias\n");
+    writeFileSync(join(ambiguous, ".git", "refs", "tags", "master"), readFileSync(join(ambiguous, ".git", "refs", "heads", "master")));
+    fifo(join(ambiguous, ".git", "heads", "master"));
+    insert("p-branch-chain-ambiguous", ambiguous);
+    expect(await attempt("p-branch-chain-ambiguous", ambiguous, null)).toBe("invalid_repository");
+
+    const chainMain = prepare("branch-chain-worktree-main");
+    git(chainMain, ["branch", "feature"]);
+    writeFileSync(join(chainMain, ".git", "refs", "heads", "alias"), "ref: refs/heads/feature\n");
+    const chainLinked = join(dir, "branch-chain-worktree");
+    git(chainMain, ["worktree", "add", "-q", chainLinked, "feature"]);
+    const gitdirLine = readFileSync(join(chainLinked, ".git"), "utf8").trim();
+    const declaredGitDir = gitdirLine.startsWith("gitdir: ") ? gitdirLine.slice("gitdir: ".length).trim() : "";
+    const worktreeGit = declaredGitDir.startsWith("/") ? declaredGitDir : join(chainLinked, declaredGitDir);
+    writeFileSync(join(worktreeGit, "HEAD"), "ref: refs/heads/alias\n");
+    fifo(join(chainMain, ".git", "refs", "tags", "feature"));
+    insert("p-branch-chain-worktree", chainLinked);
+    expect(await attempt("p-branch-chain-worktree", chainLinked, null)).toBe("invalid_repository");
+
+    const bisectMain = prepare("branch-bisect-main");
+    git(bisectMain, ["checkout", "-q", "-b", "other"]);
+    const bisectChild = prepare("branch-bisect-child");
+    writeFileSync(join(bisectChild, ".git", "commondir"), `${join(bisectMain, ".git")}\n`);
+    mkdirSync(join(bisectChild, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(bisectChild, ".git", "refs", "bisect", "bad"), "ref: refs/heads/master\n");
+    writeFileSync(join(bisectChild, ".git", "HEAD"), "ref: refs/bisect/bad\n");
+    fifo(join(bisectMain, ".git", "refs", "tags", "master"));
+    insert("p-branch-bisect", bisectChild);
+    expect(await attempt("p-branch-bisect", bisectChild, null)).toBe("invalid_repository");
+
+    const mainWorktree = prepare("main-worktree-pseudo");
+    git(mainWorktree, ["checkout", "-q", "-b", "other"]);
+    mkdirSync(join(mainWorktree, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(mainWorktree, ".git", "ORIG_HEAD"), "ref: refs/heads/master\n");
+    writeFileSync(join(mainWorktree, ".git", "refs", "bisect", "bad"), "ref: main-worktree/ORIG_HEAD\n");
+    writeFileSync(join(mainWorktree, ".git", "HEAD"), "ref: refs/bisect/bad\n");
+    fifo(join(mainWorktree, ".git", "refs", "tags", "master"));
+    insert("p-main-worktree-pseudo", mainWorktree);
+    expect(await attempt("p-main-worktree-pseudo", mainWorktree, null)).toBe("invalid_repository");
+
+    const mainWorktreeRoot = prepare("main-worktree-root");
+    git(mainWorktreeRoot, ["checkout", "-q", "-b", "other"]);
+    mkdirSync(join(mainWorktreeRoot, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(mainWorktreeRoot, ".git", "refs", "bisect", "bad"), "ref: refs/heads/master\n");
+    const mainWorktreeChild = join(dir, "main-worktree-child");
+    git(mainWorktreeRoot, ["worktree", "add", "-q", "-b", "wt", mainWorktreeChild, "other"]);
+    const mainWorktreeGitdir = readFileSync(join(mainWorktreeChild, ".git"), "utf8").trim();
+    const mainWorktreeDeclared = mainWorktreeGitdir.startsWith("gitdir: ") ? mainWorktreeGitdir.slice("gitdir: ".length).trim() : "";
+    const mainWorktreeGit = mainWorktreeDeclared.startsWith("/") ? mainWorktreeDeclared : join(mainWorktreeChild, mainWorktreeDeclared);
+    mkdirSync(join(mainWorktreeGit, "refs", "bisect"), { recursive: true });
+    writeFileSync(join(mainWorktreeGit, "refs", "bisect", "bad"), "ref: main-worktree/refs/bisect/bad\n");
+    writeFileSync(join(mainWorktreeGit, "HEAD"), "ref: refs/bisect/bad\n");
+    fifo(join(mainWorktreeRoot, ".git", "refs", "tags", "master"));
+    insert("p-main-worktree-linked", mainWorktreeChild);
+    expect(await attempt("p-main-worktree-linked", mainWorktreeChild, null)).toBe("invalid_repository");
+
+    const healthy = prepare("branch-healthy");
+    insert("p-branch-healthy", healthy);
+    const imported = await importRepository({ config, store }, projectFor("p-branch-healthy", healthy), null, "tester");
+    expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const healthyChain = prepare("branch-chain-healthy");
+    git(healthyChain, ["symbolic-ref", "refs/heads/link", "refs/heads/master"]);
+    git(healthyChain, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    writeFileSync(join(healthyChain, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
+    writeFileSync(join(healthyChain, ".git", "HEAD"), "ref: refs/heads/alias\n");
+    insert("p-branch-chain-healthy", healthyChain);
+    const chainImported = await importRepository({ config, store }, projectFor("p-branch-chain-healthy", healthyChain), null, "tester");
+    expect(await Bun.file(join(chainImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const healthyWork = prepare("branch-chain-worktree-healthy-main");
+    git(healthyWork, ["branch", "real"]);
+    git(healthyWork, ["symbolic-ref", "refs/heads/link", "refs/heads/real"]);
+    const healthyLinked = join(dir, "branch-chain-worktree-healthy");
+    git(healthyWork, ["worktree", "add", "-q", healthyLinked, "link"]);
+    insert("p-branch-chain-worktree-healthy", healthyLinked);
+    const workImported = await importRepository({ config, store }, projectFor("p-branch-chain-worktree-healthy", healthyLinked), null, "tester");
+    expect(await Bun.file(join(workImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const shadowHealthyMain = prepare("branch-shadow-healthy-main");
+    git(shadowHealthyMain, ["branch", "real"]);
+    git(shadowHealthyMain, ["symbolic-ref", "refs/heads/link", "refs/heads/real"]);
+    const shadowHealthyLinked = join(dir, "branch-shadow-healthy");
+    git(shadowHealthyMain, ["worktree", "add", "-q", shadowHealthyLinked, "link"]);
+    const shadowHealthyGit = join(shadowHealthyMain, ".git", "worktrees", "branch-shadow-healthy");
+    mkdirSync(join(shadowHealthyGit, "refs", "heads"), { recursive: true });
+    writeFileSync(join(shadowHealthyGit, "refs", "heads", "link"), "ref: refs/heads/decoy\n");
+    insert("p-branch-shadow-healthy", shadowHealthyLinked);
+    const shadowImported = await importRepository({ config, store }, projectFor("p-branch-shadow-healthy", shadowHealthyLinked), null, "tester");
+    expect(await Bun.file(join(shadowImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const nbspHealthy = prepare("branch-nbsp-healthy");
+    const nbspBranch = "master\u00a0";
+    writeFileSync(join(nbspHealthy, ".git", "refs", "heads", nbspBranch), readFileSync(join(nbspHealthy, ".git", "refs", "heads", "master")));
+    writeFileSync(join(nbspHealthy, ".git", "HEAD"), `ref: refs/heads/${nbspBranch}\n`);
+    insert("p-branch-nbsp-healthy", nbspHealthy);
+    const nbspImported = await importRepository({ config, store }, projectFor("p-branch-nbsp-healthy", nbspHealthy), null, "tester");
+    expect(await Bun.file(join(nbspImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const mainWorktreeHealthy = prepare("branch-main-worktree-healthy");
+    git(mainWorktreeHealthy, ["branch", "feature"]);
+    git(mainWorktreeHealthy, ["branch", "link"]);
+    mkdirSync(join(mainWorktreeHealthy, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(mainWorktreeHealthy, ".git", "refs", "bisect", "bad"), "ref: refs/heads/feature\n");
+    writeFileSync(join(mainWorktreeHealthy, ".git", "refs", "heads", "link"), "ref: main-worktree/refs/bisect/bad\n");
+    git(mainWorktreeHealthy, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    insert("p-branch-main-worktree-healthy", mainWorktreeHealthy);
+    const mainWorktreeImported = await importRepository({ config, store }, projectFor("p-branch-main-worktree-healthy", mainWorktreeHealthy), null, "tester");
+    expect(await Bun.file(join(mainWorktreeImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const mainWorktreeLinkedHealthyMain = prepare("branch-main-worktree-linked-healthy-main");
+    git(mainWorktreeLinkedHealthyMain, ["branch", "feature"]);
+    git(mainWorktreeLinkedHealthyMain, ["branch", "link"]);
+    const mainWorktreeLinkedHealthy = join(dir, "branch-main-worktree-linked-healthy");
+    git(mainWorktreeLinkedHealthyMain, ["worktree", "add", "-q", mainWorktreeLinkedHealthy, "link"]);
+    mkdirSync(join(mainWorktreeLinkedHealthyMain, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(mainWorktreeLinkedHealthyMain, ".git", "refs", "bisect", "bad"), "ref: refs/heads/feature\n");
+    writeFileSync(join(mainWorktreeLinkedHealthyMain, ".git", "refs", "heads", "link"), "ref: main-worktree/refs/bisect/bad\n");
+    insert("p-branch-main-worktree-linked-healthy", mainWorktreeLinkedHealthy);
+    const mainWorktreeLinkedImported = await importRepository(
+      { config, store },
+      projectFor("p-branch-main-worktree-linked-healthy", mainWorktreeLinkedHealthy),
+      null,
+      "tester",
+    );
+    expect(await Bun.file(join(mainWorktreeLinkedImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+    const healthyAmbiguous = prepare("branch-ambiguous-healthy");
+    writeFileSync(join(healthyAmbiguous, ".git", "refs", "tags", "master"), readFileSync(join(healthyAmbiguous, ".git", "refs", "heads", "master")));
+    insert("p-branch-ambiguous-healthy", healthyAmbiguous);
+    const ambiguousImported = await importRepository({ config, store }, projectFor("p-branch-ambiguous-healthy", healthyAmbiguous), null, "tester");
+    expect(await Bun.file(join(ambiguousImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const healthyMainWorktree = prepare("main-worktree-healthy");
+    git(healthyMainWorktree, ["checkout", "-q", "-b", "other"]);
+    mkdirSync(join(healthyMainWorktree, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(healthyMainWorktree, ".git", "ORIG_HEAD"), "ref: refs/heads/master\n");
+    writeFileSync(join(healthyMainWorktree, ".git", "refs", "bisect", "bad"), "ref: main-worktree/ORIG_HEAD\n");
+    writeFileSync(join(healthyMainWorktree, ".git", "HEAD"), "ref: refs/bisect/bad\n");
+    insert("p-main-worktree-healthy", healthyMainWorktree);
+    const mainWorktreeImported = await importRepository({ config, store }, projectFor("p-main-worktree-healthy", healthyMainWorktree), null, "tester");
+    expect(await Bun.file(join(mainWorktreeImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const healthyLinkedRoot = prepare("main-worktree-linked-healthy");
+    git(healthyLinkedRoot, ["checkout", "-q", "-b", "other"]);
+    mkdirSync(join(healthyLinkedRoot, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(healthyLinkedRoot, ".git", "refs", "bisect", "bad"), "ref: refs/heads/master\n");
+    const healthyLinked = join(dir, "main-worktree-linked-healthy-child");
+    git(healthyLinkedRoot, ["worktree", "add", "-q", "-b", "wt-healthy", healthyLinked, "other"]);
+    const healthyLinkedGitdir = readFileSync(join(healthyLinked, ".git"), "utf8").trim();
+    const healthyLinkedDeclared = healthyLinkedGitdir.startsWith("gitdir: ") ? healthyLinkedGitdir.slice("gitdir: ".length).trim() : "";
+    const healthyLinkedGit = healthyLinkedDeclared.startsWith("/") ? healthyLinkedDeclared : join(healthyLinked, healthyLinkedDeclared);
+    mkdirSync(join(healthyLinkedGit, "refs", "bisect"), { recursive: true });
+    writeFileSync(join(healthyLinkedGit, "refs", "bisect", "bad"), "ref: main-worktree/refs/bisect/bad\n");
+    writeFileSync(join(healthyLinkedGit, "HEAD"), "ref: refs/bisect/bad\n");
+    insert("p-main-worktree-linked-healthy", healthyLinked);
+    const linkedImported = await importRepository({ config, store }, projectFor("p-main-worktree-linked-healthy", healthyLinked), null, "tester");
+    expect(await Bun.file(join(linkedImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
   });
 
   test("import does not wait on a pipe Git opens while resolving HEAD", async () => {

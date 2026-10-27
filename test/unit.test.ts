@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -1004,6 +1005,270 @@ describe("repository import", () => {
       expect(existsSync(join(dir, "repos"))).toBe(false);
     } finally {
       rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a git ref import does not run smudge or process filters", async () => {
+    const source = join(dir, "filter-repo");
+    const globalHome = join(dir, "filter-home");
+    const localMarker = join(dir, "local-filter-ran");
+    const processMarker = join(dir, "process-filter-ran");
+    const globalMarker = join(dir, "global-filter-ran");
+    const previousHome = process.env.HOME;
+    const git = (cwd: string, args: string[]): void => {
+      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          GIT_AUTHOR_NAME: "Tester",
+          GIT_AUTHOR_EMAIL: "tester@example.com",
+          GIT_COMMITTER_NAME: "Tester",
+          GIT_COMMITTER_EMAIL: "tester@example.com",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+    };
+    mkdirSync(source, { recursive: true });
+    writeFileSync(join(source, "a.js"), "PLAIN_FILTER_BYTES\n");
+    git(source, ["init", "-q"]);
+    git(source, ["add", "a.js"]);
+    git(source, ["commit", "-qm", "init"]);
+    writeFileSync(join(source, ".gitattributes"), "* filter=pwn\n");
+    git(source, ["add", ".gitattributes"]);
+    git(source, ["commit", "-qm", "attrs"]);
+    git(source, ["config", "filter.pwn.smudge", `touch ${localMarker}; echo LOCAL_SMUDGE`]);
+    git(source, ["config", "filter.pwn.process", `touch ${processMarker}`]);
+    git(source, ["config", "filter.pwn.required", "true"]);
+
+    const globalSource = join(dir, "global-filter-repo");
+    mkdirSync(join(globalHome, ".config"), { recursive: true });
+    writeFileSync(join(globalHome, ".gitconfig"), `[filter "pwn"]\n\tsmudge = touch ${globalMarker}; echo GLOBAL_SMUDGE\n\trequired = true\n`);
+    mkdirSync(globalSource, { recursive: true });
+    writeFileSync(join(globalSource, "a.js"), "PLAIN_GLOBAL_BYTES\n");
+    git(globalSource, ["init", "-q"]);
+    git(globalSource, ["add", "a.js"]);
+    git(globalSource, ["commit", "-qm", "init"]);
+    writeFileSync(join(globalSource, ".gitattributes"), "* filter=pwn\n");
+    git(globalSource, ["add", ".gitattributes"]);
+    git(globalSource, ["commit", "-qm", "attrs"]);
+
+    const insert = (id: string, path: string): void => {
+      store.run(
+        `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+         VALUES (?, ?, '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+        id, id, path, JSON.stringify(["**/*.js"]),
+      );
+    };
+    insert("p-filter-local", source);
+    insert("p-filter-global", globalSource);
+    process.env.HOME = globalHome;
+    try {
+      const local = await importRepository({ config, store }, {
+        id: "p-filter-local",
+        source_path: source,
+        scope_include: JSON.stringify(["**/*.js"]),
+        scope_exclude: "[]",
+      }, "HEAD", "tester");
+      expect(await Bun.file(join(local.path, "a.js")).text()).toBe("PLAIN_FILTER_BYTES\n");
+      expect(existsSync(localMarker)).toBe(false);
+      expect(existsSync(processMarker)).toBe(false);
+
+      const global = await importRepository({ config, store }, {
+        id: "p-filter-global",
+        source_path: globalSource,
+        scope_include: JSON.stringify(["**/*.js"]),
+        scope_exclude: "[]",
+      }, "HEAD", "tester");
+      expect(await Bun.file(join(global.path, "a.js")).text()).toBe("PLAIN_GLOBAL_BYTES\n");
+      expect(existsSync(globalMarker)).toBe(false);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
+  test("a git ref import archives a sha256 commit without running its filter", async () => {
+    const source = join(dir, "sha256-repo");
+    const marker = join(dir, "sha256-filter-ran");
+    const git = (cwd: string, args: string[]): string => {
+      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          GIT_AUTHOR_NAME: "Tester",
+          GIT_AUTHOR_EMAIL: "tester@example.com",
+          GIT_COMMITTER_NAME: "Tester",
+          GIT_COMMITTER_EMAIL: "tester@example.com",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+      return result.stdout.toString().trim();
+    };
+    mkdirSync(source, { recursive: true });
+    writeFileSync(join(source, "a.js"), "SHA256_PLAIN\n");
+    writeFileSync(join(source, ".gitattributes"), "* filter=pwn\n");
+    git(source, ["init", "-q", "--object-format=sha256"]);
+    git(source, ["add", "a.js", ".gitattributes"]);
+    git(source, ["commit", "-qm", "init"]);
+    const commit = git(source, ["rev-parse", "HEAD"]);
+    git(source, ["config", "filter.pwn.smudge", `touch ${marker}; echo SMUDGED`]);
+    git(source, ["config", "filter.pwn.process", `touch ${marker}`]);
+    git(source, ["config", "filter.pwn.required", "true"]);
+    store.run(
+      `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+       VALUES ('p-sha256', 'sha256', '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+      source, JSON.stringify(["**/*.js"]),
+    );
+    const imported = await importRepository({ config, store }, {
+      id: "p-sha256",
+      source_path: source,
+      scope_include: JSON.stringify(["**/*.js"]),
+      scope_exclude: "[]",
+    }, "HEAD", "tester");
+    expect(commit).toHaveLength(64);
+    expect(imported.commit_sha).toBe(commit);
+    expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("SHA256_PLAIN\n");
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  test("a git ref import does not run gpg for an export-subst signature placeholder", async () => {
+    const source = join(dir, "subst-repo");
+    const marker = join(dir, "gpg-ran");
+    const wrapper = join(dir, "bin");
+    const previousPath = process.env.PATH;
+    const git = (cwd: string, args: string[]): string => {
+      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+        env: {
+          PATH: "/usr/bin:/bin",
+          GIT_AUTHOR_NAME: "Tester",
+          GIT_AUTHOR_EMAIL: "tester@example.com",
+          GIT_COMMITTER_NAME: "Tester",
+          GIT_COMMITTER_EMAIL: "tester@example.com",
+          GIT_CONFIG_NOSYSTEM: "1",
+          HOME: join(dir, "subst-home"),
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_ATTR_NOSYSTEM: "1",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+      return result.stdout.toString().trim();
+    };
+    mkdirSync(join(dir, "subst-home"), { recursive: true });
+    mkdirSync(join(source, "nested"), { recursive: true });
+    writeFileSync(join(source, "sig.js"), "sig:$Format:%G?$\n");
+    writeFileSync(join(source, "nested", "sig.js"), "nested:$Format:%G?$\n");
+    writeFileSync(join(source, ".gitattributes"), "[attr]evil export-subst\nsig.js evil\n");
+    writeFileSync(join(source, "nested", ".gitattributes"), "sig.js export-subst\n");
+    git(source, ["init", "-q"]);
+    git(source, ["add", "sig.js", "nested/sig.js", ".gitattributes", "nested/.gitattributes"]);
+    git(source, ["commit", "-qm", "init"]);
+    expect(git(source, ["check-attr", "export-subst", "--", "sig.js", "nested/sig.js"])).toBe(
+      "sig.js: export-subst: set\nnested/sig.js: export-subst: set",
+    );
+    const tree = git(source, ["rev-parse", "HEAD^{tree}"]);
+    const signatureHeader = "-----BEGIN PGP SIGNATURE-----";
+    const signatureBody = ["", "iQE=", "=abcd", "-----END PGP SIGNATURE-----"];
+    const forged = [
+      `tree ${tree}`,
+      "author Tester <tester@example.com> 1700000000 +0000",
+      "committer Tester <tester@example.com> 1700000000 +0000",
+      `gpgsig ${signatureHeader}`,
+      ...signatureBody.map((line) => ` ${line}`),
+      "",
+      "signed",
+      "",
+    ].join("\n");
+    const commitFile = join(dir, "signed-commit");
+    writeFileSync(commitFile, forged);
+    const commit = git(source, ["hash-object", "-t", "commit", "-w", commitFile]);
+    git(source, ["update-ref", "HEAD", commit]);
+    mkdirSync(wrapper);
+    writeFileSync(join(wrapper, "gpg"), `#!/bin/sh\ntouch ${marker}\nexit 0\n`);
+    chmodSync(join(wrapper, "gpg"), 0o755);
+    store.run(
+      `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+       VALUES ('p-subst', 'subst', '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+      source, JSON.stringify(["**/*.js"]),
+    );
+    process.env.PATH = `${wrapper}:${previousPath ?? "/usr/bin:/bin"}`;
+    try {
+      const imported = await importRepository({ config, store }, {
+        id: "p-subst",
+        source_path: source,
+        scope_include: JSON.stringify(["**/*.js"]),
+        scope_exclude: "[]",
+      }, "HEAD", "tester");
+      expect(imported.commit_sha).toBe(commit);
+      expect(await Bun.file(join(imported.path, "sig.js")).text()).toBe("sig:$Format:%G?$\n");
+      expect(await Bun.file(join(imported.path, "nested/sig.js")).text()).toBe("nested:$Format:%G?$\n");
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+
+  test("a git ref import ignores global attributes and keeps a committed line-ending rule", async () => {
+    const source = join(dir, "attr-repo");
+    const globalHome = join(dir, "attr-home");
+    const xdg = join(dir, "attr-xdg");
+    const previousHome = process.env.HOME;
+    const previousXdg = process.env.XDG_CONFIG_HOME;
+    const git = (cwd: string, args: string[]): void => {
+      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          GIT_AUTHOR_NAME: "Tester",
+          GIT_AUTHOR_EMAIL: "tester@example.com",
+          GIT_COMMITTER_NAME: "Tester",
+          GIT_COMMITTER_EMAIL: "tester@example.com",
+          GIT_CONFIG_NOSYSTEM: "1",
+          HOME: join(dir, "attr-commit-home"),
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+    };
+    mkdirSync(join(globalHome, ".config", "git"), { recursive: true });
+    mkdirSync(join(xdg, "git"), { recursive: true });
+    mkdirSync(join(dir, "attr-commit-home"), { recursive: true });
+    writeFileSync(join(globalHome, ".config", "git", "attributes"), "*.js text eol=crlf\n");
+    writeFileSync(join(xdg, "git", "attributes"), "*.js text eol=crlf\n* ident\n");
+    mkdirSync(source, { recursive: true });
+    writeFileSync(join(source, "plain.js"), "PLAIN\n");
+    writeFileSync(join(source, "crlf.js"), "hello\n");
+    writeFileSync(join(source, ".gitattributes"), "crlf.js text eol=crlf\n");
+    git(source, ["init", "-q"]);
+    git(source, ["add", "plain.js", "crlf.js", ".gitattributes"]);
+    git(source, ["commit", "-qm", "init"]);
+    mkdirSync(join(source, ".git", "info"), { recursive: true });
+    writeFileSync(join(source, ".git", "info", "attributes"), "*.js text eol=crlf\n");
+    store.run(
+      `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+       VALUES ('p-attrs', 'attrs', '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+      source, JSON.stringify(["**/*.js"]),
+    );
+    process.env.HOME = globalHome;
+    process.env.XDG_CONFIG_HOME = xdg;
+    try {
+      const imported = await importRepository({ config, store }, {
+        id: "p-attrs",
+        source_path: source,
+        scope_include: JSON.stringify(["**/*.js"]),
+        scope_exclude: "[]",
+      }, "HEAD", "tester");
+      expect(await Bun.file(join(imported.path, "plain.js")).text()).toBe("PLAIN\n");
+      expect(await Bun.file(join(imported.path, "crlf.js")).text()).toBe("hello\r\n");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = previousXdg;
     }
   });
 

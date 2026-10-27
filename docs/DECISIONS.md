@@ -62,6 +62,15 @@ snapshot (or `git archive` for a ref) and rebuilds the inventory there. This
 prevents a later worktree edit from invalidating evidence. The original commit
 and branch are recorded; uncommitted worktree state is represented by the file
 hashes in the inventory. A ref archive uses the Git directory discovered for
+that work tree and ignores `GIT_*` overrides. Metadata that points at another
+object store, including a different Git common directory, is rejected instead
+of being copied into the snapshot. That archive does not load repository,
+system, or global Git configuration, so filter commands do not run and
+`core.autocrlf` is not applied. System and global attribute files are not
+read. The archive Git directory uses the pinned repository's object format,
+including SHA-256. Committed `export-subst` attributes are disabled, so a
+signature placeholder cannot run `gpg`. Committed attributes can still request
+line-ending conversion.
 that work tree and does not pass inherited `GIT_*` overrides through.
 Metadata that points at another object store, including a different Git common
 directory, is rejected instead of being copied into the snapshot. A promisor

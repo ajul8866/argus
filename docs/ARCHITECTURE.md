@@ -228,6 +228,13 @@ operation, preserving include/exclude short-circuit behavior.
    archive, including `config.worktree`, sparse-checkout, and a config include
    wherever Git would start that section, is rejected before Git starts. The
    or a symlink in the object store is rejected, and `GIT_*` variables are not
+   passed through. The archive reads that git directory's object store through
+   a new Git directory with the same object format, including SHA-256.
+   Repository, system, and global filter commands are not used, and system and
+   global attribute files are not read. Committed `export-subst` attributes are
+   disabled, so a signature placeholder cannot run `gpg`. Committed attributes
+   can still request line-ending conversion. A subdirectory archives only its
+   own tree. The inventory is then rebuilt from the snapshot.
    passed through. A pipe or symlink in metadata Git would read for that
    archive, including `config.worktree`, sparse-checkout, a config include
    wherever Git would start that section, and a pipe or symlink on a path Git

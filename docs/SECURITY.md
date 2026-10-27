@@ -45,6 +45,17 @@ LLM agents. Use it only on repositories you are authorized to assess.
   oversized files, and symlinks are not retained in the snapshot. The archive
   reads only a Git directory that belongs to the selected work tree. A `.git`
   symlink or gitfile, a Git common directory other than that Git directory, an
+  alternate object database, a symlink inside the object store, and `GIT_*`
+  environment variables are rejected or ignored, so a ref import cannot copy
+  commits stored outside that work tree. The archive is produced from that
+  object store through a new Git directory. That directory uses the pinned
+  repository's object format, including SHA-256, and replaces repository,
+  system, and global Git configuration, so a smudge or process filter cannot
+  run during import. Settings such as `core.autocrlf` are not applied. System
+  and global attribute files are not read. Committed `export-subst` attributes
+  are disabled, so a signature placeholder cannot run `gpg`. Committed
+  attributes can still request line-ending conversion. A subdirectory of a
+  repository archives only that subdirectory.
   alternate object database, and a symlink inside the object store are rejected.
   Inherited `GIT_*` environment variables are not passed through. Import sets
   `GIT_NO_LAZY_FETCH`, so a promisor remote cannot fetch a missing commit or

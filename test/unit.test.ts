@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import type { Config } from "../src/config.ts";
 import { loadConfig, PHASE_NAMES } from "../src/config.ts";
 import { KeyedSerialQueue } from "../src/concurrency.ts";
@@ -13,7 +13,7 @@ import { EvidenceStore } from "../src/orchestrator/evidence.ts";
 import { ReportService } from "../src/reports/generator.ts";
 import { buildInventory, gitInfo } from "../src/repo/inventory.ts";
 import { importRepository, runPinnedGit } from "../src/repo/import.ts";
-import { GIT_DIRECTORY_ERROR, GIT_METADATA_ERROR, GIT_OBJECTS_ERROR, assertAuthorizedRoot, canonicalDirectory, createWorkspace, openWorktreeGit, readCappedRegularFile, readScopedFile, verifyQuote } from "../src/repo/workspace.ts";
+import { GIT_COMMON_DIR_ERROR, GIT_DIRECTORY_ERROR, GIT_METADATA_ERROR, GIT_OBJECTS_ERROR, assertAuthorizedRoot, canonicalDirectory, createWorkspace, openWorktreeGit, readCappedRegularFile, readScopedFile, verifyQuote } from "../src/repo/workspace.ts";
 import { createScopeMatcher, globToRegExp, matchesScope, extractJson, sha256 } from "../src/util.ts";
 import { redactSecrets } from "../src/security/redact.ts";
 import { credentialEnvironment, decryptSecret, encryptSecret, type StoredCredential } from "../src/security/credentials.ts";
@@ -1082,6 +1082,179 @@ describe("repository import", () => {
     } finally {
       rmSync(outside, { recursive: true, force: true });
     }
+  });
+
+  test("a git ref import rejects a common directory that points at another repository", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "argus-git-common-"));
+    const limited = { ...config, allowedRoots: [dir] };
+    const requested = (source: string) => ({
+      ...project,
+      source_path: source,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    });
+    try {
+      initRepo(outside, {
+        "secret.js": "SECRET_COMMONDIR_SENTINEL\n",
+        "child/secret.js": "SECRET_CHILD_COMMONDIR_SENTINEL\n",
+      });
+      const absolute = join(dir, "commondir-absolute");
+      initRepo(absolute, { "local.js": "LOCAL_ONLY\n" });
+      writeFileSync(join(absolute, ".git", "commondir"), `${join(outside, ".git")}\n`);
+      const relativeRepo = join(dir, "commondir-relative");
+      initRepo(relativeRepo, { "local.js": "LOCAL_ONLY\n" });
+      writeFileSync(
+        join(relativeRepo, ".git", "commondir"),
+        `${relative(join(relativeRepo, ".git"), join(outside, ".git"))}\n`,
+      );
+      const parent = join(dir, "commondir-parent");
+      const child = join(parent, "child");
+      mkdirSync(child, { recursive: true });
+      writeFileSync(join(child, "a.js"), "LOCAL_CHILD\n");
+      gitExec(parent, ["init", "-q"]);
+      writeFileSync(join(parent, ".git", "commondir"), `${join(outside, ".git")}\n`);
+
+      for (const source of [absolute, relativeRepo, child]) {
+        await expect(importRepository({ config: limited, store }, requested(source), "HEAD", "tester"))
+          .rejects.toMatchObject({ code: "invalid_repository", message: GIT_COMMON_DIR_ERROR });
+      }
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+      expect(existsSync(join(dir, "repos"))).toBe(false);
+
+      const fifo = join(dir, "commondir-fifo");
+      initRepo(fifo, { "a.js": "LOCAL_ONLY\n" });
+      rmSync(join(fifo, ".git", "commondir"), { force: true });
+      const created = Bun.spawnSync(["mkfifo", join(fifo, ".git", "commondir")]);
+      expect(created.exitCode).toBe(0);
+      const started = Date.now();
+      await expect(openWorktreeGit(fifo, [dir])).rejects.toMatchObject({
+        code: "invalid_repository",
+        message: GIT_COMMON_DIR_ERROR,
+      });
+      expect(Date.now() - started).toBeLessThan(1_000);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a git ref import rejects a symlink inside the git object store", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "argus-git-objects-link-"));
+    const limited = { ...config, allowedRoots: [dir] };
+    const requested = (source: string) => ({
+      ...project,
+      source_path: source,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    });
+    const removeLooseObjects = (source: string) => {
+      const removed = Bun.spawnSync(["find", join(source, ".git", "objects"), "-type", "f", "-delete"]);
+      expect(removed.exitCode).toBe(0);
+    };
+    try {
+      initRepo(outside, {
+        "secret.js": "SECRET_COMMONDIR_SENTINEL\n",
+        "child/secret.js": "SECRET_CHILD_COMMONDIR_SENTINEL\n",
+      });
+      gitExec(outside, ["repack", "-ad"]);
+      const outsideCommit = gitExec(outside, ["rev-parse", "HEAD"]);
+
+      const packLink = join(dir, "pack-link");
+      initRepo(packLink, { "local.js": "LOCAL_ONLY\n" });
+      rmSync(join(packLink, ".git", "objects", "pack"), { recursive: true, force: true });
+      symlinkSync(join(outside, ".git", "objects", "pack"), join(packLink, ".git", "objects", "pack"));
+      removeLooseObjects(packLink);
+      gitExec(packLink, ["update-ref", "HEAD", outsideCommit]);
+      await expect(importRepository({ config: limited, store }, requested(packLink), "HEAD", "tester"))
+        .rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+
+      const packFile = join(dir, "pack-file");
+      initRepo(packFile, { "local.js": "LOCAL_ONLY\n" });
+      const packDir = join(outside, ".git", "objects", "pack");
+      const packNames = readdirSync(packDir);
+      expect(packNames.length).toBeGreaterThan(0);
+      for (const name of packNames) {
+        symlinkSync(join(packDir, name), join(packFile, ".git", "objects", "pack", name));
+      }
+      removeLooseObjects(packFile);
+      gitExec(packFile, ["update-ref", "HEAD", outsideCommit]);
+      await expect(importRepository({ config: limited, store }, requested(packFile), "HEAD", "tester"))
+        .rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+
+      const loose = join(dir, "loose-link");
+      const looseOutside = join(outside, "loose-repo");
+      initRepo(looseOutside, { "secret.js": "SECRET_LOOSE_SENTINEL\n" });
+      const blob = gitExec(looseOutside, ["rev-parse", "HEAD:secret.js"]);
+      initRepo(loose, { "local.js": "LOCAL_ONLY\n" });
+      mkdirSync(join(loose, ".git", "objects", blob.slice(0, 2)), { recursive: true });
+      symlinkSync(
+        join(looseOutside, ".git", "objects", blob.slice(0, 2), blob.slice(2)),
+        join(loose, ".git", "objects", blob.slice(0, 2), blob.slice(2)),
+      );
+      const tree = Bun.spawnSync(["git", "-C", loose, "mktree"], {
+        stdin: Buffer.from(`100644 blob ${blob}\tsecret.js\n`),
+        stdout: "pipe",
+        stderr: "pipe",
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_AUTHOR_NAME: "t",
+          GIT_AUTHOR_EMAIL: "t@example.com",
+          GIT_COMMITTER_NAME: "t",
+          GIT_COMMITTER_EMAIL: "t@example.com",
+        },
+      });
+      expect(tree.exitCode).toBe(0);
+      const commit = gitExec(loose, ["commit-tree", new TextDecoder().decode(tree.stdout).trim(), "-m", "leak"]);
+      gitExec(loose, ["update-ref", "HEAD", commit]);
+      await expect(importRepository({ config: limited, store }, requested(loose), "HEAD", "tester"))
+        .rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+
+      const fifo = join(dir, "object-fifo");
+      initRepo(fifo, { "a.js": "LOCAL_ONLY\n" });
+      const fifoBlob = gitExec(fifo, ["rev-parse", "HEAD:a.js"]);
+      const fifoObject = join(fifo, ".git", "objects", fifoBlob.slice(0, 2), fifoBlob.slice(2));
+      rmSync(fifoObject);
+      expect(Bun.spawnSync(["mkfifo", fifoObject]).exitCode).toBe(0);
+      const started = Date.now();
+      await expect(openWorktreeGit(fifo, [dir])).rejects.toMatchObject({
+        code: "invalid_repository",
+        message: GIT_OBJECTS_ERROR,
+      });
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a git ref import accepts a common directory that names its own git directory", async () => {
+    const limited = { ...config, allowedRoots: [dir] };
+    const requested = (source: string) => ({
+      ...project,
+      source_path: source,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    });
+    const dot = join(dir, "commondir-dot");
+    initRepo(dot, { "a.js": "LOCAL_DOT\n" });
+    writeFileSync(join(dot, ".git", "commondir"), ".\n");
+    const importedDot = await importRepository({ config: limited, store }, requested(dot), "HEAD", "tester");
+    expect(await Bun.file(join(importedDot.path, "a.js")).text()).toBe("LOCAL_DOT\n");
+    expect(existsSync(join(importedDot.path, "secret.js"))).toBe(false);
+
+    const absolute = join(dir, "commondir-self");
+    initRepo(absolute, { "a.js": "LOCAL_ABS\n" });
+    writeFileSync(join(absolute, ".git", "commondir"), `${realpathSync(join(absolute, ".git"))}\n`);
+    const importedAbsolute = await importRepository({ config: limited, store }, requested(absolute), "HEAD", "tester");
+    expect(await Bun.file(join(importedAbsolute.path, "a.js")).text()).toBe("LOCAL_ABS\n");
+
+    const main = join(dir, "worktree-main");
+    initRepo(main, { "a.js": "MAIN_FILE\n" });
+    gitExec(main, ["worktree", "add", "--detach", "-q", join(dir, "worktree-linked")]);
+    const importedMain = await importRepository({ config: limited, store }, requested(main), "HEAD", "tester");
+    expect(await Bun.file(join(importedMain.path, "a.js")).text()).toBe("MAIN_FILE\n");
+    expect(importedMain.commit_sha).toMatch(/^[0-9a-f]{40}$/);
   });
 });
 

@@ -177,8 +177,10 @@ This is the step that makes two agreeing LLMs insufficient.
   writer. Report bytes are hashed and recorded.
 - Every generation uses its report UUID in the filename and exclusive file
   creation, so simultaneous requests cannot overwrite another report even when
-  their timestamps match. Downloads recompute the stored SHA-256 and fail closed
-  when the file no longer matches its database record.
+  their timestamps match. Downloads recompute the stored size and SHA-256 and
+  fail closed when the file no longer matches its database record. Replacing
+  the file with a symlink or a pipe fails closed. The open does not follow the
+  symlink or wait for a pipe writer.
 
 ## 3. Persistence and recovery
 

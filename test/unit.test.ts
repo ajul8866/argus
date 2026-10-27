@@ -1608,6 +1608,32 @@ describe("repository import", () => {
     insert("p-branch-bisect", bisectChild);
     expect(await attempt("p-branch-bisect", bisectChild, null)).toBe("invalid_repository");
 
+    const mainWorktree = prepare("main-worktree-pseudo");
+    git(mainWorktree, ["checkout", "-q", "-b", "other"]);
+    mkdirSync(join(mainWorktree, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(mainWorktree, ".git", "ORIG_HEAD"), "ref: refs/heads/master\n");
+    writeFileSync(join(mainWorktree, ".git", "refs", "bisect", "bad"), "ref: main-worktree/ORIG_HEAD\n");
+    writeFileSync(join(mainWorktree, ".git", "HEAD"), "ref: refs/bisect/bad\n");
+    fifo(join(mainWorktree, ".git", "refs", "tags", "master"));
+    insert("p-main-worktree-pseudo", mainWorktree);
+    expect(await attempt("p-main-worktree-pseudo", mainWorktree, null)).toBe("invalid_repository");
+
+    const mainWorktreeRoot = prepare("main-worktree-root");
+    git(mainWorktreeRoot, ["checkout", "-q", "-b", "other"]);
+    mkdirSync(join(mainWorktreeRoot, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(mainWorktreeRoot, ".git", "refs", "bisect", "bad"), "ref: refs/heads/master\n");
+    const mainWorktreeChild = join(dir, "main-worktree-child");
+    git(mainWorktreeRoot, ["worktree", "add", "-q", "-b", "wt", mainWorktreeChild, "other"]);
+    const mainWorktreeGitdir = readFileSync(join(mainWorktreeChild, ".git"), "utf8").trim();
+    const mainWorktreeDeclared = mainWorktreeGitdir.startsWith("gitdir: ") ? mainWorktreeGitdir.slice("gitdir: ".length).trim() : "";
+    const mainWorktreeGit = mainWorktreeDeclared.startsWith("/") ? mainWorktreeDeclared : join(mainWorktreeChild, mainWorktreeDeclared);
+    mkdirSync(join(mainWorktreeGit, "refs", "bisect"), { recursive: true });
+    writeFileSync(join(mainWorktreeGit, "refs", "bisect", "bad"), "ref: main-worktree/refs/bisect/bad\n");
+    writeFileSync(join(mainWorktreeGit, "HEAD"), "ref: refs/bisect/bad\n");
+    fifo(join(mainWorktreeRoot, ".git", "refs", "tags", "master"));
+    insert("p-main-worktree-linked", mainWorktreeChild);
+    expect(await attempt("p-main-worktree-linked", mainWorktreeChild, null)).toBe("invalid_repository");
+
     const healthy = prepare("branch-healthy");
     insert("p-branch-healthy", healthy);
     const imported = await importRepository({ config, store }, projectFor("p-branch-healthy", healthy), null, "tester");
@@ -1625,6 +1651,32 @@ describe("repository import", () => {
     insert("p-branch-ambiguous-healthy", healthyAmbiguous);
     const ambiguousImported = await importRepository({ config, store }, projectFor("p-branch-ambiguous-healthy", healthyAmbiguous), null, "tester");
     expect(await Bun.file(join(ambiguousImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const healthyMainWorktree = prepare("main-worktree-healthy");
+    git(healthyMainWorktree, ["checkout", "-q", "-b", "other"]);
+    mkdirSync(join(healthyMainWorktree, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(healthyMainWorktree, ".git", "ORIG_HEAD"), "ref: refs/heads/master\n");
+    writeFileSync(join(healthyMainWorktree, ".git", "refs", "bisect", "bad"), "ref: main-worktree/ORIG_HEAD\n");
+    writeFileSync(join(healthyMainWorktree, ".git", "HEAD"), "ref: refs/bisect/bad\n");
+    insert("p-main-worktree-healthy", healthyMainWorktree);
+    const mainWorktreeImported = await importRepository({ config, store }, projectFor("p-main-worktree-healthy", healthyMainWorktree), null, "tester");
+    expect(await Bun.file(join(mainWorktreeImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const healthyLinkedRoot = prepare("main-worktree-linked-healthy");
+    git(healthyLinkedRoot, ["checkout", "-q", "-b", "other"]);
+    mkdirSync(join(healthyLinkedRoot, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(healthyLinkedRoot, ".git", "refs", "bisect", "bad"), "ref: refs/heads/master\n");
+    const healthyLinked = join(dir, "main-worktree-linked-healthy-child");
+    git(healthyLinkedRoot, ["worktree", "add", "-q", "-b", "wt-healthy", healthyLinked, "other"]);
+    const healthyLinkedGitdir = readFileSync(join(healthyLinked, ".git"), "utf8").trim();
+    const healthyLinkedDeclared = healthyLinkedGitdir.startsWith("gitdir: ") ? healthyLinkedGitdir.slice("gitdir: ".length).trim() : "";
+    const healthyLinkedGit = healthyLinkedDeclared.startsWith("/") ? healthyLinkedDeclared : join(healthyLinked, healthyLinkedDeclared);
+    mkdirSync(join(healthyLinkedGit, "refs", "bisect"), { recursive: true });
+    writeFileSync(join(healthyLinkedGit, "refs", "bisect", "bad"), "ref: main-worktree/refs/bisect/bad\n");
+    writeFileSync(join(healthyLinkedGit, "HEAD"), "ref: refs/bisect/bad\n");
+    insert("p-main-worktree-linked-healthy", healthyLinked);
+    const linkedImported = await importRepository({ config, store }, projectFor("p-main-worktree-linked-healthy", healthyLinked), null, "tester");
+    expect(await Bun.file(join(linkedImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
   });
 
   test("workspaces are read-only by default and owner-writable only on explicit request", async () => {

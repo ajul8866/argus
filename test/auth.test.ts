@@ -827,3 +827,73 @@ test("token scopes gate dynamic launches independently of task:create", async ()
   }));
   expect(deniedControl.status).toBe(403);
 });
+
+test("adapter routes create tasks and read findings under token scopes", async () => {
+  const { api, userId } = await projectClient();
+  const tokens = new TokenService(store);
+  store.run(
+    `INSERT INTO projects (id, name, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+     VALUES ('p_adapter','Adapter', ?, '**/*', '', 'Tester', 'AUTH', ?, ?)`,
+    dir,
+    now(),
+    now(),
+  );
+  store.run(
+    "INSERT INTO audits (id, project_id, repository_id, status, current_phase, config, mode, created_at) VALUES ('a_adapter','p_adapter',NULL,'running',1,'{}','dynamic',?)",
+    now(),
+  );
+  store.run(
+    `INSERT INTO findings
+     (id, code, audit_id, project_id, title, category, cwe, severity, status, repository_commit, files,
+      root_cause, preconditions, reproduction, expected, observed, impact, remediation, created_at, updated_at)
+     VALUES ('f1','F-1','a_adapter','p_adapter','Test','idor',NULL,'high','confirmed',NULL,'[]',
+      'root','none','steps','expected','observed','impact','fix',?,?)`,
+    now(),
+    now(),
+  );
+
+  const headersFor = (raw: string) => ({ authorization: `Bearer ${raw}`, "content-type": "application/json" });
+  const onlyCreate = tokens.create({
+    userId,
+    label: "adapter",
+    scopes: ["task:create"],
+    projectId: "p_adapter",
+  });
+  const denied = await api(new Request("http://localhost/api/audits/a_adapter/tasks", {
+    method: "POST",
+    headers: headersFor(onlyCreate.raw),
+    body: JSON.stringify({ kind: "explore", payload: {}, agent_role: "security_researcher" }),
+  }));
+  expect(denied.status).toBe(403);
+
+  const both = tokens.create({
+    userId,
+    label: "adapter dynamic",
+    scopes: ["task:create", "audit:launch_dynamic"],
+    projectId: "p_adapter",
+  });
+  const created = await api(new Request("http://localhost/api/audits/a_adapter/tasks", {
+    method: "POST",
+    headers: headersFor(both.raw),
+    body: JSON.stringify({ kind: "explore", payload: {}, agent_role: "security_researcher" }),
+  }));
+  expect(created.status).toBe(201);
+  expect((await created.json()).task.audit_id).toBe("a_adapter");
+
+  const reader = tokens.create({
+    userId,
+    label: "reader",
+    scopes: ["finding:read"],
+    projectId: "p_adapter",
+  });
+  const finding = await api(new Request("http://localhost/api/findings/f1", {
+    headers: { authorization: `Bearer ${reader.raw}` },
+  }));
+  expect(finding.status).toBe(200);
+  expect((await finding.json()).finding.id).toBe("f1");
+
+  const missing = await api(new Request("http://localhost/api/findings/missing", {
+    headers: { authorization: `Bearer ${reader.raw}` },
+  }));
+  expect(missing.status).toBe(404);
+});

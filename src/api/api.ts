@@ -741,6 +741,47 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
           );
           return json({ tasks });
         }
+        if (action === "tasks" && method === "POST") {
+          const current = requireRole("auditor");
+          requireScope("task:create");
+          const audit = deps.store.get<{ id: string; project_id: string; mode: string; status: string }>(
+            "SELECT id, project_id, mode, status FROM audits WHERE id = ?",
+            auditId,
+          );
+          if (!audit) throw notFound("Audit not found");
+          requireAuditScope(auditId);
+          requireProjectScope(audit.project_id);
+          if (audit.status !== "running") throw conflict("Tasks can be created only while the audit is running");
+          const body = await readJson(request);
+          const kind = requireString(body, "kind", 100);
+          if (kind === "explore" || kind.startsWith("explore.")) {
+            requireScope("audit:launch_dynamic");
+            if (!["dynamic", "hybrid"].includes(audit.mode)) throw conflict("Audit is not dynamic");
+          }
+          const phase = typeof body.phase === "number" ? body.phase : 2;
+          if (!Number.isInteger(phase) || phase < 1 || phase > 6) throw badRequest("phase must be 1..6");
+          const agentRole = optionalString(body, "agent_role", 100)
+            ?? (kind.startsWith("explore") ? "security_researcher" : null);
+          if (agentRole && !deps.store.get("SELECT role FROM agent_defs WHERE role = ?", agentRole)) {
+            throw badRequest("Unknown agent role");
+          }
+          if (!agentRole) throw badRequest("agent_role is required for this task kind");
+          const payload = body.payload && typeof body.payload === "object" && !Array.isArray(body.payload)
+            ? (body.payload as Record<string, unknown>)
+            : {};
+          const taskId = deps.engine.createTask({
+            auditId,
+            phase,
+            kind,
+            taskKey: `adapter:${kind}:${uid()}`,
+            title: optionalString(body, "title", 300) ?? `${kind} task`,
+            payload,
+            agentRole,
+            priority: 50,
+          });
+          deps.auth.logAction(current.email, "task.created", taskId, { audit_id: auditId, kind }, ip);
+          return json({ task: deps.store.get("SELECT * FROM tasks WHERE id = ?", taskId) }, 201);
+        }
         if (action === "findings" && method === "GET") {
           requireUser();
           const findings = deps.store.all(

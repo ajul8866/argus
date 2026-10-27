@@ -224,8 +224,10 @@ operation, preserving include/exclude short-circuit behavior.
    common directory other than that Git directory, an alternate object store,
    or a symlink in the object store is rejected, and `GIT_*` variables are not
    passed through. A pipe or symlink in metadata Git would read for that
-   archive, including `config.worktree`, sparse-checkout, and a config include
-   wherever Git would start that section, is rejected before Git starts. The
+   archive, including a loose ref other than `HEAD`, worktree metadata, a
+   pseudoref, `config.worktree`, sparse-checkout, and a config include
+   wherever Git would start that section, is rejected before Git starts.
+   Replacement refs are not applied. The
   directory named by a gitfile or `commondir` is the path Git opens, with
   trailing breaks removed and `..` applied after each symlink is followed.
   The runtime `realpath` is not used for that walk. A pointer that is not

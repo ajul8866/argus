@@ -140,10 +140,13 @@ export function clampText(value: unknown, max = 4000): string {
 // Repository config can point core.excludesFile and core.attributesFile at a
 // fifo. Git opens that path from every command that reads the config. Force
 // both settings at the command line so the fifo is never opened.
+// --no-replace-objects keeps refs/replace from substituting another object for
+// the commit being archived. Without it, archive can store different bytes
+// than that commit while rev-parse still prints the original commit id.
 const GIT_CONFIG_OVERRIDES = ["-c", "core.excludesFile=/dev/null", "-c", "core.attributesFile=/dev/null"] as const;
 
 export function gitArgv(args: readonly string[]): string[] {
-  return ["git", ...GIT_CONFIG_OVERRIDES, ...args];
+  return ["git", "--no-replace-objects", ...GIT_CONFIG_OVERRIDES, ...args];
 }
 
 export async function gitInfo(path: string): Promise<{ commit: string | null; branch: string | null }> {

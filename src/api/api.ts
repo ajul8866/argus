@@ -1139,7 +1139,21 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
       const retestMatch = path.match(/^\/api\/findings\/([^/]+)\/retest$/);
       if (retestMatch && method === "POST") {
         const current = requireRole("auditor");
-        const taskId = await deps.engine.requestRetest(retestMatch[1]!, current.email);
+        requireScope("audit:retest");
+        const findingRow = deps.store.get<{ audit_id: string }>(
+          "SELECT audit_id FROM findings WHERE id = ?",
+          retestMatch[1]!,
+        );
+        if (!findingRow) throw notFound("Finding not found");
+        requireAuditScope(findingRow.audit_id);
+        const body = request.body === null ? {} : await readJson(request);
+        const taskId = await deps.engine.requestRetest(retestMatch[1]!, current.email, {
+          reason: optionalString(body, "reason", 1_000) ?? undefined,
+          environmentManifest: optionalString(body, "environment_manifest", 4_000) ?? undefined,
+          commitSha: optionalString(body, "commit_sha", 200),
+          buildRef: optionalString(body, "build_ref", 200),
+          environmentMatch: body.environment_match === true,
+        });
         deps.auth.logAction(current.email, "finding.retest_requested", retestMatch[1]!, { task_id: taskId }, ip);
         return json({ ok: true, task_id: taskId }, 201);
       }

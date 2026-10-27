@@ -502,3 +502,54 @@ describe("dynamic exploration views", () => {
     expect(rows.find((row) => row.id === "n1")?.label).toBe("Find access control issues");
   });
 });
+
+describe("dynamic audit setup", () => {
+  function script(results: Array<{ status?: number; body: unknown }>) {
+    const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ path: String(input), body: init?.body ? JSON.parse(String(init.body)) : {} });
+      const next = results.shift();
+      if (!next) throw new Error("Unexpected extra request");
+      return response(next.status ?? 200, next.body);
+    }) as typeof fetch;
+    return calls;
+  }
+
+  test("a dynamic audit is created without importing a repository", async () => {
+    const calls = script([{ body: { audit: { id: "a1" } } }]);
+    const result = await createAuditWithSnapshot({
+      projectId: "p1",
+      startNow: false,
+      mode: "dynamic",
+      targetId: "t1",
+    });
+    expect(result).toEqual({ id: "a1", startError: null });
+    expect(calls.map((call) => call.path)).toEqual(["/api/audits"]);
+    expect(calls[0]!.body).toMatchObject({ project_id: "p1", mode: "dynamic", target_id: "t1" });
+    expect(calls[0]!.body.repository_id).toBeUndefined();
+  });
+
+  test("a dynamic audit without a target is refused before any request", async () => {
+    const calls = script([]);
+    await expect(
+      createAuditWithSnapshot({ projectId: "p1", startNow: false, mode: "dynamic" }),
+    ).rejects.toThrow(/target/i);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("a hybrid audit still imports the repository when none is selected", async () => {
+    const calls = script([
+      { body: { repository: { id: "r1" } } },
+      { body: { audit: { id: "a2" } } },
+    ]);
+    const result = await createAuditWithSnapshot({
+      projectId: "p1",
+      startNow: false,
+      mode: "hybrid",
+      targetId: "t1",
+    });
+    expect(result.id).toBe("a2");
+    expect(calls.map((call) => call.path)).toEqual(["/api/projects/p1/import", "/api/audits"]);
+    expect(calls[1]!.body).toMatchObject({ repository_id: "r1", mode: "hybrid", target_id: "t1" });
+  });
+});

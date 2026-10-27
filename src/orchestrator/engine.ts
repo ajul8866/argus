@@ -26,6 +26,7 @@ import { evaluateEvidence } from "./evidence-gate.ts";
 import { validateAuditOverrides } from "./options.ts";
 import { TargetService, type AuditScopeSnapshot } from "../dynamic/targets.ts";
 import { createBrokerDynamicExecutor, runPocChecks } from "../dynamic/executor.ts";
+import { RetestService } from "../dynamic/retest.ts";
 import { evaluateRun, validatePoc, type PocManifest } from "../dynamic/poc.ts";
 import { GraphStore, type Coverage, type ExplorationNode } from "../dynamic/graph.ts";
 import type { Inventory } from "../repo/inventory.ts";
@@ -1252,13 +1253,51 @@ export class AuditEngine {
     });
   }
 
-  async requestRetest(findingId: string, userId: string | null): Promise<string> {
+  async requestRetest(
+    findingId: string,
+    userId: string | null,
+    options: {
+      reason?: string;
+      environmentManifest?: string;
+      commitSha?: string | null;
+      buildRef?: string | null;
+      environmentMatch?: boolean;
+    } = {},
+  ): Promise<string> {
     const finding = this.store.get<FindingRow>("SELECT * FROM findings WHERE id = ?", findingId);
     if (!finding) throw new AppError(404, "finding_not_found", "Finding not found");
     const audit = this.store.get<AuditRow>("SELECT * FROM audits WHERE id = ?", finding.audit_id);
     if (!audit) throw new AppError(404, "audit_not_found", "Audit not found");
     if (!["running", "completed", "completed_with_errors", "cancelled", "failed"].includes(audit.status)) {
       throw new AppError(409, "audit_not_retestable", `Audit is ${audit.status}`);
+    }
+    const isDynamic = this.isDynamicFinding(finding);
+    let retestId: string | null = null;
+    if (isDynamic) {
+      const snapshot = this.targets.getSnapshot(finding.audit_id);
+      if (!snapshot) throw new AppError(409, "scope_snapshot_missing", "The audit has no scope snapshot");
+      const authorization = snapshot.snapshot.authorization;
+      retestId = new RetestService(this.store, (input) =>
+        this.replayPocForRetest(input.findingId, input.auditId),
+      ).request({
+        findingId,
+        auditId: finding.audit_id,
+        reason: options.reason?.trim() || "Manual retest requested by an operator",
+        requestedBy: userId && this.store.get("SELECT id FROM users WHERE id = ?", userId) ? userId : null,
+        authorizationSnapshot: JSON.stringify({
+          id: authorization.id,
+          authorized_by: authorization.authorized_by,
+          reference: authorization.reference,
+          valid_from: authorization.valid_from,
+          valid_until: authorization.valid_until,
+        }),
+        environmentManifest:
+          options.environmentManifest ??
+          JSON.stringify({ target: snapshot.snapshot.target.base_url, commit_sha: null }),
+        commitSha: options.commitSha ?? null,
+        buildRef: options.buildRef ?? null,
+        environmentMatch: options.environmentMatch === true,
+      });
     }
     const suffix = this.store.all<{ id: string }>(
       "SELECT id FROM tasks WHERE audit_id = ? AND kind = 'phase5.reverify' AND task_key LIKE ?",
@@ -1271,7 +1310,7 @@ export class AuditEngine {
       kind: "phase5.reverify",
       taskKey: `phase5:finding:${finding.id}:manual:${suffix + 1}`,
       title: `Phase 5 — Manual retest ${finding.code}`,
-      payload: { finding_id: finding.id },
+      payload: { finding_id: finding.id, retest_id: retestId },
       agentRole: "retest_auditor",
       priority: 50,
     });
@@ -1295,7 +1334,13 @@ export class AuditEngine {
     this.events.append({
       auditId: finding.audit_id,
       type: "finding.retest_requested",
-      payload: { finding_id: finding.id, code: finding.code, task_id: task, by: userId },
+      payload: {
+        finding_id: finding.id,
+        code: finding.code,
+        task_id: task,
+        retest_id: retestId,
+        by: userId,
+      },
       taskId: task,
     });
     await this.reconcile(finding.audit_id);
@@ -1674,7 +1719,37 @@ export class AuditEngine {
       await this.runReportTask(task);
       return;
     }
+    if (task.kind === "phase5.reverify") {
+      const payload = parseJson<Record<string, unknown>>(task.payload, {});
+      if (typeof payload.retest_id === "string") {
+        await this.runRetestTask(task, payload.retest_id);
+        return;
+      }
+    }
     await this.runAgentTask(task, audit, signal);
+  }
+
+  /**
+   * A dynamic retest runs the stored PoC through the broker and records a
+   * strict verdict; it does not need an LLM session.
+   */
+  private async runRetestTask(task: TaskRow, retestId: string): Promise<void> {
+    try {
+      if (this.cancelIfAuditClosed(task, "Audit was cancelled before the retest ran")) return;
+      const service = new RetestService(this.store, (input) =>
+        this.replayPocForRetest(input.findingId, input.auditId),
+      );
+      const verdict = await service.run(retestId);
+      this.completeTask(task.id, { retest_id: retestId, verdict });
+      this.events.append({
+        auditId: task.audit_id,
+        taskId: task.id,
+        type: "finding.retest_completed",
+        payload: { retest_id: retestId, verdict },
+      });
+    } catch (error) {
+      this.finishTaskFailure(task.id, "internal", error instanceof Error ? error.message : String(error));
+    }
   }
 
   private async runDeterministicTask(task: TaskRow): Promise<void> {
@@ -3187,6 +3262,54 @@ export class AuditEngine {
     if (Date.parse(live.validFrom) > nowMs) return false;
     if (Date.parse(live.validUntil) <= nowMs) return false;
     return true;
+  }
+
+  /**
+   * Replays the stored PoC for a retest and reports whether the exploit check
+   * still succeeds. The positive control must pass for the result to mean
+   * anything, which the strict verdict rules already enforce.
+   */
+  private async replayPocForRetest(
+    findingId: string,
+    auditId: string,
+  ): Promise<{ positivePassed: boolean; exploitPassed: boolean; evidenceRefs: string[]; error?: string }> {
+    const proof = this.store.get<{ id: string }>(
+      "SELECT id FROM evidence WHERE finding_id = ? AND kind = 'dynamic_proof' ORDER BY rowid DESC LIMIT 1",
+      findingId,
+    );
+    if (!proof) return { positivePassed: false, exploitPassed: false, evidenceRefs: [], error: "no stored PoC" };
+    let manifest: PocManifest;
+    try {
+      const verified = await this.evidence.content(proof.id);
+      const parsed = JSON.parse(verified?.content ?? "{}") as { manifest?: PocManifest };
+      if (!parsed.manifest) throw new Error("manifest missing");
+      manifest = parsed.manifest;
+      validatePoc(manifest);
+    } catch (error) {
+      return {
+        positivePassed: false,
+        exploitPassed: false,
+        evidenceRefs: [],
+        error: `the stored PoC cannot be replayed: ${String(error)}`,
+      };
+    }
+    try {
+      const exchanges = await runPocChecks(this.config, this.store, auditId, manifest);
+      const run = evaluateRun(manifest, exchanges);
+      return {
+        positivePassed: run.positive,
+        exploitPassed: run.exploit,
+        evidenceRefs: [proof.id],
+        ...(run.status === "error" ? { error: run.reason ?? "positive control failed" } : {}),
+      };
+    } catch (error) {
+      return {
+        positivePassed: false,
+        exploitPassed: false,
+        evidenceRefs: [proof.id],
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
   }
 
   private async reconcile(auditId: string): Promise<void> {

@@ -935,10 +935,13 @@ test("exploration route returns assets, nodes, edges, anchors, and coverage", as
   expect(body.assets).toHaveLength(1);
   expect(body.assets[0]).toMatchObject({ id: asset.id, assetKey: "https://graph.test" });
   expect(body.nodes).toHaveLength(3);
-  expect(body.edges).toEqual([
-    { fromNodeId: goal.id, toNodeId: intent.id, kind: "spawns" },
-    { fromNodeId: intent.id, toNodeId: fact.id, kind: "yields" },
-  ]);
+  expect(body.edges).toHaveLength(2);
+  expect(body.edges).toEqual(
+    expect.arrayContaining([
+      { fromNodeId: goal.id, toNodeId: intent.id, kind: "spawns" },
+      { fromNodeId: intent.id, toNodeId: fact.id, kind: "yields" },
+    ]),
+  );
   expect(body.anchors).toHaveLength(3);
   expect(body.coverage).toEqual([
     expect.objectContaining({ assetId: asset.id, assetKey: "https://graph.test", tested: true }),

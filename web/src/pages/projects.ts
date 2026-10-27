@@ -139,9 +139,13 @@ export async function renderProjects(root: HTMLElement): Promise<void> {
 export async function renderProjectDetail(root: HTMLElement, projectId: string): Promise<void> {
   root.replaceChildren(loading("Loading project"));
   try {
-    const detail = await api<{ project: Project; repositories: Repository[]; audits: Audit[] }>(`/api/projects/${projectId}`);
+    const [detail, targetRegistry] = await Promise.all([
+      api<{ project: Project; repositories: Repository[]; audits: Audit[] }>(`/api/projects/${projectId}`),
+      api<{ targets: TargetRow[] }>(`/api/projects/${projectId}/targets`).catch(() => ({ targets: [] as TargetRow[] })),
+    ]);
     const project = detail.project;
     const canManage = session.user?.role === "admin" || session.user?.role === "auditor";
+    const targets = targetRegistry.targets;
 
     const repositories = detail.repositories.length
       ? h(
@@ -185,6 +189,27 @@ export async function renderProjectDetail(root: HTMLElement, projectId: string):
         )
       : emptyState("No audits", "Create the first six-phase audit for the newest snapshot.", canManage ? button("New audit", () => void openAuditCreate(project.id), "primary") : null);
 
+    const targetList = targets.length
+      ? h("div", { class: "table-wrap" },
+          h("table", {},
+            h("thead", {}, h("tr", {}, h("th", {}, "Target"), h("th", {}, "Environment"), h("th", { class: "col-optional" }, "Methods"), h("th", {}, "Status"), h("th", {}, ""))),
+            h("tbody", {}, ...targets.map((target) =>
+              h("tr", {},
+                h("td", {}, h("div", { class: "table-title mono" }, target.base_url), h("div", { class: "table-sub" }, target.label)),
+                h("td", { class: "small" }, target.environment),
+                h("td", { class: "small mono col-optional" }, [...target.allowed_methods, ...(target.authorized_actions?.methods ?? [])].join(", ") || "none"),
+                h("td", {}, statusBadge(target.status)),
+                h("td", {}, h("a", { class: "btn btn-sm btn-secondary", href: `#/coverage?project=${projectId}&target=${target.id}` }, "Coverage")),
+              ),
+            )),
+          ),
+        )
+      : emptyState(
+          "No authorized target",
+          "A dynamic or hybrid audit needs a target, a recorded authorization, and at least one test identity.",
+          canManage ? button("Add target", () => openTargetCreate(projectId), "primary") : null,
+        );
+
     root.replaceChildren(
       pageHeader(
         project.name,
@@ -196,6 +221,7 @@ export async function renderProjectDetail(root: HTMLElement, projectId: string):
       ),
       h("div", { class: "grid grid-main" },
         h("div", { class: "stack" },
+          section("Authorized targets", targetList),
           section("Repository snapshots", repositories),
           section("Audit history", audits),
         ),
@@ -227,6 +253,108 @@ export async function renderProjectDetail(root: HTMLElement, projectId: string):
   } catch (error) {
     root.replaceChildren(errorState(error instanceof Error ? error.message : "Unable to load project", () => void renderProjectDetail(root, projectId)));
   }
+}
+
+type TargetRow = {
+  id: string;
+  label: string;
+  base_url: string;
+  environment: string;
+  status: string;
+  allowed_methods: string[];
+  authorized_actions?: { methods?: string[] } | null;
+  authorization_count?: number;
+  identity_count?: number;
+};
+
+function openTargetCreate(projectId: string): void {
+  const label = input("label", { placeholder: "Staging API", required: true });
+  const baseUrl = input("base_url", { placeholder: "https://staging.example.test", required: true });
+  const environment = input("environment", { value: "staging", required: true });
+  const hosts = input("allowed_hosts", { placeholder: "staging.example.test, *.staging.example.test", required: true });
+  const cidrs = input("allowed_cidrs", { placeholder: "optional, e.g. 203.0.113.0/24" });
+  const methods = input("allowed_methods", { value: "GET, HEAD" });
+  const maxRps = input("max_rps", { type: "number", value: "5", min: 1, max: 100 });
+  const authorizedBy = input("authorized_by", { required: true });
+  const reference = input("reference", { required: true });
+  const validUntil = input("valid_until", {
+    type: "datetime-local",
+    value: new Date(Date.now() + 7 * 24 * 3_600_000).toISOString().slice(0, 16),
+    required: true,
+  });
+  const identityA = input("identity_a", { placeholder: "user_a secret reference" });
+  const identityB = input("identity_b", { placeholder: "user_b secret reference" });
+  const errorBox = h("div", { class: "login-error hidden", role: "alert", tabindex: "-1" });
+  const submit = h("button", { class: "btn btn-primary", type: "submit" }, "Create target");
+  const split = (value: string): string[] =>
+    value.split(/[\n,]/).map((entry) => entry.trim()).filter(Boolean);
+
+  const content = h("form", {
+    class: "form",
+    onsubmit: async (event: Event) => {
+      event.preventDefault();
+      errorBox.classList.add("hidden");
+      submit.disabled = true;
+      try {
+        const { target } = await api<{ target: { id: string } }>(`/api/projects/${projectId}/targets`, {
+          method: "POST",
+          body: {
+            label: label.value.trim(),
+            base_url: baseUrl.value.trim(),
+            environment: environment.value.trim(),
+            allowed_hosts: split(hosts.value),
+            allowed_cidrs: split(cidrs.value),
+            allowed_methods: split(methods.value),
+            max_rps: Number(maxRps.value) || undefined,
+          },
+        });
+        await api(`/api/targets/${target.id}/authorizations`, {
+          method: "POST",
+          body: {
+            authorized_by: authorizedBy.value.trim(),
+            authorization_ref: reference.value.trim(),
+            valid_from: new Date().toISOString(),
+            valid_until: new Date(validUntil.value).toISOString(),
+            authorized_actions: { methods: split(methods.value) },
+          },
+        });
+        for (const [label, ref] of [["user_a", identityA.value.trim()], ["user_b", identityB.value.trim()]] as const) {
+          if (!ref) continue;
+          await api(`/api/targets/${target.id}/identities`, {
+            method: "POST",
+            body: { label, role: "user", auth_kind: "header", secret_ref: ref },
+          });
+        }
+        instance.close();
+        toast("Target created with its authorization.", "success");
+        location.reload();
+      } catch (error) {
+        errorBox.textContent = error instanceof Error ? error.message : "Unable to create the target";
+        errorBox.classList.remove("hidden");
+        errorBox.focus();
+      } finally {
+        submit.disabled = false;
+      }
+    },
+  },
+  errorBox,
+  h("p", { class: "modal-copy" }, "Argus records who authorized testing, until when, and which identities may be used. Secrets are referenced by name and never stored in the browser."),
+  h("div", { class: "form-grid" },
+    field("Label", label), field("Base URL", baseUrl),
+    field("Environment", environment), field("Max requests per second", maxRps),
+    field("Allowed hosts", hosts), field("Allowed CIDRs", cidrs),
+    field("Allowed methods", methods),
+  ),
+  h("div", { class: "form-grid" },
+    field("Authorized by", authorizedBy), field("Authorization reference", reference),
+    field("Valid until", validUntil),
+  ),
+  h("div", { class: "form-grid" },
+    field("Identity A secret reference", identityA),
+    field("Identity B secret reference", identityB),
+  ),
+  h("div", { class: "form-actions" }, button("Cancel", () => instance.close(), "secondary"), submit));
+  const instance = modal("Add authorized target", content, null, {});
 }
 
 function openImport(projectId: string): void {

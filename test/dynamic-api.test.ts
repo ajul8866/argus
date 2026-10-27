@@ -409,3 +409,175 @@ test("a worker proposes and an independent run confirms a dynamic candidate", as
   expect(fabricated.status).toBe(400);
   expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM findings WHERE audit_id = ?", auditId)!.count).toBe(1);
 }, 40_000);
+
+test("a retest route records a row and the task runs it deterministically", async () => {
+  dir = mkdtempSync(join(tmpdir(), "argus-retest-api-"));
+  const settings = config(dir);
+  store = new Store(settings, "test.sqlite");
+  seedDefaults(store, settings);
+  const auth = new AuthService(settings, store);
+  await auth.bootstrap();
+
+  targetServer = createServer((request, response) => {
+    const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (url.pathname !== "/invoices/inv-1") {
+      response.writeHead(404).end("{}");
+      return;
+    }
+    if (request.headers.authorization === "Bearer token-a") {
+      response.writeHead(403).end('{"error":"forbidden"}');
+      return;
+    }
+    response.writeHead(200, { "content-type": "application/json" }).end('{"invoice":{"id":"inv-1"}}');
+  });
+  await new Promise<void>((resolve) => targetServer!.listen(0, "127.0.0.1", resolve));
+  const baseUrl = `http://127.0.0.1:${(targetServer.address() as { port: number }).port}`;
+
+  const events = new EventLog(store);
+  const manager = new HarnessManager(settings, store);
+  const evidence = new EvidenceStore(settings, store);
+  const reports = new ReportService(settings, store, evidence, events);
+  engine = new AuditEngine(settings, store, manager, evidence, events, reports);
+  const api = createApi({ config: settings, store, auth, events, manager, evidence, reports, engine });
+  const login = await auth.login(settings.adminEmail, settings.adminPassword!, "local", "test");
+  const headers = { cookie: `argus_session=${login.token}`, "x-csrf-token": login.csrf, "content-type": "application/json" };
+  const call = async (path: string, init: RequestInit = {}) => {
+    const response = await api(new Request(`http://localhost${path}`, { ...init, headers: { ...headers, ...(init.headers ?? {}) } }));
+    return { status: response.status, body: await response.json().catch(() => null) };
+  };
+
+  store.run(
+    `INSERT INTO projects (id, name, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+     VALUES ('p_r','Retest', ?, '**/*', '', 'Tester', 'AUTH-R', ?, ?)`,
+    join(import.meta.dir, "fixtures", "vulnerable-app"),
+    now(),
+    now(),
+  );
+  store.run(
+    `INSERT INTO repositories (id, project_id, path, commit_sha, branch, languages, frameworks, inventory, graph, file_count, total_bytes, imported_at)
+     VALUES ('r_r','p_r',?, 'abc123','main','{}','[]','{}','{}',1,10,?)`,
+    join(import.meta.dir, "fixtures", "vulnerable-app"),
+    now(),
+  );
+  const target = await call("/api/projects/p_r/targets", {
+    method: "POST",
+    body: JSON.stringify({
+      label: "Retest target",
+      base_url: baseUrl,
+      environment: "test",
+      repository_id: "r_r",
+      allowed_hosts: ["127.0.0.1"],
+      allowed_cidrs: ["127.0.0.1/32"],
+      allowed_methods: ["GET"],
+      max_rps: 100,
+      tls_required: false,
+    }),
+  });
+  const targetId = target.body.target.id;
+  await call(`/api/targets/${targetId}/authorizations`, {
+    method: "POST",
+    body: JSON.stringify({
+      authorized_by: "Tester",
+      authorization_ref: "AUTH-R",
+      valid_from: new Date(Date.now() - 60_000).toISOString(),
+      valid_until: new Date(Date.now() + 3_600_000).toISOString(),
+      authorized_actions: { methods: ["GET"] },
+    }),
+  });
+  const identityA = await call(`/api/targets/${targetId}/identities`, {
+    method: "POST",
+    body: JSON.stringify({ label: "user_a", role: "user", auth_kind: "header", secret_ref: "r:user_a" }),
+  });
+  const identityB = await call(`/api/targets/${targetId}/identities`, {
+    method: "POST",
+    body: JSON.stringify({ label: "user_b", role: "user", auth_kind: "header", secret_ref: "r:user_b" }),
+  });
+  for (const [ref, token] of [["r:user_a", "token-a"], ["r:user_b", "token-b"]] as const) {
+    const encrypted = encryptSecret(settings, token);
+    store.run(
+      `INSERT INTO provider_credentials (id, provider, env_var, ciphertext, iv, tag, last4, created_at, updated_at)
+       VALUES (?, 'test-identity', ?, ?, ?, ?, ?, ?, ?)`,
+      `cred-${ref}`,
+      ref,
+      encrypted.ciphertext,
+      encrypted.iv,
+      encrypted.tag,
+      encrypted.last4,
+      now(),
+      now(),
+    );
+  }
+  const audit = await call("/api/audits", {
+    method: "POST",
+    body: JSON.stringify({ project_id: "p_r", repository_id: "r_r", mode: "dynamic", target_id: targetId }),
+  });
+  const auditId = audit.body.audit.id;
+  await call(`/api/audits/${auditId}/start`, { method: "POST" });
+  await engine.stop();
+  engine = null;
+
+  const asset = new GraphStore(store).upsertAsset({ projectId: "p_r", kind: "app", assetKey: baseUrl });
+  const aId = identityA.body.identity.id;
+  const bId = identityB.body.identity.id;
+  const manifest = {
+    language: "typescript",
+    script_evidence_id: "pending",
+    object: { asset_id: asset.id, object_id: "inv-1", owner_identity: bId },
+    checks: {
+      positive: { identity: bId, request: { method: "GET", path: "/invoices/inv-1" }, expect: { status: 200, body_contains: "inv-1" } },
+      exploit: { identity: aId, request: { method: "GET", path: "/invoices/inv-1" }, expect: { status: 403 } },
+      negative: { identity: aId, request: { method: "GET", path: "/nope" }, expect: { status: 404 } },
+    },
+    environment: { target: baseUrl, commit_sha: "abc123", identities: [aId, bId] },
+  };
+  const proposed = await call(`/api/audits/${auditId}/candidates`, {
+    method: "POST",
+    body: JSON.stringify({
+      asset_id: asset.id,
+      title: "Cross-tenant read",
+      category: "idor",
+      severity: "high",
+      manifest,
+      script: "requests.get('/invoices/inv-1')",
+      proposed_by: "worker-1",
+    }),
+  });
+  expect(proposed.status).toBe(201);
+  const confirmed = await call(`/api/candidates/${proposed.body.candidateId}/confirm`, {
+    method: "POST",
+    body: JSON.stringify({ confirmed_by: "validator-1" }),
+  });
+  expect(confirmed.body.verdict).toBe("CONFIRMED");
+  const findingId = confirmed.body.findingId;
+
+  const retest = await call(`/api/findings/${findingId}/retest`, {
+    method: "POST",
+    body: JSON.stringify({
+      reason: "ownership check added",
+      environment_match: true,
+      environment_manifest: JSON.stringify({ target: baseUrl, commit_sha: "abc123" }),
+      commit_sha: "abc123",
+    }),
+  });
+  expect(retest.status).toBe(201);
+  const retestRow = store.get<{ status: string; verdict: string | null; environment_match: number }>(
+    "SELECT status, verdict, environment_match FROM retests WHERE finding_id = ?",
+    findingId,
+  )!;
+  expect(retestRow).toMatchObject({ status: "queued", verdict: null, environment_match: 1 });
+
+  const engine2 = new AuditEngine(settings, store, manager, evidence, events, reports);
+  engine = engine2;
+  engine2.start();
+  const deadline = Date.now() + 20_000;
+  let verdict: string | null = null;
+  while (Date.now() < deadline) {
+    verdict = store.get<{ verdict: string | null }>(
+      "SELECT verdict FROM retests WHERE finding_id = ?",
+      findingId,
+    )?.verdict ?? null;
+    if (verdict) break;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  expect(verdict).toBe("still_reproducible");
+}, 60_000);

@@ -58,7 +58,9 @@ export function coverageRows(payload: ExplorationPayload): CoverageRow[] {
 export type Audit = { id: string; project_name: string; mode?: string; status: string };
 
 export async function selectAudit(params: URLSearchParams): Promise<Audit | null> {
-  const { audits } = await api<{ audits: Audit[] }>("/api/audits");
+  const projectId = params.get("project");
+  const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
+  const { audits } = await api<{ audits: Audit[] }>(`/api/audits${query}`);
   if (audits.length === 0) return null;
   const requested = params.get("audit");
   if (requested && audits.some((audit) => audit.id === requested)) {

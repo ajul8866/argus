@@ -220,7 +220,7 @@ describe("dynamic IDOR proof", () => {
     store.run(
       `INSERT INTO repositories (id, project_id, path, commit_sha, branch, languages, frameworks, inventory, graph, file_count, total_bytes, imported_at)
        VALUES ('r1','p1',?, 'abc123','main','{}','[]','{}','{}',1,10,?)`,
-      dir,
+      join(import.meta.dir, "fixtures", "vulnerable-app"),
       now(),
     );
     store.run(
@@ -327,7 +327,16 @@ describe("dynamic IDOR proof", () => {
     const brokerPort = (await broker.start()).port;
     const brokerUrl = `http://127.0.0.1:${brokerPort}`;
 
-    const proof = new DynamicProofService(store, evidence, graph);
+    const proof = new DynamicProofService(
+      store,
+      evidence,
+      async (_auditId, manifest) => ({
+        positive: await proxyRequest(brokerPort, `${baseUrl}${manifest.checks.positive.request.path}`, manifest.checks.positive.identity),
+        exploit: await proxyRequest(brokerPort, `${baseUrl}${manifest.checks.exploit.request.path}`, manifest.checks.exploit.identity),
+        negative: await proxyRequest(brokerPort, `${baseUrl}${manifest.checks.negative.request.path}`, manifest.checks.negative.identity),
+      }),
+      graph,
+    );
     const manifest: PocManifest = {
       language: "typescript",
       script_evidence_id: "pending",
@@ -367,9 +376,7 @@ describe("dynamic IDOR proof", () => {
         ];
       },
       async execute(_auditId, intent) {
-        const positive = await proxyRequest(brokerPort, `${baseUrl}/api/invoices/inv-1`, identityB.id);
         const exploit = await proxyRequest(brokerPort, `${baseUrl}/api/invoices/inv-1`, identityA.id);
-        const negative = await proxyRequest(brokerPort, `${baseUrl}/api/invoices/inv-999`, identityA.id);
         const result = await proof.record({
           auditId: "a1",
           assetId: asset.id,
@@ -377,14 +384,13 @@ describe("dynamic IDOR proof", () => {
           category: "idor",
           severity: "high",
           manifest,
-          exchanges: { positive, exploit, negative },
           script: `# Reproduces the cross-tenant invoice read\nrequests.get("${baseUrl}/api/invoices/inv-1", headers={"authorization": "Bearer <user_a>"})`,
           intentNodeId: intent.nodeId,
           source: {
             path: "src/routes/invoices.js",
             start_line: 11,
             end_line: 17,
-            quote: "router.get('/:id', (request, response) => { ... })",
+            quote: "router.get(\"/:id\", (request, response) => {\n  const invoice = findInvoiceById(request.params.id);",
           },
         });
         expect(result.run.status).toBe("passed");
@@ -406,13 +412,19 @@ describe("dynamic IDOR proof", () => {
     const finding = store.get<{ id: string; status: string; code: string; files: string }>(
       "SELECT id, status, code, files FROM findings WHERE audit_id = 'a1'",
     )!;
-    expect(finding.status).toBe("confirmed");
+    expect(finding.status).toBe("reverified");
+    expect(
+      store.get<{ verdict: string }>(
+        "SELECT verdict FROM verifications WHERE finding_id = ? AND kind = 'reverification'",
+        finding.id,
+      ),
+    ).toEqual({ verdict: "REVERIFIED" });
     expect(finding.code).toBe("DYN-001");
-    expect(JSON.parse(finding.files)).toEqual([{ path: "src/routes/invoices.js", start_line: 11, end_line: 17 }]);
+    expect(JSON.parse(finding.files)).toEqual([{ path: "src/routes/invoices.js", start_line: 12, end_line: 13 }]);
     expect(
       store.get<{ count: number }>("SELECT COUNT(*) AS count FROM evidence WHERE finding_id = ?", finding.id)!.count,
     ).toBe(5);
-    expect(exchanges.length).toBe(3);
+    expect(exchanges.length).toBe(4);
     expect(graph.coverage("a1").find((entry) => entry.assetId === asset.id)?.tested).toBe(true);
 
     if (!usingFixture) fixed = true;

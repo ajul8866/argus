@@ -1,11 +1,28 @@
+import type { Config } from "../config.ts";
 import type { Store } from "../db/index.ts";
 import { badRequest, now, notFound, sha256, toJson, uid } from "../util.ts";
 import { redactSecrets } from "../security/redact.ts";
 import type { EvidenceStore } from "../orchestrator/evidence.ts";
 import { GraphStore } from "./graph.ts";
 import { evaluateRun, type PocExchange, type PocManifest, type PocRunResult } from "./poc.ts";
+import { TargetService } from "./targets.ts";
+import { verifyQuote } from "../repo/workspace.ts";
+import { existsSync } from "node:fs";
 
 export type FindingSeverity = "critical" | "high" | "medium" | "low" | "info";
+
+/** Exchanges must come from the broker replay, never from the caller. */
+export type ProvenExchanges = {
+  positive: PocExchange;
+  exploit: PocExchange;
+  negative: PocExchange;
+};
+
+/**
+ * The only source of exchange data is a broker replay. A caller supplies the
+ * manifest; the service performs the requests itself.
+ */
+export type PocReplay = (auditId: string, manifest: PocManifest) => Promise<ProvenExchanges>;
 
 export type DynamicProofInput = {
   auditId: string;
@@ -14,7 +31,6 @@ export type DynamicProofInput = {
   category: string;
   severity: FindingSeverity;
   manifest: PocManifest;
-  exchanges: { positive: PocExchange; exploit: PocExchange; negative: PocExchange };
   script: string;
   impact?: string;
   remediation?: string;
@@ -49,6 +65,7 @@ export class DynamicProofService {
   constructor(
     private readonly store: Store,
     private readonly evidence: EvidenceStore,
+    private readonly replay: PocReplay,
     graph?: GraphStore,
   ) {
     this.graph = graph ?? new GraphStore(store);
@@ -69,9 +86,36 @@ export class DynamicProofService {
       throw badRequest("invalid severity");
     }
 
-    const run = evaluateRun(input.manifest, input.exchanges);
+    const replay = await this.replay(input.auditId, input.manifest);
+    const run = evaluateRun(input.manifest, replay);
     if (run.status !== "passed") {
       throw badRequest(`PoC did not pass: ${run.reason ?? run.status}`);
+    }
+
+    let source: { path: string; start_line: number; end_line: number; quote: string } | null = null;
+    if (input.source) {
+      const snapshot = new TargetService(this.store).getSnapshot(input.auditId)?.snapshot;
+      const repositoryId = snapshot?.repository?.id ?? null;
+      const repository = repositoryId
+        ? this.store.get<{ path: string }>("SELECT path FROM repositories WHERE id = ?", repositoryId)
+        : null;
+      if (!repository || !existsSync(repository.path)) {
+        throw badRequest("A source quote requires an imported repository snapshot");
+      }
+      const check = await verifyQuote(
+        repository.path,
+        { include: ["**/*"], exclude: [] },
+        { path: input.source.path, quote: input.source.quote },
+      );
+      if (!check.found) {
+        throw badRequest(`The source quote was not found in ${input.source.path}: ${check.detail}`);
+      }
+      source = {
+        path: check.path,
+        start_line: check.line_start ?? input.source.start_line,
+        end_line: check.line_end ?? input.source.end_line,
+        quote: input.source.quote,
+      };
     }
 
     const findingId = uid();
@@ -93,7 +137,7 @@ export class DynamicProofService {
     const exchangeIds: string[] = [];
     for (const name of ["positive", "exploit", "negative"] as const) {
       const check = input.manifest.checks[name];
-      const exchange = input.exchanges[name];
+      const exchange = replay[name];
       const row = await this.evidence.append({
         auditId: input.auditId,
         findingId,
@@ -120,9 +164,9 @@ export class DynamicProofService {
         manifest: { ...input.manifest, script_evidence_id: scriptEvidence.id },
         result: run,
         exchanges: {
-          positive: { status: input.exchanges.positive.status, body_sha256: sha256(input.exchanges.positive.body) },
-          exploit: { status: input.exchanges.exploit.status, body_sha256: sha256(input.exchanges.exploit.body) },
-          negative: { status: input.exchanges.negative.status, body_sha256: sha256(input.exchanges.negative.body) },
+          positive: { status: replay.positive.status, body_sha256: sha256(replay.positive.body) },
+          exploit: { status: replay.exploit.status, body_sha256: sha256(replay.exploit.body) },
+          negative: { status: replay.negative.status, body_sha256: sha256(replay.negative.body) },
         },
       },
       redacted: true,
@@ -131,29 +175,29 @@ export class DynamicProofService {
     const positive = input.manifest.checks.positive;
     const exploit = input.manifest.checks.exploit;
     const negative = input.manifest.checks.negative;
-    const observed = `${exploit.identity} received HTTP ${input.exchanges.exploit.status} for ${input.manifest.object.object_id}, an object owned by ${input.manifest.object.owner_identity}.`;
-    const rootCause = input.source
-      ? `The handler at ${input.source.path}:${input.source.start_line} does not enforce object ownership.`
+    const observed = `${exploit.identity} received HTTP ${replay.exploit.status} for ${input.manifest.object.object_id}, an object owned by ${input.manifest.object.owner_identity}.`;
+    const rootCause = source
+      ? `The handler at ${source.path}:${source.start_line} does not enforce object ownership.`
       : "No source root cause was identified. The finding is proven by the reproducible exchange.";
     const impact =
       input.impact ??
       `An authenticated identity can read another identity's ${input.manifest.object.object_id}.`;
     const remediation =
       input.remediation ?? "Enforce object ownership on the handler before returning the object.";
-    const files = input.source
-      ? toJson([{ path: input.source.path, start_line: input.source.start_line, end_line: input.source.end_line }])
+    const files = source
+      ? toJson([{ path: source.path, start_line: source.start_line, end_line: source.end_line }])
       : "[]";
     const payload = {
       provenance: "dynamic",
-      link_key: input.source ? `${input.source.path}:${input.category}` : null,
+      link_key: source ? `${source.path}:${input.category}` : null,
       manifest: { ...input.manifest, script_evidence_id: scriptEvidence.id },
       run,
       object: input.manifest.object,
       evidence_ids: [scriptEvidence.id, ...exchangeIds, proofEvidence.id],
       exchange_statuses: {
-        positive: input.exchanges.positive.status,
-        exploit: input.exchanges.exploit.status,
-        negative: input.exchanges.negative.status,
+        positive: replay.positive.status,
+        exploit: replay.exploit.status,
+        negative: replay.negative.status,
       },
     };
 

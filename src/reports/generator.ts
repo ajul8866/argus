@@ -185,7 +185,17 @@ export class ReportService {
       graph: string;
       file_count: number;
       imported_at: string;
-    }>("SELECT * FROM repositories WHERE id = ?", audit.repository_id)!;
+    }>("SELECT * FROM repositories WHERE id = ?", audit.repository_id) ?? {
+      id: "",
+      commit_sha: null,
+      branch: null,
+      languages: "{}",
+      frameworks: "[]",
+      inventory: "{}",
+      graph: "{}",
+      file_count: 0,
+      imported_at: audit.created_at,
+    };
     const phases = this.store.all<{
       phase: number;
       name: string;

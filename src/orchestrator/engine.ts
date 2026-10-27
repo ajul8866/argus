@@ -25,6 +25,8 @@ import { redactObject, redactSecrets } from "../security/redact.ts";
 import { evaluateEvidence } from "./evidence-gate.ts";
 import { validateAuditOverrides } from "./options.ts";
 import { TargetService, type AuditScopeSnapshot } from "../dynamic/targets.ts";
+import { createBrokerDynamicExecutor, runPocChecks } from "../dynamic/executor.ts";
+import { evaluateRun, validatePoc, type PocManifest } from "../dynamic/poc.ts";
 import { GraphStore, type Coverage, type ExplorationNode } from "../dynamic/graph.ts";
 import type { Inventory } from "../repo/inventory.ts";
 import { inventoryForAgent, inventorySummary } from "../repo/inventory.ts";
@@ -273,6 +275,10 @@ export class AuditEngine {
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
   private readonly running = new Map<string, { auditId: string; controller: AbortController }>();
+  private readonly exploring = new Set<string>();
+  private readonly explorationRuns = new Map<string, Promise<void>>();
+  private readonly taskRuns = new Map<string, Promise<void>>();
+  private tickRun: Promise<void> | null = null;
   private readonly transitions = new KeyedSerialQueue();
   private stopping = false;
 
@@ -287,6 +293,7 @@ export class AuditEngine {
   ) {
     this.targets = new TargetService(store);
     this.graph = new GraphStore(store);
+    this.dynamicExecutor = createBrokerDynamicExecutor(config, store);
   }
 
   private readonly targets: TargetService;
@@ -298,18 +305,35 @@ export class AuditEngine {
   }
 
   start(): void {
+    this.stopping = false;
     this.recoverAfterRestart();
-    this.timer = setInterval(() => void this.tick(), 1_500);
+    this.timer = setInterval(() => {
+      this.tickRun = this.tick();
+      void this.tickRun;
+    }, 1_500);
   }
 
   async stop(): Promise<void> {
     this.stopping = true;
     if (this.timer) clearInterval(this.timer);
+    if (this.tickRun) await this.tickRun.catch(() => undefined);
     for (const entry of this.running.values()) entry.controller.abort();
     await Promise.race([
       Promise.allSettled([...this.running.keys()].map((runId) => this.manager.cleanupRun(runId))),
       new Promise((resolvePromise) => setTimeout(resolvePromise, 3_000)),
     ]);
+    if (this.explorationRuns.size > 0) {
+      await Promise.race([
+        Promise.allSettled([...this.explorationRuns.values()]),
+        new Promise((resolvePromise) => setTimeout(resolvePromise, 10_000)),
+      ]);
+    }
+    if (this.taskRuns.size > 0) {
+      await Promise.race([
+        Promise.allSettled([...this.taskRuns.values()]),
+        new Promise((resolvePromise) => setTimeout(resolvePromise, 10_000)),
+      ]);
+    }
   }
 
   private recoverAfterRestart(): void {
@@ -398,6 +422,7 @@ export class AuditEngine {
         "SELECT id, status FROM audits WHERE status IN ('running','cancelling') ORDER BY created_at",
       );
       for (const audit of audits) {
+        if (this.stopping) break;
         await this.reconcile(audit.id).catch((error) => {
           this.events.append({
             auditId: audit.id,
@@ -405,7 +430,34 @@ export class AuditEngine {
             payload: { message: `Scheduler reconcile failed: ${String(error)}` },
           });
         });
-        if (audit.status === "running") this.schedule(audit.id);
+        if (audit.status === "running") {
+          this.schedule(audit.id);
+          const dynamic = this.store.get<{ mode: string; exploration_status: string | null }>(
+            "SELECT mode, exploration_status FROM audits WHERE id = ?",
+            audit.id,
+          );
+          if (
+            dynamic &&
+            dynamic.mode !== "static" &&
+            dynamic.exploration_status === "open" &&
+            !this.exploring.has(audit.id)
+          ) {
+            this.exploring.add(audit.id);
+            const run = this.runExplorationStep(audit.id)
+              .catch((error) => {
+                this.events.append({
+                  auditId: audit.id,
+                  type: "system.error",
+                  payload: { message: `Exploration step failed: ${String(error)}` },
+                });
+              })
+              .finally(() => {
+                this.exploring.delete(audit.id);
+                this.explorationRuns.delete(audit.id);
+              });
+            this.explorationRuns.set(audit.id, run);
+          }
+        }
       }
     } finally {
       this.ticking = false;
@@ -641,7 +693,7 @@ export class AuditEngine {
         });
       }
       if (audit.mode !== "static") {
-        this.graph.createNode({
+        const goal = this.graph.createNode({
           auditId,
           kind: "goal",
           payload: {
@@ -650,6 +702,15 @@ export class AuditEngine {
             mode: audit.mode,
           },
         });
+        const snapshot = this.targets.getSnapshot(auditId)?.snapshot;
+        if (snapshot) {
+          const asset = this.graph.upsertAsset({
+            projectId: audit.project_id,
+            kind: "app",
+            assetKey: snapshot.target.base_url,
+          });
+          this.graph.anchor(goal.id, asset.id);
+        }
         this.store.run("UPDATE audits SET exploration_status = 'open' WHERE id = ?", auditId);
       } else {
         this.store.run("UPDATE audits SET exploration_status = 'not_applicable' WHERE id = ?", auditId);
@@ -833,7 +894,18 @@ export class AuditEngine {
     const audit = this.store.get<AuditRow>("SELECT * FROM audits WHERE id = ?", auditId);
     if (!audit) throw new AppError(404, "audit_not_found", "Audit not found");
     if (audit.exploration_status === "closed") return;
-    this.store.run("UPDATE audits SET exploration_status = 'closed' WHERE id = ?", auditId);
+    this.store.run(
+      "UPDATE audits SET exploration_status = 'closed', stop_reason = COALESCE(stop_reason, ?) WHERE id = ?",
+      reason,
+      auditId,
+    );
+    if (audit.mode === "dynamic") {
+      this.store.run(
+        "UPDATE audit_phases SET status = 'skipped', finished_at = COALESCE(finished_at, ?) WHERE audit_id = ? AND phase BETWEEN 3 AND 5 AND status = 'pending'",
+        now(),
+        auditId,
+      );
+    }
     this.events.append({ auditId, type: "exploration.closed", payload: { reason } });
     await this.reconcile(auditId);
     this.schedule(auditId);
@@ -912,6 +984,11 @@ export class AuditEngine {
       if (proposed.length > 0) this.acceptIntents(auditId, proposed);
       approved = this.approvedIntents(auditId);
     }
+    if (approved.length === 0) {
+      const untested = this.graph.coverage(auditId).filter((entry) => !entry.tested);
+      if (untested.length === 0) await this.closeExploration(auditId, "frontier_exhausted");
+      return;
+    }
 
     for (const node of approved.slice(0, 4)) {
       const payload = parseJson<Record<string, unknown>>(node.payload, {});
@@ -925,7 +1002,19 @@ export class AuditEngine {
         category: typeof payload.category === "string" ? payload.category : undefined,
       };
       this.graph.updateNodeStatus(node.id, "running");
-      const result = await this.dynamicExecutor.execute(auditId, intent);
+      let result;
+      try {
+        result = await this.dynamicExecutor.execute(auditId, intent);
+      } catch (error) {
+        this.graph.updateNodeStatus(node.id, "failed");
+        this.events.append({
+          auditId,
+          type: "exploration.intent_failed",
+          payload: { node_id: node.id, message: error instanceof Error ? error.message : String(error) },
+        });
+        await this.closeExploration(auditId, "executor_failed");
+        return;
+      }
       this.store.run(
         "UPDATE audits SET exploration_cost_usd = exploration_cost_usd + ? WHERE id = ?",
         Number(result.costUsd) || 0,
@@ -952,6 +1041,131 @@ export class AuditEngine {
       );
       this.events.append({ auditId, type: "exploration.stopped", payload: { reason: "exploration_budget" } });
       await this.reconcile(auditId);
+      return;
+    }
+    if (this.approvedIntents(auditId).length === 0 && this.graph.coverage(auditId).every((entry) => entry.tested)) {
+      await this.closeExploration(auditId, "frontier_exhausted");
+    }
+  }
+
+  private isDynamicFinding(finding: FindingRow): boolean {
+    if (!finding.candidate_id) return false;
+    const candidate = this.store.get<{ provenance: string }>(
+      "SELECT provenance FROM candidates WHERE id = ?",
+      finding.candidate_id,
+    );
+    return candidate?.provenance === "dynamic" || candidate?.provenance === "hybrid";
+  }
+
+  /**
+   * Independent reverification for a dynamic finding: re-run the recorded PoC
+   * from its manifest through the broker and write a verifications row. The
+   * finding keeps its confirmed status; the verdict records the outcome.
+   */
+  private async reverifyDynamicFinding(finding: FindingRow): Promise<void> {
+    const existing = this.store.get<{ id: string }>(
+      "SELECT id FROM verifications WHERE finding_id = ? AND kind = 'reverification'",
+      finding.id,
+    );
+    if (existing) return;
+    const proof = this.store.get<{ id: string; content_path: string }>(
+      "SELECT id, content_path FROM evidence WHERE finding_id = ? AND kind = 'dynamic_proof' ORDER BY rowid DESC LIMIT 1",
+      finding.id,
+    );
+    const record = (verdict: string, rationale: string, evidenceCheck: Record<string, unknown>) => {
+      this.store.run(
+        `INSERT INTO verifications
+         (id, audit_id, candidate_id, finding_id, kind, agent_session_id, discovery_session_id, verdict,
+          rationale, evidence_check, payload, created_at)
+         VALUES (?, ?, ?, ?, 'reverification', ?, ?, ?, ?, ?, ?, ?)`,
+        uid(),
+        finding.audit_id,
+        finding.candidate_id,
+        finding.id,
+        finding.retest_session_id ?? null,
+        finding.discovery_session_id ?? null,
+        verdict,
+        rationale,
+        toJson(evidenceCheck),
+        toJson({ source: "broker_replay", evidence_id: proof?.id ?? null }),
+        now(),
+      );
+      this.events.append({
+        auditId: finding.audit_id,
+        type: "finding.reverified",
+        payload: { finding_id: finding.id, code: finding.code, verdict, rationale },
+      });
+    };
+
+    if (!proof) {
+      this.store.run(
+        "UPDATE findings SET status = 'unresolved', retest_decision = 'UNRESOLVED', updated_at = ? WHERE id = ?",
+        now(),
+        finding.id,
+      );
+      record("UNRESOLVED", "The dynamic proof evidence is missing, so the PoC cannot be replayed.", {});
+      return;
+    }
+
+    let manifest: PocManifest;
+    try {
+      const verified = await this.evidence.content(proof.id);
+      const parsed = JSON.parse(verified?.content ?? "{}") as { manifest?: PocManifest };
+      if (!parsed.manifest) throw new Error("manifest missing");
+      manifest = parsed.manifest;
+      validatePoc(manifest);
+    } catch (error) {
+      this.store.run(
+        "UPDATE findings SET status = 'unresolved', retest_decision = 'NEEDS_CORRECTION', updated_at = ? WHERE id = ?",
+        now(),
+        finding.id,
+      );
+      record("NEEDS_CORRECTION", `The stored PoC cannot be replayed: ${String(error)}`, {});
+      return;
+    }
+
+    try {
+      const exchanges = await runPocChecks(this.config, this.store, finding.audit_id, manifest);
+      const run = evaluateRun(manifest, exchanges);
+      const check = {
+        positive: exchanges.positive.status,
+        exploit: exchanges.exploit.status,
+        negative: exchanges.negative.status,
+        result: run.status,
+      };
+      if (run.status === "passed") {
+        this.store.run(
+          "UPDATE findings SET status = 'reverified', verification_decision = 'REVERIFIED', retest_decision = 'REVERIFIED', updated_at = ? WHERE id = ?",
+          now(),
+          finding.id,
+        );
+        record("REVERIFIED", "The recorded PoC replayed through the broker and all three checks passed.", check);
+      } else if (run.status === "failed" && run.positive) {
+        this.store.run(
+          "UPDATE findings SET status = 'unresolved', retest_decision = 'NEEDS_CORRECTION', updated_at = ? WHERE id = ?",
+          now(),
+          finding.id,
+        );
+        record(
+          "NEEDS_CORRECTION",
+          `The positive control passed but the exploit check no longer reproduces: ${run.reason ?? run.status}.`,
+          check,
+        );
+      } else {
+        this.store.run(
+          "UPDATE findings SET status = 'unresolved', retest_decision = 'UNRESOLVED', updated_at = ? WHERE id = ?",
+          now(),
+          finding.id,
+        );
+        record("UNRESOLVED", `The replay could not establish a verdict: ${run.reason ?? run.status}.`, check);
+      }
+    } catch (error) {
+      this.store.run(
+        "UPDATE findings SET status = 'unresolved', retest_decision = 'UNRESOLVED', updated_at = ? WHERE id = ?",
+        now(),
+        finding.id,
+      );
+      record("UNRESOLVED", `The replay failed: ${error instanceof Error ? error.message : String(error)}`, {});
     }
   }
 
@@ -1404,7 +1618,7 @@ export class AuditEngine {
           agent_role: task.agent_role,
         },
       });
-      void this.executeTask(task.id, controller.signal)
+      const run = this.executeTask(task.id, controller.signal)
         .catch((error) => {
           this.events.append({
             auditId,
@@ -1416,8 +1630,10 @@ export class AuditEngine {
         })
         .finally(() => {
           this.running.delete(task.id);
+          this.taskRuns.delete(task.id);
           void this.reconcile(auditId);
         });
+      this.taskRuns.set(task.id, run);
     }
   }
 
@@ -2938,6 +3154,11 @@ export class AuditEngine {
     }
   }
 
+  /** Test seam: run one scheduler pass for a single audit. */
+  async reconcileForTest(auditId: string): Promise<void> {
+    await this.reconcile(auditId);
+  }
+
   private async reconcile(auditId: string): Promise<void> {
     await this.withAuditLock(auditId, async () => {
       const audit = this.store.get<AuditRow>("SELECT * FROM audits WHERE id = ?", auditId);
@@ -3062,7 +3283,15 @@ export class AuditEngine {
         audit.mode === "static" ||
         audit.exploration_status === "closed" ||
         audit.exploration_status === "not_applicable";
-      if (phase2.total > 0 && phase2.active === 0 && phase2.terminal === phase2.total && explorationClosed) {
+      const dynamicExplored = audit.mode === "dynamic" && audit.exploration_status === "closed";
+      if (dynamicExplored && phase2.total === 0) {
+        this.store.run(
+          "UPDATE audit_phases SET status = 'completed', finished_at = COALESCE(finished_at, ?), summary = COALESCE(summary, 'Exploration closed; no static discovery tasks.') WHERE audit_id = ? AND phase = 2",
+          now(),
+          auditId,
+        );
+      }
+      if ((phase2.total > 0 || dynamicExplored) && phase2.active === 0 && phase2.terminal === phase2.total && explorationClosed) {
         const candidates = this.store.all<CandidateRow>(
           "SELECT * FROM candidates WHERE audit_id = ? AND status = 'discovered' ORDER BY created_at",
           auditId,
@@ -3132,7 +3361,7 @@ export class AuditEngine {
         "SELECT COUNT(*) AS count FROM tasks WHERE audit_id = ? AND phase = 3",
         auditId,
       )?.count ?? 0;
-      if (phase2.total > 0 && phase2.active === 0 && phase3CountAfter === 0) {
+      if ((phase2.total > 0 || dynamicExplored) && phase2.active === 0 && phase3CountAfter === 0) {
         this.store.run(
           "UPDATE audit_phases SET status = 'completed', finished_at = COALESCE(finished_at, ?), summary = COALESCE(summary, 'No confirmable candidates remained.') WHERE audit_id = ? AND phase = 3",
           now(),
@@ -3199,7 +3428,7 @@ export class AuditEngine {
       }
 
       const phase4 = phaseStats.get(4)!;
-      if (phase4.total > 0 && phase4.active === 0 && phase4.terminal === phase4.total) {
+      if ((phase4.total > 0 || dynamicExplored) && phase4.active === 0 && phase4.terminal === phase4.total) {
         const findings = this.store.all<FindingRow>(
           "SELECT * FROM findings WHERE audit_id = ? AND status = 'confirmed'",
           auditId,
@@ -3227,6 +3456,11 @@ export class AuditEngine {
               type: "finding.reverification_cap_exceeded",
               payload: { finding_id: finding.id, code: finding.code, cap: reverificationCap },
             });
+            continue;
+          }
+          const isDynamic = this.isDynamicFinding(finding);
+          if (isDynamic) {
+            await this.reverifyDynamicFinding(finding);
             continue;
           }
           this.createTask({
@@ -3274,8 +3508,9 @@ export class AuditEngine {
       const postValidationComplete =
         postValidationPhases.length === 3 &&
         postValidationPhases.every((phase) => ["completed", "skipped", "failed"].includes(phase.status));
+      const dynamicExploredForReport = audit.mode === "dynamic" && audit.exploration_status === "closed";
       const allEarlierTerminal =
-        phase1.completed > 0 &&
+        (phase1.completed > 0 || dynamicExploredForReport) &&
         [2, 3, 4, 5].every((phase) => {
           const stats = phaseStats.get(phase)!;
           return stats.active === 0;
@@ -3285,8 +3520,8 @@ export class AuditEngine {
         !latestReport &&
         allEarlierTerminal &&
         postValidationComplete &&
-        phase1.completed > 0 &&
-        phase2.total > 0 &&
+        (phase1.completed > 0 || dynamicExploredForReport) &&
+        (phase2.total > 0 || dynamicExploredForReport) &&
         !anyActive
       ) {
         this.createTask({

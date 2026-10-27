@@ -183,7 +183,7 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         const recentAudits = deps.store.all(
           `SELECT a.id, a.status, a.current_phase, a.created_at, a.started_at, a.finished_at,
                   p.name AS project_name, r.commit_sha
-           FROM audits a JOIN projects p ON p.id = a.project_id JOIN repositories r ON r.id = a.repository_id
+           FROM audits a JOIN projects p ON p.id = a.project_id LEFT JOIN repositories r ON r.id = a.repository_id
            ORDER BY a.created_at DESC LIMIT 8`,
         );
         const recentEvents = deps.store.all(
@@ -638,7 +638,7 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
           `SELECT a.*, p.name AS project_name, r.commit_sha,
              (SELECT COUNT(*) FROM findings f WHERE f.audit_id = a.id) AS finding_count,
              (SELECT COUNT(*) FROM tasks t WHERE t.audit_id = a.id AND t.status IN ('running','queued')) AS active_tasks
-           FROM audits a JOIN projects p ON p.id = a.project_id JOIN repositories r ON r.id = a.repository_id
+           FROM audits a JOIN projects p ON p.id = a.project_id LEFT JOIN repositories r ON r.id = a.repository_id
            ${projectId ? "WHERE a.project_id = ?" : ""} ORDER BY a.created_at DESC LIMIT 100`,
           ...(projectId ? [projectId] : []),
         );

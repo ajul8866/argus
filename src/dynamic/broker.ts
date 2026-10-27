@@ -128,7 +128,7 @@ export class BrokerServer {
     const responseHeaders: Record<string, string> = {};
     upstream.headers.forEach((value, key) => {
       if (!["content-encoding", "content-length", "transfer-encoding", "connection"].includes(key)) {
-        responseHeaders[key] = value;
+        responseHeaders[key] = SENSITIVE.has(key) ? "[REDACTED]" : value;
       }
     });
     response.writeHead(upstream.status, responseHeaders);

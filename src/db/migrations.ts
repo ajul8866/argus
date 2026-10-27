@@ -664,4 +664,36 @@ CREATE INDEX idx_candidates_status ON candidates(status);
 CREATE INDEX idx_candidates_link ON candidates(audit_id, link_key);
 `,
   },
+  {
+    version: 12,
+    name: "verification_session_optional",
+    foreignKeysOff: true,
+    sql: `
+CREATE TABLE verifications_new (
+  id TEXT PRIMARY KEY,
+  audit_id TEXT NOT NULL REFERENCES audits(id) ON DELETE CASCADE,
+  candidate_id TEXT REFERENCES candidates(id),
+  finding_id TEXT REFERENCES findings(id),
+  kind TEXT NOT NULL CHECK (kind IN ('confirmation','reverification')),
+  agent_session_id TEXT REFERENCES agent_sessions(id),
+  discovery_session_id TEXT,
+  verdict TEXT NOT NULL CHECK (verdict IN ('CONFIRMED','REFUTED','INCONCLUSIVE','DUPLICATE','REVERIFIED','REJECTED','NEEDS_CORRECTION','UNRESOLVED')),
+  rationale TEXT NOT NULL,
+  evidence_check TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+INSERT INTO verifications_new
+  (id, audit_id, candidate_id, finding_id, kind, agent_session_id, discovery_session_id, verdict,
+   rationale, evidence_check, payload, created_at)
+SELECT id, audit_id, candidate_id, finding_id, kind, agent_session_id, discovery_session_id, verdict,
+       rationale, evidence_check, payload, created_at
+FROM verifications;
+DROP TABLE verifications;
+ALTER TABLE verifications_new RENAME TO verifications;
+CREATE INDEX idx_verifications_audit ON verifications(audit_id);
+CREATE INDEX idx_verifications_candidate ON verifications(candidate_id);
+CREATE INDEX idx_verifications_finding ON verifications(finding_id);
+`,
+  },
 ];

@@ -420,4 +420,56 @@ WHERE role IN ('codebase_mapper','security_researcher','independent_validator','
     OR (harness = 'claude-code' AND json(allowed_tools) = '["Read","Grep","Glob","LS"]'));
 `,
   },
+  {
+    version: 4,
+    name: "dynamic_targets_and_identities",
+    sql: `
+CREATE TABLE project_targets (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  label TEXT NOT NULL,
+  base_url TEXT NOT NULL,
+  environment TEXT NOT NULL,
+  repository_id TEXT REFERENCES repositories(id),
+  allowed_hosts TEXT NOT NULL,
+  allowed_cidrs TEXT NOT NULL,
+  allowed_methods TEXT NOT NULL,
+  max_rps REAL NOT NULL DEFAULT 5,
+  tls_required INTEGER NOT NULL DEFAULT 1 CHECK (tls_required IN (0,1)),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','disabled')),
+  created_by TEXT REFERENCES users(id),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_project_targets_project ON project_targets(project_id, status);
+
+CREATE TABLE target_authorizations (
+  id TEXT PRIMARY KEY,
+  target_id TEXT NOT NULL REFERENCES project_targets(id) ON DELETE CASCADE,
+  authorized_by TEXT NOT NULL,
+  authorization_ref TEXT NOT NULL,
+  valid_from TEXT NOT NULL,
+  valid_until TEXT NOT NULL,
+  authorized_actions TEXT NOT NULL,
+  restrictions TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','expired','revoked')),
+  created_by TEXT REFERENCES users(id),
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_target_authorizations_target ON target_authorizations(target_id, status, valid_until);
+
+CREATE TABLE test_identities (
+  id TEXT PRIMARY KEY,
+  target_id TEXT NOT NULL REFERENCES project_targets(id) ON DELETE CASCADE,
+  label TEXT NOT NULL,
+  role TEXT NOT NULL,
+  auth_kind TEXT NOT NULL CHECK (auth_kind IN ('none','header','cookie','basic')),
+  secret_ref TEXT,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','expired','disabled')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_test_identities_target ON test_identities(target_id, status);
+`,
+  },
 ];

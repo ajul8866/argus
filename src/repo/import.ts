@@ -400,11 +400,14 @@ async function assertGitLookups(
     const base = revisionRefName(ref);
     if (base) names.add(base);
   }
-  const common = await linkedGitDirectory(gitDir);
+  // Git reads commondir once, from the git directory the command started in.
+  // A commondir inside the common directory is not a link Git follows, and the
+  // shared refs on the chain are read there in place.
+  const common = isStartedGitDirectory ? await linkedGitDirectory(gitDir) : null;
   const sharedRefsElsewhere = common !== null && await distinctGitDirectory(gitDir, common);
   const carry = await addSymrefAbbreviations(gitDir, names, follow, sharedRefsElsewhere);
   for (const name of names) await assertRequestedRevision(gitDir, name);
-  if (common) await assertGitLookups(common, ref, [...names], seen, [{ name: "HEAD", depth: 0 }, ...carry]);
+  if (common) await assertGitLookups(common, ref, [...names], seen, [{ name: "HEAD", depth: 0 }, ...carry], false);
 }
 
 async function distinctGitDirectory(left: string, right: string): Promise<boolean> {

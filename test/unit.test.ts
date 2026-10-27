@@ -1114,7 +1114,13 @@ describe("repository import", () => {
       gitExec(parent, ["init", "-q"]);
       writeFileSync(join(parent, ".git", "commondir"), `${join(outside, ".git")}\n`);
 
-      for (const source of [absolute, relativeRepo, child]) {
+      const escaped = join(dir, "commondir-escape");
+      initRepo(escaped, { "local.js": "LOCAL_ONLY\n" });
+      mkdirSync(join(outside, ".git", "inner-decoy"), { recursive: true });
+      symlinkSync(join(outside, ".git", "inner-decoy"), join(escaped, ".git", "escape"));
+      writeFileSync(join(escaped, ".git", "commondir"), "escape/..\n");
+
+      for (const source of [absolute, relativeRepo, child, escaped]) {
         await expect(importRepository({ config: limited, store }, requested(source), "HEAD", "tester"))
           .rejects.toMatchObject({ code: "invalid_repository", message: GIT_COMMON_DIR_ERROR });
       }
@@ -1228,6 +1234,141 @@ describe("repository import", () => {
     }
   });
 
+  test("a git ref import rejects an alternate object directory git would resolve outside the root", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "argus-git-alt-escape-"));
+    const limited = { ...config, allowedRoots: [dir] };
+    const requested = (source: string) => ({
+      ...project,
+      source_path: source,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    });
+    const archiveNames = (directory: string): string => {
+      const archived = Bun.spawnSync(["git", "-C", directory, "archive", "--format=tar", "HEAD"], {
+        stdout: "pipe",
+        stderr: "pipe",
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_CONFIG_GLOBAL: "/dev/null",
+        },
+      });
+      expect(archived.exitCode).toBe(0);
+      return new TextDecoder().decode(Bun.spawnSync(["tar", "-t"], {
+        stdin: archived.stdout,
+        stdout: "pipe",
+      }).stdout);
+    };
+    try {
+      const outsideRepo = join(outside, "alt");
+      initRepo(outsideRepo, { "secret.js": "SECRET_OBJECT_SENTINEL\n" });
+      gitExec(outsideRepo, ["repack", "-ad"]);
+      const outsideCommit = gitExec(outsideRepo, ["rev-parse", "HEAD"]);
+      mkdirSync(join(outside, "decoy"), { recursive: true });
+      symlinkSync(join(outside, "decoy"), join(dir, "escape"));
+      mkdirSync(join(dir, "alt/.git/objects"), { recursive: true });
+
+      const dotdot = join(dir, "dotdot-repo");
+      initRepo(dotdot, { "local.js": "LOCAL_ONLY\n" });
+      mkdirSync(join(dotdot, ".git/objects/info"), { recursive: true });
+      writeFileSync(join(dotdot, ".git/objects/info/alternates"), "../../../escape/../alt/.git/objects\n");
+      gitExec(dotdot, ["update-ref", "HEAD", outsideCommit]);
+      expect(archiveNames(dotdot)).toContain("secret.js");
+
+      const nested = join(dir, "nested-repo");
+      initRepo(nested, { "local.js": "LOCAL_ONLY\n" });
+      const bridge = join(dir, "bridge-objects");
+      mkdirSync(join(bridge, "info"), { recursive: true });
+      writeFileSync(join(bridge, "info/alternates"), `${join(outsideRepo, ".git/objects")}\n`);
+      mkdirSync(join(nested, ".git/objects/info"), { recursive: true });
+      writeFileSync(join(nested, ".git/objects/info/alternates"), `${bridge}\n`);
+      gitExec(nested, ["update-ref", "HEAD", outsideCommit]);
+      expect(archiveNames(nested)).toContain("secret.js");
+
+      const linked = join(dir, "linked-alt-repo");
+      initRepo(linked, { "local.js": "LOCAL_ONLY\n" });
+      const inner = join(dir, "inner-objects");
+      mkdirSync(join(inner, "info"), { recursive: true });
+      symlinkSync(join(outsideRepo, ".git/objects/pack"), join(inner, "pack"));
+      mkdirSync(join(linked, ".git/objects/info"), { recursive: true });
+      writeFileSync(join(linked, ".git/objects/info/alternates"), `${inner}\n`);
+      gitExec(linked, ["update-ref", "HEAD", outsideCommit]);
+      expect(archiveNames(linked)).toContain("secret.js");
+
+      const quoted = join(dir, "quoted-repo");
+      initRepo(quoted, { "local.js": "LOCAL_ONLY\n" });
+      mkdirSync(join(quoted, ".git/objects/info"), { recursive: true });
+      writeFileSync(
+        join(quoted, ".git/objects/info/alternates"),
+        `"${join(outsideRepo, ".git/objects")}"\n`,
+      );
+      gitExec(quoted, ["update-ref", "HEAD", outsideCommit]);
+      expect(archiveNames(quoted)).toContain("secret.js");
+
+      const raw = join(dir, "raw-byte-repo");
+      initRepo(raw, { "local.js": "LOCAL_ONLY\n" });
+      symlinkSync(join(outside, "decoy"), Buffer.concat([Buffer.from(dir), Buffer.from("/"), Buffer.from([0xff])]));
+      mkdirSync(join(raw, ".git/objects/info"), { recursive: true });
+      writeFileSync(
+        join(raw, ".git/objects/info/alternates"),
+        Buffer.concat([Buffer.from("../../../"), Buffer.from([0xff]), Buffer.from("/../alt/.git/objects\n")]),
+      );
+      gitExec(raw, ["update-ref", "HEAD", outsideCommit]);
+      expect(archiveNames(raw)).toContain("secret.js");
+
+      for (const source of [dotdot, nested, linked, quoted, raw]) {
+        await expect(importRepository({ config: limited, store }, requested(source), "HEAD", "tester"))
+          .rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+      }
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+      expect(existsSync(join(dir, "repos"))).toBe(false);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a git ref import accepts an alternate object directory inside the allowed root", async () => {
+    const limited = { ...config, allowedRoots: [dir] };
+    const source = join(dir, "inside-alt-repo");
+    initRepo(source, { "keep.js": "KEEP\n" });
+    initRepo(join(dir, "inside-alt"), { "other.js": "OTHER\n" });
+    mkdirSync(join(source, ".git/objects/info"), { recursive: true });
+    writeFileSync(
+      join(source, ".git/objects/info/alternates"),
+      "# ignored comment\n../../../inside-alt/.git/objects\n",
+    );
+    const imported = await importRepository({
+      config: limited,
+      store,
+    }, {
+      ...project,
+      source_path: source,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    }, "HEAD", "tester");
+    expect(await Bun.file(join(imported.path, "keep.js")).text()).toBe("KEEP\n");
+    expect(existsSync(join(imported.path, "other.js"))).toBe(false);
+    expect(existsSync(join(imported.path, "secret.js"))).toBe(false);
+
+    const absoluteSource = join(dir, "inside-abs-repo");
+    initRepo(absoluteSource, { "keep.js": "KEEP_ABS\n" });
+    mkdirSync(join(absoluteSource, ".git/objects/info"), { recursive: true });
+    writeFileSync(
+      join(absoluteSource, ".git/objects/info/alternates"),
+      `${join(dir, "inside-alt/.git/objects")}\n`,
+    );
+    const importedAbsolute = await importRepository({
+      config: limited,
+      store,
+    }, {
+      ...project,
+      source_path: absoluteSource,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    }, "HEAD", "tester");
+    expect(await Bun.file(join(importedAbsolute.path, "keep.js")).text()).toBe("KEEP_ABS\n");
+  });
+
   test("a git ref import accepts a common directory that names its own git directory", async () => {
     const limited = { ...config, allowedRoots: [dir] };
     const requested = (source: string) => ({
@@ -1248,6 +1389,12 @@ describe("repository import", () => {
     writeFileSync(join(absolute, ".git", "commondir"), `${realpathSync(join(absolute, ".git"))}\n`);
     const importedAbsolute = await importRepository({ config: limited, store }, requested(absolute), "HEAD", "tester");
     expect(await Bun.file(join(importedAbsolute.path, "a.js")).text()).toBe("LOCAL_ABS\n");
+
+    const dotSlash = join(dir, "commondir-dot-slash");
+    initRepo(dotSlash, { "a.js": "LOCAL_DOT_SLASH\n" });
+    writeFileSync(join(dotSlash, ".git", "commondir"), "./\n");
+    const importedDotSlash = await importRepository({ config: limited, store }, requested(dotSlash), "HEAD", "tester");
+    expect(await Bun.file(join(importedDotSlash.path, "a.js")).text()).toBe("LOCAL_DOT_SLASH\n");
 
     const main = join(dir, "worktree-main");
     initRepo(main, { "a.js": "MAIN_FILE\n" });

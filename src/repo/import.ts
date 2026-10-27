@@ -262,8 +262,23 @@ async function looseRefLine(gitDir: string, refName: string): Promise<string | n
   return text?.split("\n", 1)[0] ?? null;
 }
 
+// Pseudorefs and the per-worktree ref namespaces live beside HEAD. Shared
+// refs such as branches and tags live in the common directory.
+function isWorktreePrivateRef(refName: string): boolean {
+  if (refName.startsWith("refs/bisect/") || refName.startsWith("refs/worktree/") || refName.startsWith("refs/rewritten/")) {
+    return true;
+  }
+  if (!refName || refName.includes("/")) return false;
+  for (const char of refName) {
+    const upper = char >= "A" && char <= "Z";
+    if (!upper && char !== "-" && char !== "_") return false;
+  }
+  return true;
+}
+
 // `--abbrev-ref HEAD` follows the symref chain and shortens the final ref.
-// A linked worktree stores that ref in the common directory, not next to HEAD.
+// A linked worktree stores shared refs in the common directory. The next hop
+// of a private ref is still the file next to HEAD.
 async function finalHeadRef(headDir: string, refRoot: string): Promise<string | null> {
   const head = await readSmallGitText(join(headDir, "HEAD"));
   let line = head?.split("\n", 1)[0] ?? "";
@@ -275,7 +290,7 @@ async function finalHeadRef(headDir: string, refRoot: string): Promise<string | 
     if (!target || seen.has(target)) throw invalidGitMetadata();
     seen.add(target);
     full = target;
-    const next = await looseRefLine(refRoot, target);
+    const next = await looseRefLine(isWorktreePrivateRef(target) ? headDir : refRoot, target);
     if (next === null) break;
     line = next;
   }

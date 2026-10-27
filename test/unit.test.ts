@@ -1597,6 +1597,17 @@ describe("repository import", () => {
     insert("p-branch-chain-worktree", chainLinked);
     expect(await attempt("p-branch-chain-worktree", chainLinked, null)).toBe("invalid_repository");
 
+    const bisectMain = prepare("branch-bisect-main");
+    git(bisectMain, ["checkout", "-q", "-b", "other"]);
+    const bisectChild = prepare("branch-bisect-child");
+    writeFileSync(join(bisectChild, ".git", "commondir"), `${join(bisectMain, ".git")}\n`);
+    mkdirSync(join(bisectChild, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(bisectChild, ".git", "refs", "bisect", "bad"), "ref: refs/heads/master\n");
+    writeFileSync(join(bisectChild, ".git", "HEAD"), "ref: refs/bisect/bad\n");
+    fifo(join(bisectMain, ".git", "refs", "tags", "master"));
+    insert("p-branch-bisect", bisectChild);
+    expect(await attempt("p-branch-bisect", bisectChild, null)).toBe("invalid_repository");
+
     const healthy = prepare("branch-healthy");
     insert("p-branch-healthy", healthy);
     const imported = await importRepository({ config, store }, projectFor("p-branch-healthy", healthy), null, "tester");

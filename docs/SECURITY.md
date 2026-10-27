@@ -47,7 +47,20 @@ LLM agents. Use it only on repositories you are authorized to assess.
   symlink or gitfile, a Git common directory other than that Git directory, an
   alternate object database, a symlink inside the object store, and `GIT_*`
   environment variables are rejected or ignored, so a ref import cannot copy
-  commits stored outside that work tree. A subdirectory of a repository
+  commits stored outside that work tree. A pipe or symlink in the metadata Git
+  reads before that archive, including the common directory, packed refs, the
+  current ref, exclude or attribute files, `config.worktree`, and
+  sparse-checkout, is rejected before Git starts. A config `include` or
+  `includeIf` is rejected wherever Git would start that section, including
+  after another section on the same line. The directory named by a gitfile or
+  `commondir` is the path Git opens: trailing CR and LF are removed, spaces
+  and embedded newlines stay, and `..` is applied after each symlink is
+  followed. The runtime `realpath` is not used there, because it cancels `..`
+  against the symlink name and would check a different directory. A pointer
+  whose bytes are not valid UTF-8 is rejected, because Git would use those
+  bytes as the path. That directory is checked the same way. `core.excludesFile` and `core.attributesFile` are
+  forced to `/dev/null` for these Git commands. A `.git` symlink discovered
+  while walking parent directories is rejected. A subdirectory of a repository
   archives only that subdirectory.
 
 ## Execution isolation

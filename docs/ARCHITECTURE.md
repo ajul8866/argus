@@ -223,8 +223,15 @@ operation, preserving include/exclude short-circuit behavior.
    only Git metadata for that work tree: a `.git` symlink or gitfile, a Git
    common directory other than that Git directory, an alternate object store,
    or a symlink in the object store is rejected, and `GIT_*` variables are not
-   passed through. A subdirectory archives only its own tree. The inventory is
-   then rebuilt from the snapshot.
+   passed through. A pipe or symlink in metadata Git would read for that
+   archive, including `config.worktree`, sparse-checkout, and a config include
+   wherever Git would start that section, is rejected before Git starts. The
+  directory named by a gitfile or `commondir` is the path Git opens, with
+  trailing breaks removed and `..` applied after each symlink is followed.
+  The runtime `realpath` is not used for that walk. A pointer that is not
+  valid UTF-8 is rejected. That directory is checked the same way. Configured exclude and attribute paths are not
+   opened. A subdirectory archives only its own tree. The inventory is then
+   rebuilt from the snapshot.
 4. Each task gets a fresh read-only copy under
    `$ARGUS_DATA_DIR/workspaces/<audit>/<session>`.
 5. If Bubblewrap is available, the harness runs with a new session, new PID/IPC/

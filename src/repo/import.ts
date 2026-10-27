@@ -450,7 +450,10 @@ async function assertGitLookups(
   const sharedRoot = common !== null && await distinctGitDirectory(gitDir, common) ? common : null;
   const carry = await addSymrefAbbreviations(gitDir, names, follow, sharedRoot);
   for (const name of names) await assertRequestedRevision(gitDir, name);
-  if (common) await assertGitLookups(common, ref, [...names], seen, [{ name: "HEAD", depth: 0 }, ...carry]);
+  if (common) {
+    if (seen.size > MAX_COMMON_DIRECTORY_LINKS) throw invalidGitMetadata();
+    await assertGitLookups(common, ref, [...names], seen, [{ name: "HEAD", depth: 0 }, ...carry]);
+  }
 }
 
 async function distinctGitDirectory(left: string, right: string): Promise<boolean> {

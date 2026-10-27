@@ -226,6 +226,15 @@ operation, preserving include/exclude short-circuit behavior.
    enters `/proc` or `/dev/fd` is rejected because those locations are local to
    the checking process. A subdirectory
    import archives only that subdirectory. A symlink, a repository directory or
+   a `gitdir:` file, a git common directory that does not resolve to that git
+   directory, a symlink inside an object store (including a non-UTF-8 name), a
+   multi-pack-index pack name that leaves that store, and an alternate object
+   directory Git would resolve outside the allowed locations are rejected. The
+   alternate path follows a symlink before `..` and keeps the raw path bytes.
+   A path that enters `/proc` or `/dev/fd` is rejected, because those locations
+   are local to the checking process. Nested alternates are checked the same
+   way. A subdirectory import archives
+   only that subdirectory. A symlink, a repository directory or
    ancestor replaced by a symlink, a path that escapes the source, or bytes
    that no longer match the inventory are not copied. The inventory is then
    rebuilt from the snapshot.

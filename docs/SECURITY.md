@@ -54,6 +54,17 @@ LLM agents. Use it only on repositories you are authorized to assess.
   process that reads the object store. A `commondir` file is rejected, as is an
   alternate path that contains quotes or backslashes. When the source is a
   subdirectory of a repository, the archive contains only that subdirectory.
+  file is not followed. The git common directory must resolve to that same git
+  directory, following a symlink before `..`. A symlinked object store or a
+  symlink inside an object store is rejected, including a directory entry that
+  is not valid UTF-8. Each multi-pack-index pack name must be one file name in
+  that object store, with no path separator. An alternate object directory is
+  resolved the way Git resolves it, including a raw byte in a symlink name, and
+  that directory, its symlinks, and its nested alternates must stay inside an
+  allowed location. A path that enters `/proc` or `/dev/fd` is rejected: those
+  locations describe the checking process, not the git process that reads the
+  object store. When the source is a subdirectory of a repository, the
+  archive contains only that subdirectory.
 
 ## Execution isolation
 

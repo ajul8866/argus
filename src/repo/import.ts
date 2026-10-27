@@ -17,6 +17,11 @@ function gitCommandEnv(): Record<string, string> {
     env[key] = value;
   }
   if (!env.PATH) env.PATH = "/usr/bin:/bin";
+  // Inherited GIT_* values were dropped above. git rev-parse --verify and
+  // git archive still fetch a missing object from a promisor remote, which
+  // may be another repository or an arbitrary URL. Set this after the strip
+  // so the caller cannot turn that fetch back on.
+  env.GIT_NO_LAZY_FETCH = "1";
   return env;
 }
 

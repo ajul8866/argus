@@ -222,6 +222,11 @@ operation, preserving include/exclude short-circuit behavior.
    that no longer match the inventory are not copied. A ref archive accepts
    only Git metadata for that work tree: a `.git` symlink or gitfile, a Git
    common directory other than that Git directory, an alternate object store,
+   or a symlink in the object store is rejected. Inherited `GIT_*` variables
+   are not passed through, and import sets `GIT_NO_LAZY_FETCH` so a promisor
+   remote cannot fetch missing commits or blobs from another repository or URL. A pipe or symlink in metadata Git would read for that
+   archive, including `config.worktree`, sparse-checkout, and a config include
+   wherever Git would start that section, is rejected before Git starts. The
    or a symlink in the object store is rejected, and `GIT_*` variables are not
    passed through. A pipe or symlink in metadata Git would read for that
    archive, including `config.worktree`, sparse-checkout, a config include

@@ -243,6 +243,7 @@ describe("dynamic IDOR proof", () => {
       baseUrl,
       environment: "test",
       allowedHosts: ["127.0.0.1"],
+      allowedCidrs: ["127.0.0.1/32"],
       allowedMethods: ["GET"],
       maxRps: 100,
       tlsRequired: false,
@@ -310,7 +311,7 @@ describe("dynamic IDOR proof", () => {
     const policy: EgressPolicy = {
       baseUrl,
       allowedHosts: ["127.0.0.1"],
-      allowedCidrs: [],
+      allowedCidrs: ["127.0.0.1/32"],
       allowedMethods: ["GET"],
       maxRps: 100,
       tls: false,

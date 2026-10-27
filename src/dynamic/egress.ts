@@ -1,5 +1,6 @@
-export type EgressPolicy = {
-  baseUrl: string;
+import { lookup } from "node:dns/promises";
+
+export type EgressPolicy = {  baseUrl: string;
   allowedHosts: string[];
   allowedCidrs: string[];
   allowedMethods: string[];
@@ -122,8 +123,45 @@ export function checkRequest(
         return { allowed: false, reason: `address ${ip} is not routable` };
       }
     }
+  } else if (!isLoopbackHost(url.hostname) && !policy.allowedCidrs.filter(Boolean).length) {
+    // Without a resolution result the address class is unknown, so a request
+    // could reach a private or metadata address through DNS. Fail closed.
+    return { allowed: false, reason: "the request was not resolved and pinned" };
   }
   return { allowed: true };
+}
+
+export function isLoopbackHost(host: string): boolean {
+  const name = host.toLowerCase().replace(/^\[|\]$/g, "");
+  return name === "localhost" || name === "::1" || name.startsWith("127.");
+}
+
+/**
+ * Resolves a hostname once and returns every address. The caller must pin one
+ * of these addresses for the actual connection so a second, independent
+ * resolution cannot land somewhere else (DNS rebinding).
+ */
+export async function resolveAndValidate(
+  policy: EgressPolicy,
+  host: string,
+): Promise<{ allowed: boolean; reason?: string; addresses: string[] }> {
+  if (isLoopbackHost(host)) {
+    const address = host === "localhost" || host === "::1" || host === "[::1]" ? "127.0.0.1" : host;
+    const decision = checkRequest(policy, { method: "GET", url: `http://${host}/` }, [address]);
+    return { allowed: decision.allowed, reason: decision.reason, addresses: [address] };
+  }
+  let addresses: string[] = [];
+  try {
+    const records = await lookup(host, { all: true, verbatim: true });
+    addresses = records.map((record) => record.address);
+  } catch {
+    return { allowed: false, reason: `host ${host} did not resolve`, addresses: [] };
+  }
+  if (addresses.length === 0) {
+    return { allowed: false, reason: `host ${host} did not resolve`, addresses: [] };
+  }
+  const decision = checkRequest(policy, { method: "GET", url: `http://${host}/` }, addresses);
+  return { allowed: decision.allowed, reason: decision.reason, addresses };
 }
 
 export function checkRedirect(

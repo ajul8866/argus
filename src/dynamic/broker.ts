@@ -1,6 +1,8 @@
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { connect as netConnect, type Socket } from "node:net";
-import { checkRequest, checkTunnel, RateLimiter, type EgressPolicy } from "./egress.ts";
+import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { request as httpsRequest } from "node:https";
+import { connect as netConnect, isIP, type Socket } from "node:net";
+import type { ClientRequest } from "node:http";
+import { checkRequest, checkTunnel, isLoopbackHost, RateLimiter, resolveAndValidate, type EgressPolicy } from "./egress.ts";
 import type { CredentialBroker } from "./credentials.ts";
 
 export type ExchangeRecord = {
@@ -43,7 +45,7 @@ export class BrokerServer {
       });
     });
     this.server.on("connect", (request, socket, head) => {
-      this.handleConnect(request, socket as Socket, head);
+      void this.handleConnect(request, socket as Socket, head).catch(() => socket.destroy());
     });
     return new Promise((resolve, reject) => {
       this.server!.once("error", reject);
@@ -73,6 +75,11 @@ export class BrokerServer {
       await this.reject(response, "scope_blocked", decision.reason ?? "request blocked", method, url, started);
       return;
     }
+    const resolved = await this.resolveTarget(url);
+    if (!resolved.allowed) {
+      await this.reject(response, "scope_blocked", resolved.reason ?? "address not allowed", method, url, started);
+      return;
+    }
     const approval = (this.options.policy.authorizedActions?.require_approval_for ?? []).map((entry) =>
       entry.toUpperCase(),
     );
@@ -100,15 +107,23 @@ export class BrokerServer {
       }
     }
 
-    let upstream: Response;
     try {
       const body = await this.readBody(request);
-      upstream = await fetch(url, {
+      if (!resolved.address) throw new Error("the target address was not resolved");
+      const pinned = await this.pinnedFetch(url, method, headers, body, resolved.address);
+      response.writeHead(pinned.status, pinned.headers);
+      response.end(pinned.body);
+      await this.record({
         method,
-        headers,
-        body: body.length > 0 ? new Uint8Array(body) : undefined,
-        redirect: "manual",
+        url,
+        identityId,
+        status: pinned.status,
+        scopeDecision: "allowed",
+        durationMs: Date.now() - started,
+        requestHeaders: this.redactHeaders(request.headers),
+        responseHeaders: pinned.recordedHeaders,
       });
+      return;
     } catch (error) {
       response.writeHead(502, { "content-type": "application/json" });
       response.end(JSON.stringify({ error: { code: "upstream_error", message: String(error) } }));
@@ -124,28 +139,95 @@ export class BrokerServer {
       });
       return;
     }
+  }
 
-    const responseHeaders: Record<string, string> = {};
-    upstream.headers.forEach((value, key) => {
-      if (!["content-encoding", "content-length", "transfer-encoding", "connection"].includes(key)) {
-        responseHeaders[key] = SENSITIVE.has(key) ? "[REDACTED]" : value;
+  /**
+   * Resolves the target once and validates every address. The returned address
+   * is the one the connection is pinned to, so a later DNS answer cannot move
+   * the request to a different host (DNS rebinding).
+   */
+  private async resolveTarget(url: string): Promise<{ allowed: boolean; reason?: string; address?: string }> {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return { allowed: false, reason: "url is invalid" };
+    }
+    const host = parsed.hostname.replace(/^\[|\]$/g, "");
+    if (isIP(host) || isLoopbackHost(host)) {
+      const address = isIP(host) ? host : "127.0.0.1";
+      const decision = checkRequest(this.options.policy, { method: "GET", url }, [address]);
+      return { allowed: decision.allowed, reason: decision.reason, address };
+    }
+    const resolved = await resolveAndValidate(this.options.policy, host);
+    if (!resolved.allowed) return { allowed: false, reason: resolved.reason };
+    const address = resolved.addresses[0];
+    if (!address) return { allowed: false, reason: `host ${host} did not resolve` };
+    return { allowed: true, address };
+  }
+
+  /**
+   * Performs the upstream request against a fixed address while keeping the
+   * original Host header and TLS server name.
+   */
+  private pinnedFetch(
+    url: string,
+    method: string,
+    headers: Headers,
+    body: Buffer,
+    address: string,
+  ): Promise<{ status: number; headers: Record<string, string>; recordedHeaders: Record<string, string>; body: Buffer }> {
+    const parsed = new URL(url);
+    const isHttps = parsed.protocol === "https:";
+    const plain = new Headers(headers);
+    plain.delete("host");
+    plain.delete("content-length");
+    return new Promise((resolve, reject) => {
+      const options = {
+        host: address,
+        port: Number(parsed.port || (isHttps ? 443 : 80)),
+        method,
+        path: `${parsed.pathname}${parsed.search}`,
+        headers: { ...Object.fromEntries(plain.entries()), host: parsed.host },
+        timeout: 30_000,
+      };
+      const request: ClientRequest = isHttps
+        ? httpsRequest({ ...options, servername: parsed.hostname }, handle)
+        : httpRequest(options, handle);
+      function handle(response: IncomingMessage): void {
+        {
+          const chunks: Buffer[] = [];
+          let size = 0;
+          response.on("data", (chunk: Buffer) => {
+            size += chunk.length;
+            if (size > 5_000_000) {
+              request.destroy(new Error("response exceeds the broker limit"));
+              return;
+            }
+            chunks.push(chunk);
+          });
+          response.on("end", () => {
+            const forwarded: Record<string, string> = {};
+            const recorded: Record<string, string> = {};
+            for (const [key, value] of Object.entries(response.headers)) {
+              if (["content-encoding", "content-length", "transfer-encoding", "connection"].includes(key)) continue;
+              const text = Array.isArray(value) ? value.join(", ") : String(value ?? "");
+              forwarded[key] = text;
+              recorded[key] = SENSITIVE.has(key) ? "[REDACTED]" : text;
+            }
+            resolve({ status: response.statusCode ?? 0, headers: forwarded, recordedHeaders: recorded, body: Buffer.concat(chunks) });
+          });
+          response.on("error", reject);
+        }
       }
-    });
-    response.writeHead(upstream.status, responseHeaders);
-    response.end(Buffer.from(await upstream.arrayBuffer()));
-    await this.record({
-      method,
-      url,
-      identityId,
-      status: upstream.status,
-      scopeDecision: "allowed",
-      durationMs: Date.now() - started,
-      requestHeaders: this.redactHeaders(request.headers),
-      responseHeaders,
+      request.on("timeout", () => request.destroy(new Error("the broker request timed out")));
+      request.on("error", reject);
+      if (body.length > 0) request.write(body);
+      request.end();
     });
   }
 
-  private handleConnect(request: IncomingMessage, socket: Socket, head: Buffer): void {
+  private async handleConnect(request: IncomingMessage, socket: Socket, head: Buffer): Promise<void> {
     const started = Date.now();
     const target = request.url ?? "";
     const separator = target.lastIndexOf(":");
@@ -166,7 +248,22 @@ export class BrokerServer {
       });
       return;
     }
-    const upstream = netConnect(port, host, () => {
+    const resolved = await this.resolveTunnelHost(host, port);
+    if (!resolved.allowed || !resolved.address) {
+      socket.end(`HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n\r\n${resolved.reason ?? "address not allowed"}\n`);
+      void this.record({
+        method: "CONNECT",
+        url: target,
+        identityId: null,
+        status: 403,
+        scopeDecision: "blocked",
+        durationMs: Date.now() - started,
+        requestHeaders: {},
+        responseHeaders: {},
+      });
+      return;
+    }
+    const upstream = netConnect(port, resolved.address, () => {
       socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       if (head.length > 0) upstream.write(head);
       upstream.pipe(socket);
@@ -191,6 +288,25 @@ export class BrokerServer {
       this.sockets.delete(socket);
       this.sockets.delete(upstream);
     });
+  }
+
+  private async resolveTunnelHost(
+    host: string,
+    port: number,
+  ): Promise<{ allowed: boolean; reason?: string; address?: string }> {
+    const name = host.replace(/^\[|\]$/g, "");
+    if (isIP(name) || isLoopbackHost(name)) {
+      const decision = checkTunnel(this.options.policy, name, port);
+      if (!decision.allowed) return { allowed: false, reason: decision.reason };
+      const addresses = await resolveAndValidate(this.options.policy, name);
+      if (!addresses.allowed) return { allowed: false, reason: addresses.reason };
+      return { allowed: true, address: addresses.addresses[0] ?? name };
+    }
+    const resolved = await resolveAndValidate(this.options.policy, name);
+    if (!resolved.allowed) return { allowed: false, reason: resolved.reason };
+    const address = resolved.addresses[0];
+    if (!address) return { allowed: false, reason: `host ${name} did not resolve` };
+    return { allowed: true, address };
   }
 
   private async reject(

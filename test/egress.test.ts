@@ -241,3 +241,99 @@ describe("BrokerServer", () => {
     }
   });
 });
+
+describe("address pinning", () => {
+  test("a request to a host that resolves to loopback is refused without an allowed CIDR", async () => {
+    const target = createHttpServer((_request, response) => response.end("ok"));
+    await new Promise<void>((resolve) => target.listen(0, "127.0.0.1", resolve));
+    const targetPort = (target.address() as { port: number }).port;
+    const broker = new BrokerServer({
+      policy: { ...policy, baseUrl: `http://localhost:${targetPort}`, allowedHosts: ["localhost"], allowedCidrs: [], tls: false },
+    });
+    const port = (await broker.start()).port;
+    try {
+      const status = await new Promise<number>((resolve, reject) => {
+        const request = httpRequest(
+          { host: "127.0.0.1", port, method: "GET", path: `http://localhost:${targetPort}/x` },
+          (response) => {
+            response.resume();
+            resolve(response.statusCode ?? 0);
+          },
+        );
+        request.on("error", reject);
+        request.end();
+      });
+      expect(status).toBe(403);
+    } finally {
+      await broker.stop();
+      await new Promise<void>((resolve) => target.close(() => resolve()));
+    }
+  });
+
+  test("the pinned address is used instead of a second resolution", async () => {
+    const seen: string[] = [];
+    const target = createHttpServer((request, response) => {
+      seen.push(String(request.headers.host));
+      response.end("ok");
+    });
+    await new Promise<void>((resolve) => target.listen(0, "127.0.0.1", resolve));
+    const targetPort = (target.address() as { port: number }).port;
+    const broker = new BrokerServer({
+      policy: {
+        ...policy,
+        baseUrl: `http://127.0.0.1:${targetPort}`,
+        allowedHosts: ["127.0.0.1"],
+        allowedCidrs: ["127.0.0.1/32"],
+        tls: false,
+      },
+    });
+    const port = (await broker.start()).port;
+    try {
+      const body = await new Promise<string>((resolve, reject) => {
+        const request = httpRequest(
+          { host: "127.0.0.1", port, method: "GET", path: `http://127.0.0.1:${targetPort}/pinned` },
+          (response) => {
+            const chunks: Buffer[] = [];
+            response.on("data", (chunk: Buffer) => chunks.push(chunk));
+            response.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+          },
+        );
+        request.on("error", reject);
+        request.end();
+      });
+      expect(body).toBe("ok");
+      expect(seen).toEqual([`127.0.0.1:${targetPort}`]);
+    } finally {
+      await broker.stop();
+      await new Promise<void>((resolve) => target.close(() => resolve()));
+    }
+  });
+
+  test("a CONNECT tunnel to a host outside the allowed CIDRs is refused", async () => {
+    const broker = new BrokerServer({
+      policy: { ...policy, baseUrl: "http://127.0.0.1:9", allowedHosts: ["127.0.0.1"], allowedCidrs: [], tls: false },
+    });
+    const port = (await broker.start()).port;
+    try {
+      const reply = await new Promise<string>((resolve, reject) => {
+        const socket = netConnect(port, "127.0.0.1", () => {
+          socket.write("CONNECT 127.0.0.1:9 HTTP/1.1\r\nHost: 127.0.0.1:9\r\n\r\n");
+        });
+        let data = "";
+        socket.on("data", (chunk) => {
+          data += chunk.toString();
+          socket.destroy();
+          resolve(data);
+        });
+        socket.on("error", reject);
+        setTimeout(() => {
+          socket.destroy();
+          resolve(data);
+        }, 2_000);
+      });
+      expect(reply).toContain("403 Forbidden");
+    } finally {
+      await broker.stop();
+    }
+  });
+});

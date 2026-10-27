@@ -3,6 +3,7 @@ import { closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readdi
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
+import { join, relative, resolve } from "node:path";
 import type { Config } from "../src/config.ts";
 import { loadConfig, PHASE_NAMES } from "../src/config.ts";
 import { KeyedSerialQueue } from "../src/concurrency.ts";
@@ -1489,6 +1490,106 @@ describe("repository import", () => {
       }, {
         ...project,
         source_path: repo,
+  test("a git ref import rejects a multi-pack-index that names an outside pack", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "ao-"));
+    const limited = { ...config, allowedRoots: [dir] };
+    const source = join(dir, "midx-repo");
+    try {
+      initRepo(join(outside, "alt"), { "secret.js": "SECRET_MIDX_SENTINEL\n" });
+      gitExec(join(outside, "alt"), ["repack", "-ad"]);
+      const outsideCommit = gitExec(join(outside, "alt"), ["rev-parse", "HEAD"]);
+      const outsidePack = join(outside, "alt/.git/objects/pack");
+      const idxName = readdirSync(outsidePack).find((name) => name.endsWith(".idx"));
+      expect(idxName).toBeTruthy();
+      if (!idxName) return;
+      const packBytes = Bun.file(join(outsidePack, idxName.replace(/idx$/, "pack")));
+      const idxBytes = Bun.file(join(outsidePack, idxName));
+      initRepo(source, { "local.js": "LOCAL_ONLY\n" });
+      const localPack = join(source, ".git/objects/pack");
+      mkdirSync(localPack, { recursive: true });
+      writeFileSync(join(localPack, idxName), Buffer.from(await idxBytes.arrayBuffer()));
+      writeFileSync(join(localPack, idxName.replace(/idx$/, "pack")), Buffer.from(await packBytes.arrayBuffer()));
+      gitExec(source, ["multi-pack-index", "write"]);
+      const prefix = `${relative(localPack, outside)}/`;
+      const stemLength = idxName.length - prefix.length - ".idx".length;
+      expect(stemLength).toBeGreaterThan(0);
+      const escapedName = `${prefix}${"a".repeat(stemLength)}.idx`;
+      expect(escapedName).toHaveLength(idxName.length);
+      const escapedPack = escapedName.replace(/idx$/, "pack");
+      const targetIdx = resolve(localPack, escapedName);
+      expect(targetIdx.startsWith(`${dir}/`)).toBe(false);
+      mkdirSync(join(targetIdx, ".."), { recursive: true });
+      writeFileSync(targetIdx, Buffer.from(await idxBytes.arrayBuffer()));
+      writeFileSync(resolve(localPack, escapedPack), Buffer.from(await packBytes.arrayBuffer()));
+      rmSync(join(localPack, idxName));
+      rmSync(join(localPack, idxName.replace(/idx$/, "pack")));
+      const midxPath = join(localPack, "multi-pack-index");
+      const midx = Buffer.from(await Bun.file(midxPath).arrayBuffer());
+      const nameAt = midx.indexOf(idxName);
+      expect(nameAt).toBeGreaterThanOrEqual(0);
+      midx.set(Buffer.from(escapedName), nameAt);
+      writeFileSync(midxPath, midx);
+      gitExec(source, ["update-ref", "HEAD", outsideCommit]);
+      const archived = Bun.spawnSync(["git", "-C", source, "archive", "--format=tar", "HEAD"], {
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
+      });
+      expect(archived.exitCode).toBe(0);
+      const listing = new TextDecoder().decode(Bun.spawnSync(["tar", "-t"], { stdin: archived.stdout, stdout: "pipe" }).stdout);
+      expect(listing).toContain("secret.js");
+      await expect(importRepository({
+        config: limited,
+        store,
+      }, {
+        ...project,
+        source_path: source,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      }, "HEAD", "tester")).rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a git ref import rejects a pack symlink whose bytes are not valid UTF-8", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "argus-ff-pack-"));
+    const limited = { ...config, allowedRoots: [dir] };
+    const source = join(dir, "ff-repo");
+    try {
+      initRepo(outside, { "secret.js": "SECRET_FF_SENTINEL\n" });
+      gitExec(outside, ["repack", "-ad"]);
+      const outsideCommit = gitExec(outside, ["rev-parse", "HEAD"]);
+      const outsidePack = join(outside, ".git/objects/pack");
+      const idxName = readdirSync(outsidePack).find((name) => name.endsWith(".idx"));
+      expect(idxName).toBeTruthy();
+      if (!idxName) return;
+      initRepo(source, { "local.js": "LOCAL_ONLY\n" });
+      const localPack = join(source, ".git/objects/pack");
+      mkdirSync(localPack, { recursive: true });
+      const entry = (name: Buffer) => Buffer.concat([Buffer.from(`${localPack}/`), name]);
+      const replacement = Buffer.from([0xef, 0xbf, 0xbd]);
+      const raw = Buffer.from([0xff]);
+      writeFileSync(entry(Buffer.concat([replacement, Buffer.from(".idx")])), "decoy");
+      writeFileSync(entry(Buffer.concat([replacement, Buffer.from(".pack")])), "decoy");
+      symlinkSync(join(outsidePack, idxName), entry(Buffer.concat([raw, Buffer.from(".idx")])));
+      symlinkSync(join(outsidePack, idxName.replace(/idx$/, "pack")), entry(Buffer.concat([raw, Buffer.from(".pack")])));
+      gitExec(source, ["update-ref", "HEAD", outsideCommit]);
+      const archived = Bun.spawnSync(["git", "-C", source, "archive", "--format=tar", "HEAD"], {
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
+      });
+      expect(archived.exitCode).toBe(0);
+      const listing = new TextDecoder().decode(Bun.spawnSync(["tar", "-t"], { stdin: archived.stdout, stdout: "pipe" }).stdout);
+      expect(listing).toContain("secret.js");
+      await expect(importRepository({
+        config: limited,
+        store,
+      }, {
+        ...project,
+        source_path: source,
         scope_include: JSON.stringify(["**/*"]),
         scope_exclude: "[]",
       }, "HEAD", "tester")).rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
@@ -1498,6 +1599,29 @@ describe("repository import", () => {
       const gitRoot = dirname(chosen.git);
       if (gitRoot.includes(outsideName)) rmSync(gitRoot, { recursive: true, force: true });
     }
+  });
+
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a git ref import accepts a multi-pack-index that names its own packs", async () => {
+    const limited = { ...config, allowedRoots: [dir] };
+    const source = join(dir, "midx-local");
+    initRepo(source, { "keep.js": "KEEP_MIDX\n" });
+    gitExec(source, ["repack", "-ad"]);
+    gitExec(source, ["multi-pack-index", "write"]);
+    const imported = await importRepository({
+      config: limited,
+      store,
+    }, {
+      ...project,
+      source_path: source,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    }, "HEAD", "tester");
+    expect(await Bun.file(join(imported.path, "keep.js")).text()).toBe("KEEP_MIDX\n");
+    expect(existsSync(join(imported.path, "secret.js"))).toBe(false);
   });
 
   test("a git ref import accepts an alternate object directory inside the allowed root", async () => {

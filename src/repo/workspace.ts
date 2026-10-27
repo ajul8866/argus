@@ -778,9 +778,114 @@ function resolveGitDirectoryPath(base: string, line: Buffer): string {
 
 type ObjectScan = { directories: number };
 
+const MIDX_HEADER_SIZE = 12;
+const MIDX_CHUNK_ENTRY = 12;
+const MIDX_MAX_NAME_CHUNK = 8_000_000;
+
+function readBe32(buffer: Buffer, offset: number): number {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset + 4 > buffer.length) throw gitObjectsError();
+  return buffer.readUInt32BE(offset);
+}
+
+function readBe64(buffer: Buffer, offset: number): number {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset + 8 > buffer.length) throw gitObjectsError();
+  const value = buffer.readUInt32BE(offset) * 0x100000000 + buffer.readUInt32BE(offset + 4);
+  if (!Number.isSafeInteger(value)) throw gitObjectsError();
+  return value;
+}
+
+async function readExact(handle: OpenedFile, position: number, length: number): Promise<Buffer> {
+  if (
+    !Number.isSafeInteger(position) ||
+    !Number.isSafeInteger(length) ||
+    position < 0 ||
+    length < 0 ||
+    !Number.isSafeInteger(position + length)
+  ) {
+    throw gitObjectsError();
+  }
+  const buffer = Buffer.alloc(length);
+  let offset = 0;
+  while (offset < length) {
+    const { bytesRead } = await handle.read(buffer, offset, length - offset, position + offset);
+    if (bytesRead === 0) throw gitObjectsError();
+    offset += bytesRead;
+  }
+  return buffer;
+}
+
+// `{object_dir}/pack/<name>` is where Git opens a multi-pack-index entry.
+// `..` in that name leaves the object store. A single path component cannot.
+function assertSafePackName(name: Buffer): void {
+  if (name.length === 0 || name.length > 255 || name.includes(0x2f) || name.includes(0x5c)) {
+    throw gitObjectsError();
+  }
+  if (
+    (name.length === 1 && name[0] === 0x2e) ||
+    (name.length === 2 && name[0] === 0x2e && name[1] === 0x2e)
+  ) {
+    throw gitObjectsError();
+  }
+}
+
+async function assertMultiPackIndex(objects: OpenedFile): Promise<void> {
+  let handle: OpenedFile | null;
+  try {
+    handle = await openAt(objects.fd, ["pack", "multi-pack-index"], noFollowFlags().file);
+  } catch (error) {
+    if (error instanceof AppError) throw gitObjectsError();
+    throw error;
+  }
+  if (!handle) return;
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || !Number.isSafeInteger(info.size) || info.size < MIDX_HEADER_SIZE) {
+      throw gitObjectsError();
+    }
+    const header = await readExact(handle, 0, MIDX_HEADER_SIZE);
+    const version = header[4];
+    const hashVersion = header[5];
+    const chunkCount = header[6];
+    if (version !== 1 || (hashVersion !== 1 && hashVersion !== 2) || chunkCount === undefined || chunkCount < 1 || chunkCount > 16) {
+      throw gitObjectsError();
+    }
+    const hashLength = hashVersion === 1 ? 20 : 32;
+    const tocBytes = (chunkCount + 1) * MIDX_CHUNK_ENTRY;
+    if (MIDX_HEADER_SIZE + tocBytes > info.size) throw gitObjectsError();
+    const toc = await readExact(handle, MIDX_HEADER_SIZE, tocBytes);
+    let names: { offset: number; size: number } | null = null;
+    for (let index = 0; index < chunkCount; index += 1) {
+      const id = readBe32(toc, index * MIDX_CHUNK_ENTRY);
+      const offset = readBe64(toc, index * MIDX_CHUNK_ENTRY + 4);
+      const next = readBe64(toc, (index + 1) * MIDX_CHUNK_ENTRY + 4);
+      if (id === 0 || offset % 4 !== 0 || next < offset || next > info.size - hashLength) throw gitObjectsError();
+      if (id === 0x504e414d) {
+        if (names) throw gitObjectsError();
+        names = { offset, size: next - offset };
+      }
+    }
+    if (readBe32(toc, chunkCount * MIDX_CHUNK_ENTRY) !== 0 || !names || names.size > MIDX_MAX_NAME_CHUNK) {
+      throw gitObjectsError();
+    }
+    const packCount = readBe32(header, 8);
+    if (packCount > 100_000) throw gitObjectsError();
+    const body = names.size === 0 ? Buffer.alloc(0) : await readExact(handle, names.offset, names.size);
+    let cursor = 0;
+    for (let index = 0; index < packCount; index += 1) {
+      const end = body.indexOf(0, cursor);
+      if (end < 0) throw gitObjectsError();
+      assertSafePackName(body.subarray(cursor, end));
+      cursor = end + 1;
+    }
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
 // A symlink or pipe under objects/ is invisible to a path check. `git archive`
 // follows the symlink and blocks on a pipe, so the directory is walked without
-// following either. The caller's descriptor stays open.
+// following either. Names stay raw bytes: string readdir turns a non-UTF-8
+// name into a different path. The caller's descriptor stays open.
 async function assertPlainObjectTree(root: OpenedFile, scan: ObjectScan): Promise<void> {
   const flags = noFollowFlags();
   const prefix = await descriptorPrefix(root.fd);
@@ -795,17 +900,20 @@ async function assertPlainObjectTree(root: OpenedFile, scan: ObjectScan): Promis
         if (current.depth > 8) throw gitObjectsError();
         scan.directories += 1;
         if (scan.directories > 4_096) throw gitObjectsError();
-        let names: string[];
+        let names: Buffer[];
         try {
-          names = await readdir(`${prefix}/${current.handle.fd}`);
+          const listed = await readdir(`${prefix}/${current.handle.fd}`, { encoding: "buffer" });
+          names = listed.map((name) => Buffer.from(name));
         } catch {
           throw gitObjectsError();
         }
         for (const name of names) {
-          if (name === "." || name === "..") continue;
-          let info: Awaited<ReturnType<typeof lstat>>;
+          if (name.equals(Buffer.from(".")) || name.equals(Buffer.from(".."))) continue;
+          if (name.length === 0 || name.includes(0) || name.includes(0x2f)) throw gitObjectsError();
+          const entryPath = Buffer.concat([Buffer.from(`${prefix}/${current.handle.fd}/`), name]);
+          let info;
           try {
-            info = await lstat(`${prefix}/${current.handle.fd}/${name}`);
+            info = lstatSync(entryPath);
           } catch {
             throw gitObjectsError();
           }
@@ -813,10 +921,10 @@ async function assertPlainObjectTree(root: OpenedFile, scan: ObjectScan): Promis
           if (!info.isDirectory()) continue;
           let child: OpenedFile;
           try {
-            child = await openChild(prefix, current.handle, name, flags.directory);
+            child = await open(entryPath, flags.directory);
           } catch (error) {
             const code = systemErrorCode(error);
-            if (code === "ELOOP" || code === "ENOTDIR") throw gitObjectsError();
+            if (code === "ELOOP" || code === "ENOTDIR" || code === "ENOENT") throw gitObjectsError();
             throw error;
           }
           pending.push({ handle: child, depth: current.depth + 1, owned: true });
@@ -848,6 +956,7 @@ async function assertSafeObjectDirectory(
   seen.add(id);
   const lines = await readAlternateLines(handle);
   await assertPlainObjectTree(handle, scan);
+  await assertMultiPackIndex(handle);
   for (const line of lines) {
     assertPlainAlternateLine(line);
     let authorized: string;

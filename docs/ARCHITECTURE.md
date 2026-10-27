@@ -220,7 +220,8 @@ operation, preserving include/exclude short-circuit behavior.
    archive for a ref) with the same open. The archive is taken from a git
    directory descriptor opened without following a symlink. A `.git` symlink,
    a `gitdir:` file, a git common directory that does not resolve to that git
-   directory, a symlink inside an object store, and an alternate object
+   directory, a symlink inside an object store (including a non-UTF-8 name), a
+   multi-pack-index pack name that leaves that store, and an alternate object
    directory Git would resolve outside the allowed locations are rejected. The
    alternate path follows a symlink before `..` and keeps the raw path bytes.
    A path that enters `/proc` or `/dev/fd` is rejected, because those locations

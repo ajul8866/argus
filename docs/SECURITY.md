@@ -55,6 +55,16 @@ LLM agents. Use it only on repositories you are authorized to assess.
   probes are the git directory file of that name, that name under `refs`,
   `refs/tags`, `refs/heads`, and `refs/remotes`, and
   `refs/remotes/<name>/HEAD`. A symref target of one of those files is checked
+  the same way. `rev-parse HEAD` and `rev-parse --abbrev-ref HEAD` run for
+  every import, including one that does not request a revision. The abbreviation
+  walks the symref chain from `HEAD`. A linked worktree reads each later shared
+  ref from its common directory, including when its own git directory has a
+  different file of that name. A `main-worktree/` prefix is removed only when
+  the remainder is a pseudoref or a `refs/bisect`, `refs/worktree`, or
+  `refs/rewritten` ref, and that file is read from the common directory. The
+  target keeps Unicode spaces Git does not treat as whitespace, and a symref
+  that is not valid UTF-8 is rejected. The
+  short names of that chain are probed before Git starts. A config `include` or
   the same way. `rev-parse --abbrev-ref HEAD` follows the HEAD symref chain and
   probes each abbreviation of the final ref, including the longer name used when
   a shorter one is ambiguous. Those probes run for every import, including one

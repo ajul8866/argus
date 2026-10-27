@@ -1,8 +1,8 @@
-import { readdir, realpath } from "node:fs/promises";
+import { readdir } from "node:fs/promises";
 import { extname, join, relative } from "node:path";
 import { createScopeMatcher, normalizePath, sha256, toJson, truncate } from "../util.ts";
 import type { Scope } from "../util.ts";
-import { readCappedRegularFile } from "./workspace.ts";
+import { canonicalDirectory, readCappedRegularFile } from "./workspace.ts";
 
 export const DEFAULT_EXCLUDES = [
   ".git/**",
@@ -166,7 +166,7 @@ export type InventoryOptions = {
 
 export async function buildInventory(root: string, options: InventoryOptions): Promise<Inventory> {
   const scopeMatcher = createScopeMatcher(options.scope);
-  const rootReal = await realpath(root);
+  const rootReal = await canonicalDirectory(root);
   const files: RepoFile[] = [];
   const skipped: Array<{ path: string; reason: string }> = [];
   const languages: Record<string, number> = {};

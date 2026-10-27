@@ -43,7 +43,7 @@ change the throttle bucket.
 | `GET` | `/api/repositories` | any | All snapshots |
 | `GET` | `/api/repositories/:id` | any | Snapshot + inventory + architecture map |
 | `GET` | `/api/repositories/:id/tree?path=` | any | Inventory-derived tree |
-| `GET` | `/api/repositories/:id/file?path=` | any | Scoped text preview. A symlink or pipe is rejected. The read stops at the checked size and the preview cap |
+| `GET` | `/api/repositories/:id/file?path=` | any | Scoped text preview. A symlink, a pipe, or a repository directory replaced by a symlink is rejected. The read stops at the checked size and the preview cap |
 
 Creating a project requires only `name` and `source_path`. The optional
 `authorized_by` and `authorization_ref` fields remain supported for existing

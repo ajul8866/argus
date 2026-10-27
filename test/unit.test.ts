@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,7 +13,7 @@ import { EvidenceStore } from "../src/orchestrator/evidence.ts";
 import { ReportService } from "../src/reports/generator.ts";
 import { buildInventory, gitInfo } from "../src/repo/inventory.ts";
 import { importRepository } from "../src/repo/import.ts";
-import { createWorkspace, readScopedFile, verifyQuote } from "../src/repo/workspace.ts";
+import { canonicalDirectory, createWorkspace, readCappedRegularFile, readScopedFile, verifyQuote } from "../src/repo/workspace.ts";
 import { createScopeMatcher, globToRegExp, matchesScope, extractJson, sha256 } from "../src/util.ts";
 import { redactSecrets } from "../src/security/redact.ts";
 import { credentialEnvironment, decryptSecret, encryptSecret, type StoredCredential } from "../src/security/credentials.ts";
@@ -697,6 +697,66 @@ describe("repository import", () => {
       code: "out_of_scope",
     });
     expect(existsSync(join(swappedCopy, "src", "a.js"))).toBe(false);
+  });
+
+  test("scoped reads, inventory, and snapshot copy reject a repository directory replaced by a symlink", async () => {
+    const root = mkdtempSync(join(tmpdir(), "argus-root-swap-"));
+    const source = join(root, "repo");
+    const outside = join(root, "outside");
+    const scope = { include: ["**/*"], exclude: [] };
+    try {
+      mkdirSync(join(source, "src"), { recursive: true });
+      mkdirSync(join(outside, "src"), { recursive: true });
+      writeFileSync(join(source, "a.js"), "INSIDE_CONTENT");
+      writeFileSync(join(source, "src", "a.js"), "INSIDE_NESTED");
+      writeFileSync(join(outside, "a.js"), "SECRET_OUTSIDE_SENTINEL");
+      writeFileSync(join(outside, "src", "a.js"), "SECRET_NESTED_SENTINEL");
+
+      const before = await readScopedFile(source, "src/a.js", scope);
+      expect(before.content).toBe("INSIDE_NESTED");
+      const pinned = await canonicalDirectory(source);
+      expect(pinned).toBe(realpathSync(source));
+
+      renameSync(source, `${source}.bak`);
+      symlinkSync(outside, source);
+
+      await expect(readScopedFile(source, "a.js", scope)).rejects.toMatchObject({ code: "out_of_scope" });
+      await expect(readScopedFile(source, "src/a.js", scope)).rejects.toMatchObject({ code: "out_of_scope" });
+      await expect(readCappedRegularFile(join(source, "a.js"), 1_000, {
+        root: source,
+        relativePath: "a.js",
+      })).rejects.toMatchObject({ code: "out_of_scope" });
+      await expect(readCappedRegularFile(join(source, "src", "a.js"), 1_000, {
+        root: source,
+        relativePath: "src/a.js",
+      })).rejects.toMatchObject({ code: "out_of_scope" });
+      await expect(buildInventory(source, { scope, maxFiles: 20, maxFileBytes: 1_000 })).rejects.toMatchObject({
+        code: "out_of_scope",
+      });
+      const copy = join(root, "copy");
+      await expect(createWorkspace(source, {
+        files: [{
+          path: "a.js",
+          size: Buffer.byteLength("SECRET_OUTSIDE_SENTINEL"),
+          lines: 1,
+          language: "JavaScript",
+          sha256: sha256("SECRET_OUTSIDE_SENTINEL"),
+        }],
+        skipped: [],
+        languages: {},
+        frameworks: [],
+        endpoints: [],
+        auth_boundaries: [],
+        dependency_graph: [],
+        entrypoints: [],
+        total_bytes: Buffer.byteLength("SECRET_OUTSIDE_SENTINEL"),
+        truncated: false,
+      }, scope, copy, {})).rejects.toMatchObject({ code: "out_of_scope" });
+      expect(existsSync(join(copy, "a.js"))).toBe(false);
+      expect(existsSync(join(copy, "src", "a.js"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

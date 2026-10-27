@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { chmod, mkdir, open, realpath, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, realpath, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
 import { AppError, createScopeMatcher, matchesScope, normalizePath, safeJoin, sha256 } from "../util.ts";
 import type { Scope } from "../util.ts";
@@ -13,10 +13,10 @@ export async function createWorkspace(
   metadata: Record<string, unknown>,
   writable = false,
 ): Promise<void> {
+  const rootReal = await canonicalDirectory(repositoryPath);
   await mkdir(workspace, { recursive: true, mode: 0o700 });
   const fileMode = writable ? 0o600 : 0o400;
   const scopeMatcher = createScopeMatcher(scope);
-  const rootReal = await realpath(repositoryPath);
   for (const file of inventory.files) {
     const normalized = normalizePath(file.path);
     if (!scopeMatcher.matches(normalized)) continue;
@@ -55,6 +55,55 @@ export async function createWorkspace(
 const OUT_OF_SCOPE = "File is outside the authorized project scope";
 const NOT_A_FILE = "Path is not a regular file";
 
+type PinnedDirectory = { path: string; dev: number; ino: number };
+
+// Resolve a directory without following a symlink at its final component.
+// A second realpath after the caller has already resolved the root follows a
+// directory that was replaced by a symlink and makes the outside tree look
+// in scope. The returned identity is checked again after the file is opened.
+async function pinDirectory(root: string): Promise<PinnedDirectory> {
+  const before = await lstat(root);
+  if (before.isSymbolicLink() || !before.isDirectory()) {
+    throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
+  }
+  const path = await realpath(root);
+  const after = await lstat(root);
+  const canonical = await lstat(path);
+  if (
+    after.isSymbolicLink() ||
+    !after.isDirectory() ||
+    canonical.isSymbolicLink() ||
+    !canonical.isDirectory() ||
+    after.dev !== before.dev ||
+    after.ino !== before.ino ||
+    canonical.dev !== before.dev ||
+    canonical.ino !== before.ino
+  ) {
+    throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
+  }
+  return { path, dev: before.dev, ino: before.ino };
+}
+
+export async function canonicalDirectory(root: string): Promise<string> {
+  return (await pinDirectory(root)).path;
+}
+
+function scopedRelative(relativePath: string): string {
+  const expected = normalizePath(relativePath);
+  if (
+    !expected ||
+    expected === "." ||
+    expected === ".." ||
+    expected.startsWith("../") ||
+    expected.startsWith("/") ||
+    /^[A-Za-z]:\//.test(expected) ||
+    expected.split("/").includes("..")
+  ) {
+    throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
+  }
+  return expected;
+}
+
 export async function readCappedRegularFile(
   path: string,
   maxBytes: number,
@@ -75,25 +124,28 @@ export async function readCappedRegularFile(
   }
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
+    const pinned = await pinDirectory(containedIn.root);
+    const expected = scopedRelative(containedIn.relativePath);
+    const expectedPath = join(pinned.path, expected);
     // O_NOFOLLOW refuses a symlink at the final path component. O_NONBLOCK
     // makes a pipe return immediately; opening it for read would otherwise
-    // wait until another process connects a writer. Intermediate directories
-    // can still be swapped, so the opened descriptor's path is checked below.
+    // wait until another process connects a writer. O_NOFOLLOW does not cover
+    // the repository directory or another intermediate component, so the
+    // opened descriptor must still be the path under the pinned directory.
     handle = await open(path, constants.O_RDONLY | noFollow | nonBlock);
     const info = await handle.stat();
     if (!info.isFile()) throw new AppError(400, "not_a_file", NOT_A_FILE);
     const size = info.size;
     if (!Number.isSafeInteger(size) || size < 0) throw new AppError(400, "not_a_file", NOT_A_FILE);
-    const rootReal = await realpath(containedIn.root);
-    const openedRelative = normalizePath(relative(rootReal, await openedRealPath(handle.fd)));
-    const expected = normalizePath(containedIn.relativePath);
+    if ((await openedRealPath(handle.fd)) !== expectedPath) {
+      throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
+    }
+    const current = await lstat(pinned.path);
     if (
-      !openedRelative ||
-      openedRelative === ".." ||
-      openedRelative.startsWith("../") ||
-      openedRelative.startsWith("/") ||
-      openedRelative.split("/").includes("..") ||
-      openedRelative !== expected
+      current.isSymbolicLink() ||
+      !current.isDirectory() ||
+      current.dev !== pinned.dev ||
+      current.ino !== pinned.ino
     ) {
       throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
     }
@@ -150,7 +202,7 @@ export async function readScopedFile(
     throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
   }
 
-  const absoluteRoot = await realpath(root);
+  const absoluteRoot = await canonicalDirectory(root);
   const target = safeJoin(absoluteRoot, canonical);
   const resolved = await realpath(target);
   const resolvedRelative = normalizePath(relative(absoluteRoot, resolved));

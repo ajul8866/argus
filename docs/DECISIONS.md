@@ -67,6 +67,18 @@ object store, including a different Git common directory, is rejected instead
 of being copied into the snapshot. The archive command runs in a separate
 repository with the `filter` attribute unset, so Git config cannot turn a
 smudge or process filter into a read of files outside the commit.
+of being copied into the snapshot. That archive does not load repository,
+system, or global Git configuration, so filter commands do not run and
+`core.autocrlf` is not applied. System and global attribute files are not
+read. The archive Git directory uses the pinned repository's object format,
+including SHA-256. Committed `export-subst` attributes are disabled, so a
+signature placeholder cannot run `gpg`. Committed attributes can still request
+line-ending conversion.
+that work tree and does not pass inherited `GIT_*` overrides through.
+Metadata that points at another object store, including a different Git common
+directory, is rejected instead of being copied into the snapshot. A promisor
+remote is not consulted: lazy fetch is disabled, so a missing object fails the
+ref import instead of being downloaded.
 
 **Scope is a platform boundary.** The prompt tells the agent what it is doing,
 but the workspace, explorer, and evidence checker independently enforce scope.

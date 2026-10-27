@@ -137,12 +137,30 @@ export function clampText(value: unknown, max = 4000): string {
   return truncate(typeof value === "string" ? value : "", max);
 }
 
+// Repository config can point core.excludesFile and core.attributesFile at a
+// fifo. Git opens that path from every command that reads the config. Force
+// both settings at the command line so the fifo is never opened.
+// --no-replace-objects keeps refs/replace from substituting another object for
+// the commit being archived. Without it, archive can store different bytes
+// than that commit while rev-parse still prints the original commit id.
+const GIT_CONFIG_OVERRIDES = ["-c", "core.excludesFile=/dev/null", "-c", "core.attributesFile=/dev/null"] as const;
+
+export function gitArgv(args: readonly string[]): string[] {
+  return ["git", "--no-replace-objects", ...GIT_CONFIG_OVERRIDES, ...args];
+}
+
 export async function gitInfo(path: string): Promise<{ commit: string | null; branch: string | null }> {
   const run = async (args: string[]): Promise<string | null> => {
     try {
-      const result = await runCommand(["git", ...args], {
+      const result = await runCommand(gitArgv(args), {
         cwd: path,
-        env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          // A promisor remote can download the commit while its name is being
+          // read. Refuse that fetch here too, so a later archive cannot see
+          // an object this command just stored.
+          GIT_NO_LAZY_FETCH: "1",
+        },
         timeoutMs: 15_000,
       });
       if (result.timedOut || result.code !== 0) return null;

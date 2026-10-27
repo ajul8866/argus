@@ -1,5 +1,4 @@
 import { constants, fstatSync, lstatSync, readlinkSync } from "node:fs";
-import { chmod, lstat, mkdir, open, readlink, readdir, realpath, writeFile } from "node:fs/promises";
 import { chmod, lstat, mkdir, open, readdir, readlink, realpath, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { AppError, createScopeMatcher, matchesScope, normalizePath, safeJoin, sha256 } from "../util.ts";
@@ -492,14 +491,13 @@ function retainGitDir(handle: OpenedFile, path: string): PinnedGitDir {
 }
 
 // `git --git-dir` follows a symlink. Hold the directory descriptor and make git
-// use that inode. Reject an object store that can name bytes outside the
-// allowed roots: a symlink under `objects`, a `commondir` file, or an alternate
-// object directory Git can resolve, including one reached through another
-// alternate, a symlink followed before `..`, or a process-local `/proc` or
-// `/dev/fd` path.
 // use that inode. `commondir`, an alternate object directory, or a symlink in
 // the object store can still make `git archive` read another repository.
-export async function openAuthorizedGitDirectory(path: string, allowedRoots: string[]): Promise<PinnedGitDir> {
+export async function openAuthorizedGitDirectory(
+  path: string,
+  allowedRoots: string[],
+  options?: { requireGitName?: boolean },
+): Promise<PinnedGitDir> {
   const flags = noFollowFlags();
   let authorized: string;
   try {
@@ -510,7 +508,11 @@ export async function openAuthorizedGitDirectory(path: string, allowedRoots: str
     }
     throw error;
   }
-  if (basename(authorized) !== ".git") throw new AppError(400, "invalid_repository", GIT_DIRECTORY_ERROR);
+  // A work tree `.git` entry must be named `.git`. A gitfile may name the same
+  // directory after it has been renamed, and that path is checked by the caller.
+  if (options?.requireGitName !== false && basename(authorized) !== ".git") {
+    throw new AppError(400, "invalid_repository", GIT_DIRECTORY_ERROR);
+  }
   let handle: OpenedFile;
   try {
     handle = await open(authorized, flags.directory);
@@ -623,13 +625,6 @@ function gitObjectsError(): AppError {
   return new AppError(400, "invalid_repository", GIT_OBJECTS_ERROR);
 }
 
-// A linked worktree's git directory lists the shared metadata in this file.
-// Git then reads that other directory's objects even when this directory has
-// its own object store. A normal repository does not have the file.
-async function assertNoCommonDir(gitFd: number): Promise<void> {
-  let handle: OpenedFile | null;
-  try {
-    handle = await openAt(gitFd, ["commondir"], noFollowFlags().file);
 // Git unquotes an alternates line that starts with `"`. Checking the raw line
 // can authorize a different directory from the one git then reads. Reject the
 // characters that select that parser instead of guessing the decoded path.
@@ -640,102 +635,6 @@ function assertPlainAlternateLine(line: Buffer): void {
 }
 
 async function readAlternateLines(objects: OpenedFile): Promise<Buffer[]> {
-  let handle: OpenedFile | null;
-  try {
-    handle = await openAt(objects.fd, ["info", "alternates"], noFollowFlags().file);
-  } catch (error) {
-    if (error instanceof AppError) throw gitObjectsError();
-    throw error;
-  }
-  if (!handle) return;
-  await handle.close().catch(() => undefined);
-  throw gitObjectsError();
-}
-
-type ObjectScan = { directories: number; seen: Set<string> };
-
-async function rejectObjectSymlinks(handle: OpenedFile, prefix: string, depth: number, scan: ObjectScan): Promise<void> {
-  if (depth > 12) throw gitObjectsError();
-  scan.directories += 1;
-  if (scan.directories > 4_096) throw gitObjectsError();
-  let entries;
-  try {
-    entries = await readdir(`${prefix}/${handle.fd}`, { withFileTypes: true });
-  } catch {
-    throw gitObjectsError();
-  }
-  for (const entry of entries) {
-    const name = entry.name;
-    if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\0")) throw gitObjectsError();
-    if (entry.isSymbolicLink()) throw gitObjectsError();
-    if (entry.isDirectory()) {
-      await scanObjectDirectory(prefix, handle, name, depth + 1, scan);
-      continue;
-    }
-    if (entry.isFile()) continue;
-    await scanObjectEntry(prefix, handle, name, depth + 1, scan);
-  }
-}
-
-async function scanObjectDirectory(
-  prefix: string,
-  parent: OpenedFile,
-  name: string,
-  depth: number,
-  scan: ObjectScan,
-): Promise<void> {
-  let child: OpenedFile | undefined;
-  try {
-    child = await openChild(prefix, parent, name, noFollowFlags().directory);
-    const info = await child.stat();
-    if (!info.isDirectory()) throw gitObjectsError();
-    await rejectObjectSymlinks(child, prefix, depth, scan);
-  } catch (error) {
-    if (error instanceof AppError) throw gitObjectsError();
-    const code = systemErrorCode(error);
-    if (code === "ELOOP" || code === "ENOTDIR" || code === "EAGAIN" || code === "ENXIO") throw gitObjectsError();
-    throw error;
-  } finally {
-    await child?.close().catch(() => undefined);
-  }
-}
-
-async function scanObjectEntry(
-  prefix: string,
-  parent: OpenedFile,
-  name: string,
-  depth: number,
-  scan: ObjectScan,
-): Promise<void> {
-  let child: OpenedFile | undefined;
-  try {
-    child = await openChild(prefix, parent, name, noFollowFlags().file);
-    const info = await child.stat();
-    if (info.isDirectory()) {
-      await rejectObjectSymlinks(child, prefix, depth, scan);
-      return;
-    }
-    if (!info.isFile()) throw gitObjectsError();
-  } catch (error) {
-    if (error instanceof AppError) throw gitObjectsError();
-    const code = systemErrorCode(error);
-    if (code === "ELOOP" || code === "ENOTDIR" || code === "EAGAIN" || code === "ENXIO") throw gitObjectsError();
-    throw error;
-  } finally {
-    await child?.close().catch(() => undefined);
-  }
-}
-
-// Git unquotes an alternates line that starts with `"`. Checking the raw line
-// can authorize a different directory from the one git then reads. Reject the
-// characters that select that parser instead of guessing the decoded path.
-function assertPlainAlternateLine(line: Buffer): void {
-  for (const byte of line) {
-    if (byte === 0x22 || byte === 0x5c || byte <= 0x1f || byte === 0x7f) throw gitObjectsError();
-  }
-}
-
-async function alternateLines(objects: OpenedFile): Promise<Buffer[]> {
   let handle: OpenedFile | null;
   try {
     handle = await openAt(objects.fd, ["info", "alternates"], noFollowFlags().file);
@@ -763,13 +662,6 @@ async function alternateLines(objects: OpenedFile): Promise<Buffer[]> {
       if (index !== buffer.length && buffer[index] !== 0x0a) continue;
       const piece = buffer.subarray(start, index);
       start = index + 1;
-      if (piece.length === 0) continue;
-      // Git treats a line whose first byte is "#" as a comment.
-      if (piece[0] === 0x23) continue;
-      if (entries.length >= 100) throw gitObjectsError();
-      entries.push(Buffer.from(piece));
-    }
-    return entries;
       if (piece.length === 0 || piece[0] === 0x23) continue;
       if (entries.length >= 100) throw gitObjectsError();
       entries.push(Buffer.from(piece));
@@ -1159,171 +1051,6 @@ async function assertGitCommonDirectory(git: PinnedGitDir): Promise<void> {
   }
 }
 
-// Node and Bun `realpath` collapse `..` before following a symlink, and they
-// re-encode a byte path as UTF-8. Git's resolver follows the symlink first and
-// keeps the raw bytes, so those routines authorize a different directory from
-// the one `git archive` reads. Walk the bytes the way Git does.
-//
-// `/proc/self` and `/dev/fd` belong to whichever process calls `lstat`. This
-// check runs in the server, while `git --git-dir=/proc/self/fd/3` sees fd 3 as
-// the git directory and `/proc/self/exe` as the git binary. Authorizing the
-// server's resolution would accept a different directory from the one git reads.
-function isProcessLocalGitPath(candidate: Buffer): boolean {
-  for (const prefix of ["/proc", "/dev/fd"]) {
-    const marker = Buffer.from(prefix);
-    if (candidate.equals(marker)) return true;
-    if (
-      candidate.length > marker.length &&
-      candidate.subarray(0, marker.length).equals(marker) &&
-      candidate[marker.length] === 0x2f
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-function splitGitComponents(path: Buffer): Buffer[] {
-  const parts: Buffer[] = [];
-  let start = 0;
-  for (let index = 0; index <= path.length; index += 1) {
-    if (index !== path.length && path[index] !== 0x2f) continue;
-    if (index > start) parts.push(Buffer.from(path.subarray(start, index)));
-    start = index + 1;
-  }
-  return parts;
-}
-
-function gitPathBuffer(parts: readonly Buffer[]): Buffer {
-  if (parts.length === 0) return Buffer.from("/");
-  const chunks: Buffer[] = [];
-  for (const part of parts) chunks.push(Buffer.from("/"), part);
-  const path = Buffer.concat(chunks);
-  if (path.length > 4096) throw gitObjectsError();
-  return path;
-}
-
-function resolveGitPath(path: Buffer): Buffer {
-  if (path.length === 0 || path.length > 4096 || path[0] !== 0x2f) throw gitObjectsError();
-  let pending = splitGitComponents(path);
-  const resolved: Buffer[] = [];
-  let index = 0;
-  let symlinks = 0;
-  let steps = 0;
-  while (index < pending.length) {
-    if (++steps > 8192) throw gitObjectsError();
-    const part = pending[index];
-    index += 1;
-    if (!part || part.length === 0 || (part.length === 1 && part[0] === 0x2e)) continue;
-    if (part.length === 2 && part[0] === 0x2e && part[1] === 0x2e) {
-      resolved.pop();
-      continue;
-    }
-    const candidate = gitPathBuffer([...resolved, part]);
-    if (isProcessLocalGitPath(candidate)) throw gitObjectsError();
-    let info;
-    try {
-      info = lstatSync(candidate);
-    } catch {
-      throw gitObjectsError();
-    }
-    if (!info.isSymbolicLink()) {
-      resolved.push(part);
-      continue;
-    }
-    if (++symlinks > 32) throw gitObjectsError();
-    let target: Buffer;
-    try {
-      const linked = readlinkSync(candidate, { encoding: "buffer" });
-      if (!Buffer.isBuffer(linked) || linked.length === 0 || linked.length > 4096) throw gitObjectsError();
-      target = linked;
-    } catch (error) {
-      if (error instanceof AppError) throw error;
-      throw gitObjectsError();
-    }
-    if (target[0] === 0x2f) resolved.length = 0;
-    pending = [...splitGitComponents(target), ...pending.slice(index)];
-    index = 0;
-  }
-  return gitPathBuffer(resolved);
-}
-
-function decodeGitPath(path: Buffer): string {
-  if (path.length === 0 || path[0] !== 0x2f) throw gitObjectsError();
-  let text: string;
-  try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(path);
-  } catch {
-    throw gitObjectsError();
-  }
-  const parts = text.split("/");
-  if (parts.some((part) => part === "." || part === "..")) throw gitObjectsError();
-  return text;
-}
-
-function resolveGitAlternate(objectsPath: string, line: Buffer): string {
-  if (!objectsPath.startsWith("/") || line.length === 0) throw gitObjectsError();
-  const base = resolveGitPath(Buffer.from(objectsPath));
-  const raw = line[0] === 0x2f ? line : Buffer.concat([base, Buffer.from("/"), line]);
-  return decodeGitPath(resolveGitPath(raw));
-}
-
-async function assertSafeObjectDirectory(
-  handle: OpenedFile,
-  objectsPath: string,
-  allowedRoots: string[],
-  scan: ObjectScan,
-): Promise<void> {
-  const info = await handle.stat();
-  const id = `${info.dev}:${info.ino}`;
-  if (scan.seen.has(id)) return;
-  if (scan.seen.size >= 8) throw gitObjectsError();
-  scan.seen.add(id);
-  const prefix = await descriptorPrefix(handle.fd);
-  await rejectObjectSymlinks(handle, prefix, 0, scan);
-  for (const line of await alternateLines(handle)) {
-    assertPlainAlternateLine(line);
-    let authorized: string;
-    try {
-      authorized = await assertAuthorizedRoot(resolveGitAlternate(objectsPath, line), allowedRoots);
-    } catch {
-      throw gitObjectsError();
-    }
-    let alternate: OpenedFile | undefined;
-    try {
-      alternate = await open(authorized, noFollowFlags().directory);
-      const openedInfo = await alternate.stat();
-      const opened = await openedRealPath(alternate.fd);
-      if (!openedInfo.isDirectory() || opened !== authorized) throw gitObjectsError();
-      await assertSafeObjectDirectory(alternate, authorized, allowedRoots, scan);
-    } catch (error) {
-      if (error instanceof AppError && error.message === GIT_OBJECTS_ERROR) throw error;
-      throw gitObjectsError();
-    } finally {
-      await alternate?.close().catch(() => undefined);
-    }
-  }
-}
-
-export async function assertAuthorizedGitAlternates(git: PinnedGitDir, allowedRoots: string[]): Promise<void> {
-  await assertNoCommonDir(git.fd);
-  let objects: OpenedFile | null;
-  try {
-    objects = await openAt(git.fd, ["objects"], noFollowFlags().directory);
-  } catch (error) {
-    if (error instanceof AppError) throw gitObjectsError();
-    throw error;
-  }
-  if (!objects) return;
-  try {
-    const info = await objects.stat();
-    if (!info.isDirectory()) throw gitObjectsError();
-    await assertSafeObjectDirectory(objects, join(git.path, "objects"), allowedRoots, {
-      directories: 0,
-      seen: new Set(),
-    });
-  } finally {
-    await objects.close().catch(() => undefined);
-  }
 async function assertPinnedGitMetadata(git: PinnedGitDir, allowedRoots: string[]): Promise<void> {
   await assertAuthorizedGitAlternates(git, allowedRoots);
   await assertGitCommonDirectory(git);

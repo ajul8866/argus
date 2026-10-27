@@ -226,9 +226,10 @@ operation, preserving include/exclude short-circuit behavior.
    passed through. A pipe or symlink in metadata Git would read for that
    archive, including `config.worktree`, sparse-checkout, and a config include
    wherever Git would start that section, is rejected before Git starts. The
-   directory named by a gitfile or `commondir` is the path Git opens, with
-   trailing breaks removed and `..` resolved after symlinks, and that directory
-   is checked the same way. Configured exclude and attribute paths are not
+  directory named by a gitfile or `commondir` is the path Git opens, with
+  trailing breaks removed and `..` applied after each symlink is followed.
+  The runtime `realpath` is not used for that walk. A pointer that is not
+  valid UTF-8 is rejected. That directory is checked the same way. Configured exclude and attribute paths are not
    opened. A subdirectory archives only its own tree. The inventory is then
    rebuilt from the snapshot.
 4. Each task gets a fresh read-only copy under

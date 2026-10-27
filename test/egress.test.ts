@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { createServer as createHttpServer, request as httpRequest } from "node:http";
+import { connect as netConnect } from "node:net";
 import { ContainerRuntime } from "../src/dynamic/runtime.ts";
 import { checkRedirect, checkRequest, RateLimiter, type EgressPolicy } from "../src/dynamic/egress.ts";
+import { BrokerServer } from "../src/dynamic/broker.ts";
 
 function fakeExecutor(failOn?: (argv: string[]) => boolean) {
   const calls: string[][] = [];
@@ -144,5 +147,97 @@ describe("egress policy", () => {
     expect(
       checkRedirect("https://app.example.test/a", "https://app.example.test/b", policy, 3),
     ).toMatchObject({ allowed: false });
+  });
+});
+
+describe("BrokerServer", () => {
+  test("forwards in-scope HTTP, blocks out-of-scope hosts, and tunnels CONNECT", async () => {
+    const target = createHttpServer((req, res) => {
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end(`ok ${req.method}`);
+    });
+    await new Promise<void>((resolve) => target.listen(0, "127.0.0.1", () => resolve()));
+    const targetPort = (target.address() as { port: number }).port;
+    const exchanges: Array<{ method: string; url: string; status: number; scopeDecision: string }> = [];
+    const broker = new BrokerServer({
+      policy: {
+        baseUrl: "http://127.0.0.1",
+        allowedHosts: ["127.0.0.1"],
+        allowedCidrs: ["127.0.0.1/32"],
+        allowedMethods: ["GET", "POST"],
+        allowedPorts: [targetPort],
+        maxRps: 100,
+        tls: false,
+      },
+      onExchange: (record) => {
+        exchanges.push(record);
+      },
+    });
+    const { port } = await broker.start(0);
+
+    try {
+      const forwarded = await new Promise<{ code: number; body: string }>((resolve, reject) => {
+        const req = httpRequest(
+          {
+            host: "127.0.0.1",
+            port,
+            method: "GET",
+            path: `http://127.0.0.1:${targetPort}/ok`,
+            headers: { host: `127.0.0.1:${targetPort}` },
+          },
+          (res) => {
+            let body = "";
+            res.on("data", (chunk) => (body += chunk));
+            res.on("end", () => resolve({ code: res.statusCode ?? 0, body }));
+          },
+        );
+        req.on("error", reject);
+        req.end();
+      });
+      expect(forwarded).toEqual({ code: 200, body: "ok GET" });
+      expect(exchanges[0]).toMatchObject({ method: "GET", status: 200, scopeDecision: "allowed" });
+
+      const blocked = await new Promise<number>((resolve, reject) => {
+        const req = httpRequest(
+          { host: "127.0.0.1", port, method: "GET", path: "http://evil.example.test/x" },
+          (res) => {
+            res.resume();
+            resolve(res.statusCode ?? 0);
+          },
+        );
+        req.on("error", reject);
+        req.end();
+      });
+      expect(blocked).toBe(403);
+
+      const tunnel = await new Promise<string>((resolve, reject) => {
+        const socket = netConnect(port, "127.0.0.1", () => {
+          socket.write(`CONNECT 127.0.0.1:${targetPort} HTTP/1.1\r\nHost: 127.0.0.1:${targetPort}\r\n\r\n`);
+        });
+        let data = "";
+        let sentGet = false;
+        socket.on("data", (chunk) => {
+          data += chunk.toString();
+          if (!sentGet && data.includes("200 Connection Established")) {
+            sentGet = true;
+            socket.write("GET /tunnel HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+          }
+          if (data.includes("ok GET")) {
+            socket.end();
+            resolve(data);
+          }
+        });
+        socket.on("error", reject);
+        setTimeout(() => {
+          socket.destroy();
+          resolve(data);
+        }, 2_000);
+      });
+      expect(tunnel).toContain("200 Connection Established");
+      expect(tunnel).toContain("ok GET");
+    } finally {
+      await broker.stop();
+      await new Promise<void>((resolve) => target.close(() => resolve()));
+    }
   });
 });

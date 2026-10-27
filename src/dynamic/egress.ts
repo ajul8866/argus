@@ -3,6 +3,7 @@ export type EgressPolicy = {
   allowedHosts: string[];
   allowedCidrs: string[];
   allowedMethods: string[];
+  allowedPorts?: number[];
   maxRps: number;
   tls: boolean;
   authorizedActions?: { methods?: string[]; require_approval_for?: string[] };
@@ -139,6 +140,17 @@ export function checkRedirect(
     return { allowed: false, reason: "redirect url is invalid" };
   }
   return checkRequest(policy, { method: "GET", url: toUrl });
+}
+
+export function checkTunnel(policy: EgressPolicy, host: string, port: number): EgressDecision {
+  if (!hostAllowed(host, policy.allowedHosts)) {
+    return { allowed: false, reason: `host ${host} is outside the scope` };
+  }
+  const allowed = policy.allowedPorts ?? [80, 443];
+  if (!allowed.includes(port)) {
+    return { allowed: false, reason: `port ${port} is not allowed` };
+  }
+  return { allowed: true };
 }
 
 export class RateLimiter {

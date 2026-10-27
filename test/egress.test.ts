@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { ContainerRuntime } from "../src/dynamic/runtime.ts";
+import { checkRedirect, checkRequest, RateLimiter, type EgressPolicy } from "../src/dynamic/egress.ts";
 
 function fakeExecutor(failOn?: (argv: string[]) => boolean) {
   const calls: string[][] = [];
@@ -71,5 +72,77 @@ describe("ContainerRuntime", () => {
     await runtime.create("a4");
     await runtime.exec("a4", ["sh", "-lc", "id"]);
     expect(calls.at(-1)).toEqual(["docker", "exec", "argus-worker-a4", "sh", "-lc", "id"]);
+  });
+});
+
+const policy: EgressPolicy = {
+  baseUrl: "https://app.example.test",
+  allowedHosts: ["app.example.test", "*.api.example.test"],
+  allowedCidrs: ["203.0.113.0/24"],
+  allowedMethods: ["GET", "POST"],
+  maxRps: 2,
+  tls: true,
+  restrictions: { denied_paths: ["/admin"] },
+};
+
+describe("egress policy", () => {
+  test("allows an in-scope request and blocks the obvious escapes", () => {
+    expect(checkRequest(policy, { method: "GET", url: "https://app.example.test/invoices" }, ["203.0.113.10"])).toEqual({
+      allowed: true,
+    });
+    expect(checkRequest(policy, { method: "GET", url: "https://evil.example.test/x" }, ["203.0.113.10"])).toMatchObject({
+      allowed: false,
+    });
+    expect(checkRequest(policy, { method: "DELETE", url: "https://app.example.test/invoices" }, ["203.0.113.10"])).toMatchObject({
+      allowed: false,
+    });
+    expect(checkRequest(policy, { method: "GET", url: "http://app.example.test/invoices" }, ["203.0.113.10"])).toMatchObject({
+      allowed: false,
+    });
+    expect(checkRequest(policy, { method: "GET", url: "https://app.example.test/admin" }, ["203.0.113.10"])).toMatchObject({
+      allowed: false,
+    });
+  });
+
+  test("allows wildcard hosts and rejects private or metadata addresses", () => {
+    expect(
+      checkRequest(policy, { method: "GET", url: "https://v1.api.example.test/x" }, ["203.0.113.10"]),
+    ).toEqual({ allowed: true });
+    expect(
+      checkRequest(policy, { method: "GET", url: "https://app.example.test/x" }, ["169.254.169.254"]),
+    ).toMatchObject({ allowed: false });
+    expect(
+      checkRequest(policy, { method: "GET", url: "https://app.example.test/x" }, ["10.0.0.5"]),
+    ).toMatchObject({ allowed: false });
+    expect(
+      checkRequest(policy, { method: "GET", url: "https://app.example.test/x" }, ["127.0.0.1"]),
+    ).toMatchObject({ allowed: false });
+    expect(
+      checkRequest(
+        { ...policy, allowedCidrs: ["127.0.0.1/32"] },
+        { method: "GET", url: "https://app.example.test/x" },
+        ["127.0.0.1"],
+      ),
+    ).toEqual({ allowed: true });
+  });
+
+  test("rate limits per key", () => {
+    const limiter = new RateLimiter();
+    expect(limiter.allow("target:user_a", 2, 0)).toBe(true);
+    expect(limiter.allow("target:user_a", 2, 10)).toBe(true);
+    expect(limiter.allow("target:user_a", 2, 20)).toBe(false);
+    expect(limiter.allow("target:user_a", 2, 1_001)).toBe(true);
+  });
+
+  test("checks redirects and the redirect cap", () => {
+    expect(
+      checkRedirect("https://app.example.test/a", "https://evil.example.test/b", policy, 0),
+    ).toMatchObject({ allowed: false });
+    expect(
+      checkRedirect("https://app.example.test/a", "https://v1.api.example.test/b", policy, 0),
+    ).toEqual({ allowed: true });
+    expect(
+      checkRedirect("https://app.example.test/a", "https://app.example.test/b", policy, 3),
+    ).toMatchObject({ allowed: false });
   });
 });

@@ -181,7 +181,8 @@ This is the step that makes two agreeing LLMs insufficient.
   their timestamps match. Downloads recompute the stored size and SHA-256 and
   fail closed when the file no longer matches its database record. Replacing
   the file with a symlink or a pipe fails closed. The open does not follow the
-  symlink or wait for a pipe writer.
+  symlink or wait for a pipe writer, and it stops at the size observed on that
+  open file.
 
 ## 3. Persistence and recovery
 

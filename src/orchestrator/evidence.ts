@@ -215,8 +215,22 @@ export class EvidenceStore {
       handle = await open(row.content_path, constants.O_RDONLY | noFollow | nonBlock);
       const info = await handle.stat();
       if (!info.isFile()) return { ok: false, reason: "Evidence file is missing or unreadable" };
-      if (info.size > limit) return { ok: false, reason: "Evidence file is larger than the recorded content" };
-      const raw = await handle.readFile({ encoding: "utf8" });
+      // Cap the read at the size just observed. readFile() stats again and would
+      // load a file that grew past the bound after this check.
+      const expected = info.size;
+      if (!Number.isSafeInteger(expected) || expected < 0) {
+        return { ok: false, reason: "Evidence file is missing or unreadable" };
+      }
+      if (expected > limit) return { ok: false, reason: "Evidence file is larger than the recorded content" };
+      const buffer = Buffer.alloc(expected);
+      let offset = 0;
+      while (offset < expected) {
+        const { bytesRead } = await handle.read(buffer, offset, expected - offset, offset);
+        if (bytesRead === 0) break;
+        offset += bytesRead;
+      }
+      if (offset !== expected) return { ok: false, reason: "Evidence file is missing or unreadable" };
+      const raw = buffer.toString("utf8");
       if (Buffer.byteLength(raw) > limit) {
         return { ok: false, reason: "Evidence file is larger than the recorded content" };
       }

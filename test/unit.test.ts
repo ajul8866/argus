@@ -1046,6 +1046,183 @@ describe("repository import", () => {
     expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
   });
 
+  test("import does not wait on a pipe reached through git config or a gitfile", async () => {
+    const gitEnv = {
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      GIT_AUTHOR_NAME: "Tester",
+      GIT_AUTHOR_EMAIL: "tester@example.com",
+      GIT_COMMITTER_NAME: "Tester",
+      GIT_COMMITTER_EMAIL: "tester@example.com",
+    };
+    const git = (cwd: string, args: string[]): void => {
+      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+        env: gitEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+    };
+    const fifo = (path: string): void => {
+      if (existsSync(path)) rmSync(path);
+      expect(Bun.spawnSync(["mkfifo", path]).exitCode).toBe(0);
+    };
+    const prepare = (name: string): string => {
+      const source = join(dir, name);
+      mkdirSync(source, { recursive: true });
+      git(source, ["init", "-q"]);
+      writeFileSync(join(source, "a.js"), "LOCAL_ONLY\n");
+      git(source, ["add", "a.js"]);
+      git(source, ["commit", "-qm", "local"]);
+      return source;
+    };
+    const insert = (id: string, source: string): void => {
+      store.run(
+        `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+         VALUES (?, ?, '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+        id, id, source, JSON.stringify(["**/*.js"]),
+      );
+    };
+    const project = (id: string, source: string) => ({
+      id,
+      source_path: source,
+      scope_include: JSON.stringify(["**/*.js"]),
+      scope_exclude: "[]",
+    });
+    const attempt = async (id: string, source: string, ref: string | null): Promise<string> => {
+      return Promise.race([
+        importRepository({ config, store }, project(id, source), ref, "tester")
+          .then(() => "imported")
+          .catch((error: { code?: string }) => error.code ?? "error"),
+        Bun.sleep(800).then(() => "blocked"),
+      ]);
+    };
+    const appendConfig = async (gitDir: string, extra: string): Promise<void> => {
+      const path = join(gitDir, "config");
+      writeFileSync(path, `${await Bun.file(path).text()}\n${extra}`);
+    };
+
+    const attributes = prepare("attr-file");
+    const attributeFifo = join(dir, "attr.fifo");
+    fifo(attributeFifo);
+    git(attributes, ["config", "core.attributesFile", attributeFifo]);
+    insert("p-attr-file", attributes);
+
+    const excludes = prepare("wt-excludes");
+    git(excludes, ["config", "extensions.worktreeConfig", "true"]);
+    const excludesFifo = join(dir, "wt-excludes.fifo");
+    fifo(excludesFifo);
+    writeFileSync(join(excludes, ".git", "config.worktree"), `[core]\n\texcludesFile = ${excludesFifo}\n`);
+    insert("p-wt-excludes", excludes);
+
+    const commented = prepare("include-comment");
+    await appendConfig(join(commented, ".git"), "# [include]\n; [includeIf \"gitdir:**\"]\n[core]\n\tnote = [include]\n");
+    insert("p-include-comment", commented);
+
+    const includeHeaders = [
+      ["include", "[include]\n\tpath = FIFO\n"],
+      ["include-upper", "[INCLUDE]\n\tpath = FIFO\n"],
+      ["include-if", "[includeIf \"gitdir:**\"]\n\tpath = FIFO\n"],
+      ["include-indent", "  [include]\n    path = FIFO\n"],
+    ] as const;
+    for (const [name, header] of includeHeaders) {
+      const source = prepare(name);
+      const pipe = join(dir, `${name}.fifo`);
+      fifo(pipe);
+      await appendConfig(join(source, ".git"), header.replaceAll("FIFO", pipe));
+      insert(`p-${name}`, source);
+      expect(await attempt(`p-${name}`, source, "HEAD")).toBe("invalid_repository");
+    }
+
+    const worktreeConfig = prepare("wt-config");
+    git(worktreeConfig, ["config", "extensions.worktreeConfig", "true"]);
+    fifo(join(worktreeConfig, ".git", "config.worktree"));
+    insert("p-wt-config", worktreeConfig);
+    expect(await attempt("p-wt-config", worktreeConfig, "HEAD")).toBe("invalid_repository");
+
+    const sparse = prepare("sparse");
+    git(sparse, ["config", "core.sparseCheckout", "true"]);
+    fifo(join(sparse, ".git", "info", "sparse-checkout"));
+    insert("p-sparse", sparse);
+    expect(await attempt("p-sparse", sparse, "HEAD")).toBe("invalid_repository");
+
+    const other = prepare("common-other");
+    const commonFifo = join(dir, "common-include.fifo");
+    fifo(commonFifo);
+    await appendConfig(join(other, ".git"), `[include]\n\tpath = ${commonFifo}\n`);
+    const commonMain = prepare("common-main");
+    writeFileSync(join(commonMain, ".git", "commondir"), `${join(other, ".git")}\n`);
+    insert("p-common-include", commonMain);
+    expect(await attempt("p-common-include", commonMain, "HEAD")).toBe("invalid_repository");
+
+    const linkedParent = prepare("symlink-parent");
+    mkdirSync(join(linkedParent, "child"));
+    writeFileSync(join(linkedParent, "child", "a.js"), "LOCAL_CHILD\n");
+    git(linkedParent, ["add", "child/a.js"]);
+    git(linkedParent, ["commit", "-qm", "child"]);
+    renameSync(join(linkedParent, ".git"), join(linkedParent, "gitdir"));
+    symlinkSync("gitdir", join(linkedParent, ".git"));
+    const linkedFifo = join(dir, "symlink-include.fifo");
+    fifo(linkedFifo);
+    await appendConfig(join(linkedParent, "gitdir"), `[include]\n\tpath = ${linkedFifo}\n`);
+    insert("p-symlink-child", join(linkedParent, "child"));
+    expect(await attempt("p-symlink-child", join(linkedParent, "child"), null)).toBe("invalid_repository");
+
+    const gitfileParent = prepare("gitfile-parent");
+    mkdirSync(join(gitfileParent, "child"));
+    writeFileSync(join(gitfileParent, "child", "a.js"), "LOCAL_CHILD\n");
+    git(gitfileParent, ["add", "child/a.js"]);
+    git(gitfileParent, ["commit", "-qm", "child"]);
+    renameSync(join(gitfileParent, ".git"), join(gitfileParent, "gitdir"));
+    writeFileSync(join(gitfileParent, ".git"), `gitdir: ${join(gitfileParent, "gitdir")}\n`);
+    fifo(join(gitfileParent, "gitdir", "info", "exclude"));
+    insert("p-gitfile-child", join(gitfileParent, "child"));
+    expect(await attempt("p-gitfile-child", join(gitfileParent, "child"), "HEAD")).toBe("invalid_repository");
+
+    const healthy = prepare("gitfile-ok");
+    mkdirSync(join(healthy, "child"));
+    writeFileSync(join(healthy, "child", "a.js"), "LOCAL_CHILD\n");
+    git(healthy, ["add", "child/a.js"]);
+    git(healthy, ["commit", "-qm", "child"]);
+    renameSync(join(healthy, ".git"), join(healthy, "gitdir"));
+    writeFileSync(join(healthy, ".git"), "gitdir: gitdir\n");
+    insert("p-gitfile-ok", join(healthy, "child"));
+
+    const worktreeMain = prepare("worktree-main");
+    const linkedWorktree = join(dir, "linked-worktree");
+    git(worktreeMain, ["worktree", "add", "-q", linkedWorktree, "HEAD"]);
+    insert("p-linked-worktree", linkedWorktree);
+
+    expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+
+    for (const [id, source] of [
+      ["p-attr-file", attributes],
+      ["p-wt-excludes", excludes],
+      ["p-include-comment", commented],
+    ] as const) {
+      const outcome = await Promise.race([
+        importRepository({ config, store }, project(id, source), "HEAD", "tester")
+          .then((imported) => ({ status: "imported" as const, path: imported.path }))
+          .catch((error: { code?: string }) => ({ status: error.code ?? "error", path: "" })),
+        Bun.sleep(4_000).then(() => ({ status: "blocked", path: "" })),
+      ]);
+      expect(outcome.status).toBe("imported");
+      expect(await Bun.file(join(outcome.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+    }
+
+    const childImport = await importRepository({ config, store }, project("p-gitfile-ok", join(healthy, "child")), "HEAD", "tester");
+    expect(await Bun.file(join(childImport.path, "a.js")).text()).toBe("LOCAL_CHILD\n");
+    expect(await Bun.file(join(childImport.path, "child")).exists()).toBe(false);
+
+    const worktreeImport = await importRepository(
+      { config, store },
+      project("p-linked-worktree", linkedWorktree),
+      null,
+      "tester",
+    );
+    expect(await Bun.file(join(worktreeImport.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+    expect(await attempt("p-linked-worktree-ref", linkedWorktree, "HEAD")).toBe("invalid_repository");
+  });
+
   test("workspaces are read-only by default and owner-writable only on explicit request", async () => {
     const scope = { include: ["**/*.js", "**/*.json", "README.md"], exclude: ["src/routes/media.js"] };
     const inventory = await buildInventory(fixture, { scope, maxFiles: 100, maxFileBytes: 1_000_000 });

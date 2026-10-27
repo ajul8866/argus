@@ -5,7 +5,7 @@ import type { Config } from "../config.ts";
 import type { Store } from "../db/index.ts";
 import { runCommand } from "../harness/process.ts";
 import { AppError, badRequest, now, parseJson, toJson, uid } from "../util.ts";
-import { DEFAULT_EXCLUDES, buildInventory, gitInfo } from "./inventory.ts";
+import { DEFAULT_EXCLUDES, buildInventory, gitArgv, gitInfo } from "./inventory.ts";
 import { assertAuthorizedRoot, canonicalDirectory, createWorkspace } from "./workspace.ts";
 
 const GIT_METADATA_ERROR = "Git metadata must stay inside the repository";
@@ -61,9 +61,11 @@ async function assertRealGitDirectory(path: string): Promise<void> {
   if (info.isSymbolicLink() || !info.isDirectory()) throw invalidGitMetadata();
 }
 
+const GIT_CONFIG_MAX_BYTES = 1_048_576;
+
 // HEAD and loose refs are tiny text files. A larger file is not a ref Git can
 // use, and reading it could block or pull in an unrelated payload.
-async function readSmallGitText(path: string): Promise<string | null> {
+async function readSmallGitText(path: string, maxBytes = 4_096): Promise<string | null> {
   const noFollow = constants.O_NOFOLLOW;
   const nonBlock = constants.O_NONBLOCK;
   if (typeof noFollow !== "number" || typeof nonBlock !== "number" || noFollow === 0 || nonBlock === 0) {
@@ -76,7 +78,7 @@ async function readSmallGitText(path: string): Promise<string | null> {
     return null;
   }
   if (info.isSymbolicLink() || !info.isFile()) throw invalidGitMetadata();
-  if (!Number.isSafeInteger(info.size) || info.size < 0 || info.size > 4_096) throw invalidGitMetadata();
+  if (!Number.isSafeInteger(info.size) || info.size < 0 || info.size > maxBytes) throw invalidGitMetadata();
   let handle;
   try {
     handle = await open(path, constants.O_RDONLY | noFollow | nonBlock);
@@ -144,8 +146,57 @@ async function assertLooseRef(gitDir: string, refName: string, depth: number): P
   await assertLooseRef(gitDir, line.slice("ref:".length).trim(), depth + 1);
 }
 
-async function assertGitDirectoryMetadata(gitDir: string): Promise<void> {
+// Git accepts "[include]" and "[includeIf ...]" with any capitalization and
+// leading whitespace. It opens include.path while parsing config, before a
+// command-line -c override exists. A comment or a value that merely contains
+// the word does not.
+function gitConfigIncludesFile(text: string): boolean {
+  const source = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+  for (const raw of source.split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#") || line.startsWith(";")) continue;
+    if (/^\[include(?:if)?(?:\s|\])/i.test(line)) return true;
+  }
+  return false;
+}
+
+async function assertConfigHasNoInclude(path: string): Promise<void> {
+  const text = await readSmallGitText(path, GIT_CONFIG_MAX_BYTES);
+  if (text && gitConfigIncludesFile(text)) throw invalidGitMetadata();
+}
+
+// commondir is a path relative to this git directory, or an absolute path.
+// Git reads config and exclude files from that other directory before the
+// later equality check can reject it.
+async function linkedGitDirectory(gitDir: string): Promise<string | null> {
+  const text = await readSmallGitText(join(gitDir, "commondir"));
+  if (text === null) return null;
+  const raw = text.split("\n", 1)[0]?.trim() ?? "";
+  if (!raw || raw.includes("\0")) throw invalidGitMetadata();
+  const target = raw.startsWith("/") ? raw : join(gitDir, raw);
+  let info;
+  try {
+    info = await lstat(target);
+  } catch {
+    return null;
+  }
+  if (info.isSymbolicLink() || !info.isDirectory()) throw invalidGitMetadata();
+  return target;
+}
+
+async function assertGitDirectoryMetadata(gitDir: string, seen = new Set<string>()): Promise<void> {
+  let identity;
+  try {
+    identity = await lstat(gitDir);
+  } catch {
+    throw invalidGitMetadata();
+  }
+  if (identity.isSymbolicLink() || !identity.isDirectory()) throw invalidGitMetadata();
+  const mark = `${identity.dev}:${identity.ino}`;
+  if (seen.has(mark)) return;
+  seen.add(mark);
   await assertRegularGitEntry(join(gitDir, "config"));
+  await assertRegularGitEntry(join(gitDir, "config.worktree"));
   await assertRegularGitEntry(join(gitDir, "commondir"));
   await assertRegularGitEntry(join(gitDir, "packed-refs"));
   await assertRegularGitEntry(join(gitDir, "shallow"));
@@ -153,19 +204,42 @@ async function assertGitDirectoryMetadata(gitDir: string): Promise<void> {
   await assertRegularGitEntry(join(gitDir, "info", "exclude"));
   await assertRegularGitEntry(join(gitDir, "info", "attributes"));
   await assertRegularGitEntry(join(gitDir, "info", "grafts"));
+  await assertRegularGitEntry(join(gitDir, "info", "sparse-checkout"));
   await assertRealGitDirectory(join(gitDir, "refs"));
+  await assertConfigHasNoInclude(join(gitDir, "config"));
+  await assertConfigHasNoInclude(join(gitDir, "config.worktree"));
   const head = await readSmallGitText(join(gitDir, "HEAD"));
   const headLine = head?.split("\n", 1)[0] ?? "";
   if (headLine.startsWith("ref:")) await assertLooseRef(gitDir, headLine.slice("ref:".length).trim(), 0);
+  const common = await linkedGitDirectory(gitDir);
+  if (common) await assertGitDirectoryMetadata(common, seen);
+}
+
+// A gitfile is "gitdir: <path>". The path is relative to the file's directory.
+// Git follows it and then opens metadata in that directory.
+async function assertGitFileTarget(gitFilePath: string): Promise<void> {
+  const text = await readSmallGitText(gitFilePath);
+  const line = text?.split("\n", 1)[0] ?? "";
+  if (!line.startsWith("gitdir: ")) return;
+  const raw = line.slice("gitdir: ".length).trim();
+  if (!raw || raw.includes("\0")) throw invalidGitMetadata();
+  const target = raw.startsWith("/") ? raw : join(dirname(gitFilePath), raw);
+  let info;
+  try {
+    info = await lstat(target);
+  } catch {
+    return;
+  }
+  if (info.isSymbolicLink() || !info.isDirectory()) throw invalidGitMetadata();
+  await assertGitDirectoryMetadata(target);
 }
 
 // A pipe or symlink named .git would block or escape before git runs. A gitfile
 // is a regular file; ref imports reject it separately so worktree snapshots can
-// still copy the selected files. Metadata inside the discovered git directory
-// is checked too: archive and rev-parse open those paths themselves.
+// still copy the selected files. The directory a gitfile names, including one
+// found by walking parents, is checked before Git starts.
 async function assertLocalGitReadable(sourceRoot: string): Promise<void> {
   let current = sourceRoot;
-  let atSource = true;
   while (true) {
     const gitPath = join(current, ".git");
     let info;
@@ -175,18 +249,14 @@ async function assertLocalGitReadable(sourceRoot: string): Promise<void> {
       const parent = dirname(current);
       if (parent === current) return;
       current = parent;
-      atSource = false;
       continue;
     }
     if (info.isDirectory()) {
       await assertGitDirectoryMetadata(gitPath);
       return;
     }
-    if (info.isSymbolicLink()) {
-      if (atSource) throw invalidGitMetadata();
-      return;
-    }
     if (!info.isFile()) throw invalidGitMetadata();
+    await assertGitFileTarget(gitPath);
     return;
   }
 }
@@ -238,11 +308,11 @@ async function prepareRefArchive(sourceRoot: string): Promise<{ toplevel: string
   if (localGit && (localGit.isSymbolicLink() || !localGit.isDirectory())) throw invalidGitMetadata();
   const env = gitCommandEnv();
   const gitDirResult = await runCommand(
-    ["git", "-C", sourceRoot, "rev-parse", "--absolute-git-dir"],
+    gitArgv(["-C", sourceRoot, "rev-parse", "--absolute-git-dir"]),
     { env, timeoutMs: 20_000 },
   );
   const topResult = await runCommand(
-    ["git", "-C", sourceRoot, "rev-parse", "--show-toplevel"],
+    gitArgv(["-C", sourceRoot, "rev-parse", "--show-toplevel"]),
     { env, timeoutMs: 20_000 },
   );
   if (
@@ -266,7 +336,7 @@ async function prepareRefArchive(sourceRoot: string): Promise<{ toplevel: string
   // archive reads objects from another repository. The common directory Git
   // will use has to be the git directory checked above.
   const commonResult = await runCommand(
-    ["git", "-C", sourceRoot, "rev-parse", "--git-common-dir"],
+    gitArgv(["-C", sourceRoot, "rev-parse", "--git-common-dir"]),
     { env, timeoutMs: 20_000 },
   );
   if (commonResult.code !== 0 || commonResult.timedOut) throw invalidGitMetadata();
@@ -331,7 +401,7 @@ export async function importRepository(
       if (!git.commit) throw badRequest("Git refs require a git repository");
       const env = gitCommandEnv();
       const resolved = await runCommand(
-        ["git", "-C", sourceRoot, "rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`],
+        gitArgv(["-C", sourceRoot, "rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`]),
         { env, timeoutMs: 20_000 },
       );
       if (resolved.code !== 0 || resolved.timedOut) throw badRequest(`Unknown git ref: ${ref}`);
@@ -342,7 +412,7 @@ export async function importRepository(
       const extractedRoot = join(staging, "source");
       await mkdir(extractedRoot, { mode: 0o700 });
       const archived = await runCommand(
-        ["git", "-C", refArchive?.toplevel ?? sourceRoot, "archive", "--format=tar", "--output", archivePath, treeish],
+        gitArgv(["-C", refArchive?.toplevel ?? sourceRoot, "archive", "--format=tar", "--output", archivePath, treeish]),
         { env, timeoutMs: 180_000 },
       );
       if (archived.code !== 0 || archived.timedOut) {

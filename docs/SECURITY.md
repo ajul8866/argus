@@ -49,8 +49,13 @@ LLM agents. Use it only on repositories you are authorized to assess.
   environment variables are rejected or ignored, so a ref import cannot copy
   commits stored outside that work tree. A pipe or symlink in the metadata Git
   reads before that archive, including the common directory, packed refs, the
-  current ref, and exclude or attribute files, is rejected before Git starts.
-  A subdirectory of a repository archives only that subdirectory.
+  current ref, exclude or attribute files, `config.worktree`, and
+  sparse-checkout, is rejected before Git starts. A config `include` or
+  `includeIf`, including one reached through `commondir` or a gitfile, is
+  rejected the same way. `core.excludesFile` and `core.attributesFile` are
+  forced to `/dev/null` for these Git commands. A `.git` symlink discovered
+  while walking parent directories is rejected. A subdirectory of a repository
+  archives only that subdirectory.
 
 ## Execution isolation
 

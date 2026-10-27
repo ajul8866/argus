@@ -12,8 +12,8 @@ import { EventLog } from "../src/events.ts";
 import { EvidenceStore } from "../src/orchestrator/evidence.ts";
 import { ReportService } from "../src/reports/generator.ts";
 import { buildInventory, gitInfo } from "../src/repo/inventory.ts";
-import { importRepository } from "../src/repo/import.ts";
-import { assertAuthorizedRoot, canonicalDirectory, createWorkspace, readCappedRegularFile, readScopedFile, verifyQuote } from "../src/repo/workspace.ts";
+import { importRepository, runPinnedGit } from "../src/repo/import.ts";
+import { GIT_DIRECTORY_ERROR, GIT_METADATA_ERROR, GIT_OBJECTS_ERROR, assertAuthorizedRoot, canonicalDirectory, createWorkspace, openWorktreeGit, readCappedRegularFile, readScopedFile, verifyQuote } from "../src/repo/workspace.ts";
 import { createScopeMatcher, globToRegExp, matchesScope, extractJson, sha256 } from "../src/util.ts";
 import { redactSecrets } from "../src/security/redact.ts";
 import { credentialEnvironment, decryptSecret, encryptSecret, type StoredCredential } from "../src/security/credentials.ts";
@@ -899,6 +899,189 @@ describe("repository import", () => {
     const authorized = await assertAuthorizedRoot(app, [real]);
     expect(authorized).toBe(realpathSync(app));
     expect((await readScopedFile(authorized, "a.js", { include: ["**/*"], exclude: [] })).content).toBe("SECRET_BOUNDARY_SENTINEL");
+  });
+
+  function gitExec(directory: string, args: string[]): string {
+    const result = Bun.spawnSync(["git", "-C", directory, ...args], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_AUTHOR_NAME: "t",
+        GIT_AUTHOR_EMAIL: "t@example.com",
+        GIT_COMMITTER_NAME: "t",
+        GIT_COMMITTER_EMAIL: "t@example.com",
+      },
+    });
+    if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
+    return new TextDecoder().decode(result.stdout).trim();
+  }
+
+  function initRepo(directory: string, files: Record<string, string>): void {
+    mkdirSync(directory, { recursive: true });
+    for (const [name, content] of Object.entries(files)) {
+      const path = join(directory, name);
+      mkdirSync(join(path, ".."), { recursive: true });
+      writeFileSync(path, content);
+    }
+    gitExec(directory, ["init", "-q"]);
+    gitExec(directory, ["config", "user.email", "t@example.com"]);
+    gitExec(directory, ["config", "user.name", "t"]);
+    gitExec(directory, ["add", "-A"]);
+    gitExec(directory, ["commit", "-qm", "init"]);
+  }
+
+  test("a git ref import does not follow a .git symlink or gitdir file", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "argus-git-outside-"));
+    try {
+      initRepo(outside, { "secret.js": "SECRET_GITDIR_SENTINEL" });
+      const source = join(dir, "inside");
+      initRepo(source, { "a.js": "INSIDE_CONTENT" });
+      const limited = { ...config, allowedRoots: [dir] };
+      const requested = {
+        ...project,
+        source_path: source,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      };
+      renameSync(join(source, ".git"), join(source, ".git-real"));
+      symlinkSync(join(outside, ".git"), join(source, ".git"));
+      await expect(importRepository({ config: limited, store }, requested, "HEAD", "tester"))
+        .rejects.toMatchObject({ code: "invalid_repository", message: GIT_METADATA_ERROR });
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+
+      rmSync(join(source, ".git"));
+      writeFileSync(join(source, ".git"), `gitdir: ${join(outside, ".git")}\n`);
+      await expect(importRepository({ config: limited, store }, requested, "HEAD", "tester"))
+        .rejects.toMatchObject({ code: "invalid_repository", message: GIT_METADATA_ERROR });
+
+      rmSync(join(source, ".git"));
+      symlinkSync(join(outside, ".git"), join(source, ".git"));
+      const imported = await importRepository({ config: limited, store }, requested, null, "tester");
+      expect(imported.commit_sha).toBeNull();
+      expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("INSIDE_CONTENT");
+      expect(existsSync(join(imported.path, "secret.js"))).toBe(false);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a git ref import rejects an object store outside the allowed root", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "argus-git-objects-"));
+    try {
+      initRepo(outside, { "hidden.js": "SECRET_ALT_SENTINEL" });
+      const alternate = join(dir, "alternate-repo");
+      initRepo(alternate, { "a.js": "INSIDE_CONTENT" });
+      mkdirSync(join(alternate, ".git/objects/info"), { recursive: true });
+      writeFileSync(join(alternate, ".git/objects/info/alternates"), `${join(outside, ".git/objects")}\n`);
+      const limited = { ...config, allowedRoots: [dir] };
+      const requested = {
+        ...project,
+        source_path: alternate,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      };
+      await expect(importRepository({ config: limited, store }, requested, "HEAD", "tester"))
+        .rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+
+      const linked = join(dir, "objects-link");
+      initRepo(linked, { "a.js": "INSIDE_CONTENT" });
+      renameSync(join(linked, ".git/objects"), join(linked, ".git/objects-real"));
+      symlinkSync(join(outside, ".git/objects"), join(linked, ".git/objects"));
+      await expect(importRepository({ config: limited, store }, { ...requested, source_path: linked }, "HEAD", "tester"))
+        .rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a subdirectory ref import archives only that subdirectory", async () => {
+    const parent = join(dir, "mono");
+    initRepo(parent, { "secret.js": "SECRET_PARENT_SENTINEL", "child/a.js": "CHILD_CONTENT" });
+    const limited = { ...config, allowedRoots: [dir] };
+    const child = join(parent, "child");
+    const imported = await importRepository({
+      config: limited,
+      store,
+    }, {
+      ...project,
+      source_path: child,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    }, "HEAD", "tester");
+    expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("CHILD_CONTENT");
+    expect(existsSync(join(imported.path, "secret.js"))).toBe(false);
+
+    mkdirSync(join(parent, ".git/objects/info"), { recursive: true });
+    const outside = mkdtempSync(join(tmpdir(), "argus-git-parent-alt-"));
+    try {
+      initRepo(outside, { "hidden.js": "SECRET_PARENT_ALT" });
+      writeFileSync(join(parent, ".git/objects/info/alternates"), `${join(outside, ".git/objects")}\n`);
+      await expect(importRepository({
+        config: limited,
+        store,
+      }, {
+        ...project,
+        source_path: child,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      }, "HEAD", "tester")).rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+
+    const onlyChild = join(dir, "nested-parent", "child");
+    initRepo(join(dir, "nested-parent"), { "secret.js": "SECRET_OUTSIDE_GIT", "child/a.js": "NESTED_CHILD" });
+    await expect(importRepository({
+      config: { ...config, allowedRoots: [onlyChild] },
+      store,
+    }, {
+      ...project,
+      source_path: onlyChild,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    }, "HEAD", "tester")).rejects.toMatchObject({ code: "invalid_repository", message: GIT_DIRECTORY_ERROR });
+  });
+
+  test("a pinned git directory ignores a symlink that replaces .git", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "argus-git-swap-"));
+    try {
+      const source = join(dir, "pinned");
+      initRepo(source, { "a.js": "INSIDE_CONTENT" });
+      initRepo(outside, { "secret.js": "SECRET_GITDIR_SENTINEL" });
+      const imported = await importRepository({
+        config: { ...config, allowedRoots: [dir] },
+        store,
+      }, {
+        ...project,
+        source_path: source,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      }, "HEAD", "tester");
+      expect(imported.commit_sha).toMatch(/^[0-9a-f]{40}$/);
+      expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("INSIDE_CONTENT");
+      expect(existsSync(join(imported.path, "secret.js"))).toBe(false);
+      const opened = await openWorktreeGit(source, [dir]);
+      expect(opened.kind).toBe("pinned");
+      if (opened.kind !== "pinned") return;
+      try {
+        renameSync(join(source, ".git"), join(source, ".git.bak"));
+        symlinkSync(join(outside, ".git"), join(source, ".git"));
+        const output = join(dir, "pinned.tar");
+        const archived = await runPinnedGit(opened.git, ["archive", "--format=tar", "--output", output, "HEAD"], 20_000);
+        expect(archived.code).toBe(0);
+        const listed = new TextDecoder().decode(Bun.spawnSync(["tar", "-tf", output], { stdout: "pipe" }).stdout);
+        expect(listed).toContain("a.js");
+        expect(listed).not.toContain("secret.js");
+      } finally {
+        await opened.git.close();
+      }
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });
 

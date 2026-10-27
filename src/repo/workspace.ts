@@ -1,6 +1,6 @@
 import { constants, fstatSync } from "node:fs";
 import { chmod, lstat, mkdir, open, readlink, realpath, writeFile } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { AppError, createScopeMatcher, matchesScope, normalizePath, safeJoin, sha256 } from "../util.ts";
 import type { Scope } from "../util.ts";
 import type { Inventory } from "./inventory.ts";
@@ -444,4 +444,206 @@ export async function assertAuthorizedRoot(path: string, allowedRoots: string[])
     "repository_not_authorized",
     "This folder is outside the configured repository locations. Choose a folder from Browse folders.",
   );
+}
+
+export const GIT_METADATA_ERROR = "Repository git metadata must be a real .git directory";
+export const GIT_DIRECTORY_ERROR = "Repository git directory must stay inside an allowed source location";
+export const GIT_OBJECTS_ERROR = "Repository git objects must stay inside an allowed source location";
+
+export type PinnedGitDir = {
+  fd: number;
+  path: string;
+  close: () => Promise<void>;
+};
+
+function noFollowFlags(): { directory: number; file: number } {
+  const noFollow = constants.O_NOFOLLOW;
+  const nonBlock = constants.O_NONBLOCK;
+  const directoryFlag = constants.O_DIRECTORY;
+  if (
+    typeof noFollow !== "number" ||
+    typeof nonBlock !== "number" ||
+    typeof directoryFlag !== "number" ||
+    noFollow === 0 ||
+    nonBlock === 0 ||
+    directoryFlag === 0
+  ) {
+    throw new AppError(400, "invalid_repository", GIT_METADATA_ERROR);
+  }
+  return {
+    directory: constants.O_RDONLY | directoryFlag | noFollow | nonBlock,
+    file: constants.O_RDONLY | noFollow | nonBlock,
+  };
+}
+
+function retainGitDir(handle: OpenedFile, path: string): PinnedGitDir {
+  let closed = false;
+  return {
+    fd: handle.fd,
+    path,
+    close: async () => {
+      if (closed) return;
+      closed = true;
+      await handle.close();
+    },
+  };
+}
+
+// `git --git-dir` follows a symlink. Hold the directory descriptor and make git
+// use that inode. Also reject an object store that points outside the allowed
+// roots: `objects` itself can be a symlink, and `objects/info/alternates` can
+// name another repository's objects.
+export async function openAuthorizedGitDirectory(path: string, allowedRoots: string[]): Promise<PinnedGitDir> {
+  const flags = noFollowFlags();
+  let authorized: string;
+  try {
+    authorized = await assertAuthorizedRoot(path, allowedRoots);
+  } catch (error) {
+    if (error instanceof AppError && (error.code === "invalid_repository" || error.code === "repository_not_authorized")) {
+      throw new AppError(400, "invalid_repository", GIT_DIRECTORY_ERROR);
+    }
+    throw error;
+  }
+  if (basename(authorized) !== ".git") throw new AppError(400, "invalid_repository", GIT_DIRECTORY_ERROR);
+  let handle: OpenedFile;
+  try {
+    handle = await open(authorized, flags.directory);
+  } catch {
+    throw new AppError(400, "invalid_repository", GIT_DIRECTORY_ERROR);
+  }
+  let handedOff = false;
+  try {
+    const info = await handle.stat();
+    const opened = await openedRealPath(handle.fd);
+    if (!info.isDirectory() || opened !== authorized) {
+      throw new AppError(400, "invalid_repository", GIT_DIRECTORY_ERROR);
+    }
+    const pinned = retainGitDir(handle, authorized);
+    handedOff = true;
+    try {
+      await assertAuthorizedGitAlternates(pinned, allowedRoots);
+    } catch (error) {
+      await pinned.close().catch(() => undefined);
+      throw error;
+    }
+    return pinned;
+  } catch (error) {
+    if (!handedOff) await handle.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+export async function openWorktreeGit(
+  worktree: string,
+  allowedRoots: string[],
+): Promise<{ kind: "missing" } | { kind: "unsafe" } | { kind: "pinned"; git: PinnedGitDir }> {
+  const flags = noFollowFlags();
+  const gitPath = join(worktree, ".git");
+  let handle: OpenedFile;
+  try {
+    handle = await open(gitPath, flags.directory);
+  } catch (error) {
+    if (systemErrorCode(error) === "ENOENT") return { kind: "missing" };
+    return { kind: "unsafe" };
+  }
+  let handedOff = false;
+  try {
+    const info = await handle.stat();
+    const opened = await openedRealPath(handle.fd);
+    if (!info.isDirectory() || opened !== gitPath || basename(opened) !== ".git") {
+      await handle.close();
+      return { kind: "unsafe" };
+    }
+    let authorized = gitPath;
+    try {
+      authorized = await assertAuthorizedRoot(gitPath, allowedRoots);
+    } catch {
+      await handle.close();
+      return { kind: "unsafe" };
+    }
+    if (authorized !== opened) {
+      await handle.close();
+      return { kind: "unsafe" };
+    }
+    const pinned = retainGitDir(handle, opened);
+    handedOff = true;
+    try {
+      await assertAuthorizedGitAlternates(pinned, allowedRoots);
+    } catch (error) {
+      await pinned.close().catch(() => undefined);
+      throw error;
+    }
+    return { kind: "pinned", git: pinned };
+  } catch (error) {
+    if (!handedOff) await handle.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+async function openAt(rootFd: number, parts: string[], flags: number): Promise<OpenedFile | null> {
+  const directoryFlags = noFollowFlags().directory;
+  const prefix = await descriptorPrefix(rootFd);
+  let current: OpenedFile | undefined = await open(`${prefix}/${rootFd}`, constants.O_RDONLY | constants.O_DIRECTORY);
+  try {
+    for (let index = 0; index < parts.length; index += 1) {
+      const name = parts[index];
+      if (!name) throw new AppError(400, "invalid_repository", GIT_OBJECTS_ERROR);
+      let next: OpenedFile;
+      try {
+        next = await openChild(prefix, current, name, index === parts.length - 1 ? flags : directoryFlags);
+      } catch (error) {
+        const code = systemErrorCode(error);
+        if (code === "ENOENT") return null;
+        if (code === "ELOOP" || code === "ENOTDIR") throw new AppError(400, "invalid_repository", GIT_OBJECTS_ERROR);
+        throw error;
+      }
+      await current.close();
+      current = next;
+    }
+    const opened = current;
+    current = undefined;
+    return opened;
+  } finally {
+    await current?.close().catch(() => undefined);
+  }
+}
+
+export async function assertAuthorizedGitAlternates(git: PinnedGitDir, allowedRoots: string[]): Promise<void> {
+  let handle: OpenedFile | null;
+  try {
+    handle = await openAt(git.fd, ["objects", "info", "alternates"], noFollowFlags().file);
+  } catch (error) {
+    if (error instanceof AppError && error.code === "out_of_scope") {
+      throw new AppError(400, "invalid_repository", GIT_OBJECTS_ERROR);
+    }
+    throw error;
+  }
+  if (!handle) return;
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || !Number.isSafeInteger(info.size) || info.size < 0 || info.size > 65_536) {
+      throw new AppError(400, "invalid_repository", GIT_OBJECTS_ERROR);
+    }
+    const buffer = Buffer.alloc(info.size);
+    let offset = 0;
+    while (offset < info.size) {
+      const { bytesRead } = await handle.read(buffer, offset, info.size - offset, offset);
+      if (bytesRead === 0) throw new AppError(400, "invalid_repository", GIT_OBJECTS_ERROR);
+      offset += bytesRead;
+    }
+    const text = buffer.toString("latin1");
+    if (text.includes("\0")) throw new AppError(400, "invalid_repository", GIT_OBJECTS_ERROR);
+    const lines = text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0);
+    if (lines.length > 100) throw new AppError(400, "invalid_repository", GIT_OBJECTS_ERROR);
+    const objectsDir = join(git.path, "objects");
+    for (const line of lines) {
+      try {
+        await assertAuthorizedRoot(resolve(objectsDir, line), allowedRoots);
+      } catch {
+        throw new AppError(400, "invalid_repository", GIT_OBJECTS_ERROR);
+      }
+    }
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
 }

@@ -1,11 +1,88 @@
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import type { Config } from "../config.ts";
 import type { Store } from "../db/index.ts";
 import { runCommand } from "../harness/process.ts";
-import { badRequest, now, parseJson, toJson, uid } from "../util.ts";
+import { AppError, badRequest, now, parseJson, toJson, uid } from "../util.ts";
 import { DEFAULT_EXCLUDES, buildInventory, gitInfo } from "./inventory.ts";
-import { assertAuthorizedRoot, createWorkspace } from "./workspace.ts";
+import {
+  GIT_DIRECTORY_ERROR,
+  GIT_METADATA_ERROR,
+  assertAuthorizedRoot,
+  createWorkspace,
+  openAuthorizedGitDirectory,
+  openWorktreeGit,
+  type PinnedGitDir,
+} from "./workspace.ts";
+
+function gitEnv(): Record<string, string> {
+  return { PATH: process.env.PATH ?? "/usr/bin:/bin" };
+}
+
+function pinnedGitDirFlag(): string {
+  if (existsSync("/proc/self/fd")) return "--git-dir=/proc/self/fd/3";
+  if (existsSync("/dev/fd")) return "--git-dir=/dev/fd/3";
+  throw new AppError(400, "invalid_repository", GIT_METADATA_ERROR);
+}
+
+// Git reads this descriptor, not the path. Replacing `.git` with a symlink
+// after the open does not change the inode git archives.
+export async function runPinnedGit(
+  git: PinnedGitDir,
+  args: string[],
+  timeoutMs: number,
+): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> {
+  return runCommand(["git", pinnedGitDirFlag(), ...args], {
+    timeoutMs,
+    env: gitEnv(),
+    extraFd: git.fd,
+  });
+}
+
+async function pinnedGitInfo(git: PinnedGitDir): Promise<{ commit: string | null; branch: string | null }> {
+  const commit = await runPinnedGit(git, ["rev-parse", "HEAD"], 20_000);
+  const branch = await runPinnedGit(git, ["rev-parse", "--abbrev-ref", "HEAD"], 20_000);
+  return {
+    commit: commit.code === 0 ? commit.stdout.trim() || null : null,
+    branch: branch.code === 0 ? branch.stdout.trim() || null : null,
+  };
+}
+
+function archiveTreeish(commit: string, gitPath: string, sourceRoot: string): string {
+  if (!/^[0-9a-f]{7,64}$/i.test(commit) || basename(gitPath) !== ".git") {
+    throw new AppError(400, "invalid_repository", GIT_DIRECTORY_ERROR);
+  }
+  const prefix = relative(dirname(gitPath), sourceRoot).replaceAll("\\", "/");
+  if (prefix === "") return commit;
+  const parts = prefix.split("/");
+  if (
+    prefix.startsWith("../") ||
+    prefix === ".." ||
+    prefix.startsWith("/") ||
+    prefix.includes(":") ||
+    prefix.includes("\0") ||
+    parts.includes("..") ||
+    parts.includes(".") ||
+    parts.some((part) => part.length === 0)
+  ) {
+    throw new AppError(400, "invalid_repository", GIT_DIRECTORY_ERROR);
+  }
+  return `${commit}:${prefix}`;
+}
+
+async function discoverGitDirectory(sourceRoot: string, allowedRoots: string[]): Promise<PinnedGitDir | null> {
+  const discovered = await runCommand(
+    ["git", "-C", sourceRoot, "rev-parse", "--absolute-git-dir"],
+    { timeoutMs: 20_000, env: gitEnv() },
+  );
+  if (discovered.code !== 0 || discovered.timedOut) return null;
+  const printed = discovered.stdout.trim();
+  if (!printed || printed.includes("\0") || printed.includes("\n")) {
+    throw new AppError(400, "invalid_repository", GIT_DIRECTORY_ERROR);
+  }
+  return openAuthorizedGitDirectory(printed.startsWith("/") ? printed : resolve(sourceRoot, printed), allowedRoots);
+}
 
 export async function importRepository(
   deps: { config: Config; store: Store },
@@ -23,14 +100,15 @@ export async function importRepository(
   imported_at: string;
 }> {
   const sourceRoot = await assertAuthorizedRoot(project.source_path, deps.config.allowedRoots);
-  const git = await gitInfo(sourceRoot);
+  const localGit = await openWorktreeGit(sourceRoot, deps.config.allowedRoots);
+  let pinnedGit: PinnedGitDir | null = localGit.kind === "pinned" ? localGit.git : null;
   const scope = {
     include: parseJson<string[]>(project.scope_include, ["**/*"]),
     exclude: [...new Set([...DEFAULT_EXCLUDES, ...parseJson<string[]>(project.scope_exclude, [])])],
   };
   let importRoot = sourceRoot;
-  let commit = git.commit;
-  let branch = git.branch;
+  let commit: string | null = null;
+  let branch: string | null = null;
   const snapshotBase = join(
     deps.config.dataDir,
     "repos",
@@ -39,29 +117,45 @@ export async function importRepository(
   );
   let staging: string | null = null;
   try {
+    if (localGit.kind === "pinned" && pinnedGit) {
+      const git = await pinnedGitInfo(pinnedGit);
+      commit = git.commit;
+      branch = git.branch;
+    } else if (localGit.kind === "missing" && !ref) {
+      const git = await gitInfo(sourceRoot);
+      commit = git.commit;
+      branch = git.branch;
+    }
     if (ref) {
-      if (!git.commit) throw badRequest("Git refs require a git repository");
+      if (localGit.kind === "unsafe") throw new AppError(400, "invalid_repository", GIT_METADATA_ERROR);
       if (!/^[A-Za-z0-9][A-Za-z0-9._/@^~:-]{0,199}$/.test(ref)) {
         throw badRequest("Invalid git ref");
       }
-      const resolved = await runCommand(
-        ["git", "-C", sourceRoot, "rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`],
-        { timeoutMs: 20_000 },
+      if (!pinnedGit) pinnedGit = await discoverGitDirectory(sourceRoot, deps.config.allowedRoots);
+      if (!pinnedGit) throw badRequest("Git refs require a git repository");
+      const resolved = await runPinnedGit(
+        pinnedGit,
+        ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`],
+        20_000,
       );
-      if (resolved.code !== 0) throw badRequest(`Unknown git ref: ${ref}`);
+      if (resolved.code !== 0 || resolved.timedOut) throw badRequest(`Unknown git ref: ${ref}`);
       commit = resolved.stdout.trim();
       staging = await mkdtemp(join(deps.config.dataDir, "repo-import-"));
       const archivePath = join(staging, "snapshot.tar");
       const extractedRoot = join(staging, "source");
       await mkdir(extractedRoot, { mode: 0o700 });
-      const archived = await runCommand(
-        ["git", "-C", sourceRoot, "archive", "--format=tar", "--output", archivePath, commit],
-        { timeoutMs: 180_000 },
+      const archived = await runPinnedGit(
+        pinnedGit,
+        ["archive", "--format=tar", "--output", archivePath, archiveTreeish(commit, pinnedGit.path, sourceRoot)],
+        180_000,
       );
       if (archived.code !== 0 || archived.timedOut) {
         throw badRequest(`Failed to archive ${ref}: ${archived.stderr.slice(0, 500)}`);
       }
-      const extracted = await runCommand(["tar", "-xf", archivePath, "-C", extractedRoot], { timeoutMs: 180_000 });
+      const extracted = await runCommand(["tar", "-xf", archivePath, "-C", extractedRoot], {
+        timeoutMs: 180_000,
+        env: gitEnv(),
+      });
       if (extracted.code !== 0 || extracted.timedOut) {
         throw badRequest(`Failed to extract ${ref}: ${extracted.stderr.slice(0, 500)}`);
       }
@@ -88,6 +182,7 @@ export async function importRepository(
     await rm(snapshotBase, { recursive: true, force: true });
     throw error;
   } finally {
+    await pinnedGit?.close().catch(() => undefined);
     if (staging) await rm(staging, { recursive: true, force: true });
   }
   const inventory = await buildInventory(importRoot, {

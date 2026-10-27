@@ -307,8 +307,8 @@ function looseSymrefTarget(text: string): string | null {
   let index = "ref:".length;
   while (index < body.length && isGitRefSpace(body[index] ?? "")) index += 1;
   const target = body.slice(index);
-  // Git skips every isspace byte after "ref:", so the target can start on a
-  // later line. An interior break is not a ref Git can resolve.
+  // Git skips every isspace byte after "ref:", including a line break, then
+  // reads one ref. An interior break is not a ref Git resolves.
   if (target.includes("\n") || target.includes("\r")) return null;
   return target ? target : null;
 }
@@ -328,24 +328,6 @@ function isCurrentWorktreeRef(name: string): boolean {
     if (char >= "A" && char <= "Z") continue;
     if (char === "-" || char === "_") continue;
     return false;
-async function looseRefLine(gitDir: string, refName: string): Promise<string | null> {
-  const parts = gitRefParts(refName);
-  let path = gitDir;
-  for (const part of parts) path = join(path, part);
-  const text = await readSmallGitText(path);
-  return text?.split("\n", 1)[0] ?? null;
-}
-
-// Pseudorefs and the per-worktree ref namespaces live beside HEAD. Shared
-// refs such as branches and tags live in the common directory.
-function isWorktreePrivateRef(refName: string): boolean {
-  if (refName.startsWith("refs/bisect/") || refName.startsWith("refs/worktree/") || refName.startsWith("refs/rewritten/")) {
-    return true;
-  }
-  if (!refName || refName.includes("/")) return false;
-  for (const char of refName) {
-    const upper = char >= "A" && char <= "Z";
-    if (!upper && char !== "-" && char !== "_") return false;
   }
   return true;
 }
@@ -389,43 +371,29 @@ async function readLooseRefLine(gitDir: string, refName: string): Promise<string
 }
 
 // `--abbrev-ref HEAD` shortens the ref the symref chain resolves to and opens
-// that name's loose-ref candidates. A linked worktree reads shared refs from
-// its common directory, so a same-named file in the worktree git directory
-// must not end the chain.
+// that name's loose-ref candidates. A linked worktree reads a shared ref from
+// its common directory, so a same-named file in the worktree git directory is
+// not that ref. A private ref stays beside the worktree HEAD even when the
+// previous hop was shared. `main-worktree/<private>` is the main worktree's
+// file and is read from the common directory under the bare name.
 async function addSymrefAbbreviations(
   gitDir: string,
   names: Set<string>,
   follow: readonly SymrefFollow[],
-  sharedRefsElsewhere: boolean,
-// Git keeps only HEAD and a few namespaces in a linked worktree's own
-// directory; every other ref is read from the common directory, so a
-// same-named file in the worktree directory is a decoy Git never opens.
-function isPerWorktreeRef(refName: string): boolean {
-  return refName === "HEAD"
-    || refName.startsWith("refs/bisect/")
-    || refName.startsWith("refs/worktree/")
-    || refName.startsWith("refs/rewritten/");
-}
-
-async function addSymrefAbbreviations(
-  gitDir: string,
   common: string | null,
-  names: Set<string>,
-  follow: readonly SymrefFollow[],
-): Promise<SymrefFollow[]> {
-  const carry: SymrefFollow[] = [];
+): Promise<void> {
   const pending = [...follow];
   const visited = new Set<string>();
   while (pending.length > 0) {
     const item = pending.pop();
     if (!item || visited.has(item.name)) continue;
     visited.add(item.name);
-    const store = common && !isPerWorktreeRef(item.name) ? common : gitDir;
+    const mainBare = mainWorktreeBareRef(item.name);
+    const store = common === null || (mainBare === null && isCurrentWorktreeRef(item.name))
+      ? gitDir
+      : common;
     const line = await readLooseRefLine(store, item.name);
-    if (line === null) {
-      carry.push(item);
-      continue;
-    }
+    if (line === null) continue;
     const target = looseSymrefTarget(line);
     if (!target) continue;
     if (item.depth >= SYMREF_READ_LIMIT - 1) continue;
@@ -433,50 +401,12 @@ async function addSymrefAbbreviations(
     for (const shortName of gitShortRefNames(target)) names.add(shortName);
     pending.push({ name: target, depth: item.depth + 1 });
   }
-  return carry;
 }
 
 // Every import runs `rev-parse HEAD` and `--abbrev-ref HEAD` before the
 // requested revision is verified. Those commands open the same six candidates
 // for HEAD and for each branch named by the HEAD symref chain. A linked
-// worktree stores shared refs in the common directory. A same-named file in
-// the worktree git directory is not the file Git opens.
-// `main-worktree/HEAD` and `main-worktree/refs/bisect/...` name the main
-// worktree's private refs. Git reads them from the common directory under
-// the bare name, not from a `main-worktree` directory.
-function mainWorktreeRefName(refName: string): string | null {
-  const prefix = "main-worktree/";
-  if (!refName.startsWith(prefix)) return null;
-  const bare = refName.slice(prefix.length);
-  return isWorktreePrivateRef(bare) ? bare : null;
-}
-
-// `--abbrev-ref HEAD` follows the symref chain and shortens the final ref.
-// A linked worktree stores shared refs in the common directory. The next hop
-// of a private ref is still the file next to HEAD.
-async function finalHeadRef(headDir: string, refRoot: string): Promise<string | null> {
-  const head = await readSmallGitText(join(headDir, "HEAD"));
-  let line = head?.split("\n", 1)[0] ?? "";
-  let full: string | null = null;
-  const seen = new Set<string>();
-  for (let depth = 0; line.startsWith("ref:"); depth += 1) {
-    if (depth > 8) throw invalidGitMetadata();
-    const target = line.slice("ref:".length).trim();
-    if (!target || seen.has(target)) throw invalidGitMetadata();
-    seen.add(target);
-    full = target;
-    const bare = mainWorktreeRefName(target);
-    const next = await looseRefLine(bare ? refRoot : isWorktreePrivateRef(target) ? headDir : refRoot, bare ?? target);
-    if (next === null) break;
-    line = next;
-  }
-  return full;
-}
-
-// Every import runs `rev-parse HEAD` and `--abbrev-ref HEAD` before the
-// requested revision is verified. Those commands open the six candidates for
-// HEAD and for every abbreviation of the final branch. A linked worktree
-// stores the branch refs in the common directory, so that directory is probed too.
+// worktree stores shared refs in the common directory.
 async function assertGitLookups(
   gitDir: string,
   ref: string | null,
@@ -496,17 +426,13 @@ async function assertGitLookups(
   seen.add(mark);
   const names = new Set<string>(["HEAD", ...inherited]);
   if (ref) {
-    const base = revisionRefName(ref);
-    if (base) names.add(base);
+    for (const base of revisionProbeNames(ref)) names.add(base);
   }
-  // Git reads commondir once, from the git directory the command started in.
-  // A commondir inside the common directory is not a link Git follows, and the
-  // shared refs on the chain are read there in place.
-  const common = isStartedGitDirectory ? await linkedGitDirectory(gitDir) : null;
-  const sharedRefsElsewhere = common !== null && await distinctGitDirectory(gitDir, common);
-  const carry = await addSymrefAbbreviations(gitDir, names, follow, sharedRefsElsewhere);
+  const linked = await linkedGitDirectory(gitDir);
+  const common = linked !== null && await distinctGitDirectory(gitDir, linked) ? linked : null;
+  await addSymrefAbbreviations(gitDir, names, follow, common);
   for (const name of names) await assertRequestedRevision(gitDir, name);
-  if (common) await assertGitLookups(common, ref, [...names], seen, [{ name: "HEAD", depth: 0 }, ...carry], false);
+  if (common) await assertGitLookups(common, ref, [...names], seen, [{ name: "HEAD", depth: 0 }]);
 }
 
 async function distinctGitDirectory(left: string, right: string): Promise<boolean> {
@@ -517,14 +443,6 @@ async function distinctGitDirectory(left: string, right: string): Promise<boolea
     if (error instanceof AppError) throw error;
     throw invalidGitMetadata();
   }
-  const common = await linkedGitDirectory(gitDir);
-  const finalRef = await finalHeadRef(gitDir, common ?? gitDir);
-  if (finalRef) {
-    names.add(finalRef);
-    for (const shortName of gitShortRefNames(finalRef)) names.add(shortName);
-  }
-  for (const name of names) await assertRequestedRevision(gitDir, name);
-  if (common) await assertGitLookups(common, ref, [...names], seen);
 }
 
 // Git opens include.path while parsing config, before a command-line -c

@@ -1741,13 +1741,15 @@ describe("repository import", () => {
     fifo(join(otherMain, ".git", "refs", "tags", "feature"));
     insert("p-branch-other-worktree", otherA);
     expect(await attempt("p-branch-other-worktree", otherA, null)).toBe("invalid_repository");
-    const chain = prepare("branch-chain");
-    writeFileSync(join(chain, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
-    writeFileSync(join(chain, ".git", "HEAD"), "ref: refs/heads/alias\n");
-    fifo(join(chain, ".git", "refs", "tags", "master"));
-    insert("p-branch-chain", chain);
-    expect(await attempt("p-branch-chain", chain, null)).toBe("invalid_repository");
 
+    // Git skips a line break after "ref:" and still abbreviates that branch.
+    const brokenLine = prepare("branch-break");
+    writeFileSync(join(brokenLine, ".git", "HEAD"), "ref:\nrefs/heads/master\n");
+    fifo(join(brokenLine, ".git", "refs", "tags", "master"));
+    insert("p-branch-break", brokenLine);
+    expect(await attempt("p-branch-break", brokenLine, null)).toBe("invalid_repository");
+
+    // Importing another ref still runs abbrev-ref HEAD, which opens .git/<branch>.
     const chainRef = prepare("branch-chain-ref");
     writeFileSync(join(chainRef, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
     writeFileSync(join(chainRef, ".git", "HEAD"), "ref: refs/heads/alias\n");
@@ -1756,74 +1758,70 @@ describe("repository import", () => {
     insert("p-branch-chain-ref", chainRef);
     expect(await attempt("p-branch-chain-ref", chainRef, "v1")).toBe("invalid_repository");
 
-    const ambiguous = prepare("branch-chain-ambiguous");
-    writeFileSync(join(ambiguous, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
-    writeFileSync(join(ambiguous, ".git", "HEAD"), "ref: refs/heads/alias\n");
-    writeFileSync(join(ambiguous, ".git", "refs", "tags", "master"), readFileSync(join(ambiguous, ".git", "refs", "heads", "master")));
-    fifo(join(ambiguous, ".git", "heads", "master"));
-    insert("p-branch-chain-ambiguous", ambiguous);
-    expect(await attempt("p-branch-chain-ambiguous", ambiguous, null)).toBe("invalid_repository");
+    // A shared ref can point at this worktree's private ref. The common directory's
+    // copy of that private ref is a different file and is not the one Git opens.
+    const privateMain = prepare("branch-private-hop-main");
+    git(privateMain, ["branch", "feature"]);
+    git(privateMain, ["branch", "other"]);
+    const privateLinked = join(dir, "branch-private-hop");
+    git(privateMain, ["worktree", "add", "-q", privateLinked, "feature"]);
+    const privateGitLine = readFileSync(join(privateLinked, ".git"), "utf8").trim();
+    const privateDeclared = privateGitLine.startsWith("gitdir: ") ? privateGitLine.slice("gitdir: ".length).trim() : "";
+    const privateGit = privateDeclared.startsWith("/") ? privateDeclared : join(privateLinked, privateDeclared);
+    mkdirSync(join(privateMain, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(privateMain, ".git", "refs", "heads", "link"), "ref: refs/bisect/bad\n");
+    writeFileSync(join(privateMain, ".git", "refs", "bisect", "bad"), "ref: refs/heads/other\n");
+    mkdirSync(join(privateGit, "refs", "bisect"), { recursive: true });
+    writeFileSync(join(privateGit, "refs", "bisect", "bad"), "ref: refs/heads/feature\n");
+    writeFileSync(join(privateGit, "HEAD"), "ref: refs/heads/link\n");
+    fifo(join(privateMain, ".git", "refs", "tags", "feature"));
+    insert("p-branch-private-hop", privateLinked);
+    expect(await attempt("p-branch-private-hop", privateLinked, null)).toBe("invalid_repository");
 
-    const chainMain = prepare("branch-chain-worktree-main");
-    git(chainMain, ["branch", "feature"]);
-    writeFileSync(join(chainMain, ".git", "refs", "heads", "alias"), "ref: refs/heads/feature\n");
-    const chainLinked = join(dir, "branch-chain-worktree");
-    git(chainMain, ["worktree", "add", "-q", chainLinked, "feature"]);
-    const gitdirLine = readFileSync(join(chainLinked, ".git"), "utf8").trim();
-    const declaredGitDir = gitdirLine.startsWith("gitdir: ") ? gitdirLine.slice("gitdir: ".length).trim() : "";
-    const worktreeGit = declaredGitDir.startsWith("/") ? declaredGitDir : join(chainLinked, declaredGitDir);
-    writeFileSync(join(worktreeGit, "HEAD"), "ref: refs/heads/alias\n");
-    fifo(join(chainMain, ".git", "refs", "tags", "feature"));
-    insert("p-branch-chain-worktree", chainLinked);
-    expect(await attempt("p-branch-chain-worktree", chainLinked, null)).toBe("invalid_repository");
-
-    const bisectMain = prepare("branch-bisect-main");
-    git(bisectMain, ["checkout", "-q", "-b", "other"]);
-    const bisectChild = prepare("branch-bisect-child");
-    writeFileSync(join(bisectChild, ".git", "commondir"), `${join(bisectMain, ".git")}\n`);
-    mkdirSync(join(bisectChild, ".git", "refs", "bisect"), { recursive: true });
-    writeFileSync(join(bisectChild, ".git", "refs", "bisect", "bad"), "ref: refs/heads/master\n");
-    writeFileSync(join(bisectChild, ".git", "HEAD"), "ref: refs/bisect/bad\n");
-    fifo(join(bisectMain, ".git", "refs", "tags", "master"));
-    insert("p-branch-bisect", bisectChild);
-    expect(await attempt("p-branch-bisect", bisectChild, null)).toBe("invalid_repository");
-
-    const mainWorktree = prepare("main-worktree-pseudo");
-    git(mainWorktree, ["checkout", "-q", "-b", "other"]);
-    mkdirSync(join(mainWorktree, ".git", "refs", "bisect"), { recursive: true });
-    writeFileSync(join(mainWorktree, ".git", "ORIG_HEAD"), "ref: refs/heads/master\n");
-    writeFileSync(join(mainWorktree, ".git", "refs", "bisect", "bad"), "ref: main-worktree/ORIG_HEAD\n");
-    writeFileSync(join(mainWorktree, ".git", "HEAD"), "ref: refs/bisect/bad\n");
-    fifo(join(mainWorktree, ".git", "refs", "tags", "master"));
-    insert("p-main-worktree-pseudo", mainWorktree);
-    expect(await attempt("p-main-worktree-pseudo", mainWorktree, null)).toBe("invalid_repository");
-
-    const mainWorktreeRoot = prepare("main-worktree-root");
-    git(mainWorktreeRoot, ["checkout", "-q", "-b", "other"]);
-    mkdirSync(join(mainWorktreeRoot, ".git", "refs", "bisect"), { recursive: true });
-    writeFileSync(join(mainWorktreeRoot, ".git", "refs", "bisect", "bad"), "ref: refs/heads/master\n");
-    const mainWorktreeChild = join(dir, "main-worktree-child");
-    git(mainWorktreeRoot, ["worktree", "add", "-q", "-b", "wt", mainWorktreeChild, "other"]);
-    const mainWorktreeGitdir = readFileSync(join(mainWorktreeChild, ".git"), "utf8").trim();
-    const mainWorktreeDeclared = mainWorktreeGitdir.startsWith("gitdir: ") ? mainWorktreeGitdir.slice("gitdir: ".length).trim() : "";
-    const mainWorktreeGit = mainWorktreeDeclared.startsWith("/") ? mainWorktreeDeclared : join(mainWorktreeChild, mainWorktreeDeclared);
-    mkdirSync(join(mainWorktreeGit, "refs", "bisect"), { recursive: true });
-    writeFileSync(join(mainWorktreeGit, "refs", "bisect", "bad"), "ref: main-worktree/refs/bisect/bad\n");
-    writeFileSync(join(mainWorktreeGit, "HEAD"), "ref: refs/bisect/bad\n");
-    fifo(join(mainWorktreeRoot, ".git", "refs", "tags", "master"));
-    insert("p-main-worktree-linked", mainWorktreeChild);
-    expect(await attempt("p-main-worktree-linked", mainWorktreeChild, null)).toBe("invalid_repository");
+    const privateOther = prepare("branch-private-other-main");
+    git(privateOther, ["branch", "feature"]);
+    git(privateOther, ["branch", "other"]);
+    const privateOtherLinked = join(dir, "branch-private-other");
+    git(privateOther, ["worktree", "add", "-q", privateOtherLinked, "feature"]);
+    const privateOtherLine = readFileSync(join(privateOtherLinked, ".git"), "utf8").trim();
+    const privateOtherDeclared = privateOtherLine.startsWith("gitdir: ") ? privateOtherLine.slice("gitdir: ".length).trim() : "";
+    const privateOtherGit = privateOtherDeclared.startsWith("/") ? privateOtherDeclared : join(privateOtherLinked, privateOtherDeclared);
+    mkdirSync(join(privateOther, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(privateOther, ".git", "refs", "heads", "link"), "ref: refs/bisect/bad\n");
+    writeFileSync(join(privateOther, ".git", "refs", "bisect", "bad"), "ref: refs/heads/other\n");
+    mkdirSync(join(privateOtherGit, "refs", "bisect"), { recursive: true });
+    writeFileSync(join(privateOtherGit, "refs", "bisect", "bad"), "ref: refs/heads/feature\n");
+    writeFileSync(join(privateOtherGit, "HEAD"), "ref: refs/heads/link\n");
+    fifo(join(privateOther, ".git", "refs", "tags", "other"));
+    insert("p-branch-private-other", privateOtherLinked);
+    expect(await attempt("p-branch-private-other", privateOtherLinked, null)).toBe("imported");
 
     const healthy = prepare("branch-healthy");
     insert("p-branch-healthy", healthy);
     const imported = await importRepository({ config, store }, projectFor("p-branch-healthy", healthy), null, "tester");
     expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
 
+    const privateHealthyMain = prepare("branch-private-hop-healthy-main");
+    git(privateHealthyMain, ["branch", "feature"]);
+    git(privateHealthyMain, ["branch", "other"]);
+    const privateHealthyLinked = join(dir, "branch-private-hop-healthy");
+    git(privateHealthyMain, ["worktree", "add", "-q", privateHealthyLinked, "feature"]);
+    const privateHealthyLine = readFileSync(join(privateHealthyLinked, ".git"), "utf8").trim();
+    const privateHealthyDeclared = privateHealthyLine.startsWith("gitdir: ") ? privateHealthyLine.slice("gitdir: ".length).trim() : "";
+    const privateHealthyGit = privateHealthyDeclared.startsWith("/") ? privateHealthyDeclared : join(privateHealthyLinked, privateHealthyDeclared);
+    mkdirSync(join(privateHealthyMain, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(privateHealthyMain, ".git", "refs", "heads", "link"), "ref: refs/bisect/bad\n");
+    writeFileSync(join(privateHealthyMain, ".git", "refs", "bisect", "bad"), "ref: refs/heads/other\n");
+    mkdirSync(join(privateHealthyGit, "refs", "bisect"), { recursive: true });
+    writeFileSync(join(privateHealthyGit, "refs", "bisect", "bad"), "ref: refs/heads/feature\n");
+    writeFileSync(join(privateHealthyGit, "HEAD"), "ref: refs/heads/link\n");
+    insert("p-branch-private-hop-healthy", privateHealthyLinked);
+    const privateImported = await importRepository({ config, store }, projectFor("p-branch-private-hop-healthy", privateHealthyLinked), null, "tester");
+    expect(await Bun.file(join(privateImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
     const healthyChain = prepare("branch-chain-healthy");
     git(healthyChain, ["symbolic-ref", "refs/heads/link", "refs/heads/master"]);
     git(healthyChain, ["symbolic-ref", "HEAD", "refs/heads/link"]);
-    writeFileSync(join(healthyChain, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
-    writeFileSync(join(healthyChain, ".git", "HEAD"), "ref: refs/heads/alias\n");
     insert("p-branch-chain-healthy", healthyChain);
     const chainImported = await importRepository({ config, store }, projectFor("p-branch-chain-healthy", healthyChain), null, "tester");
     expect(await Bun.file(join(chainImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
@@ -1884,37 +1882,6 @@ describe("repository import", () => {
       "tester",
     );
     expect(await Bun.file(join(mainWorktreeLinkedImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
-    const healthyAmbiguous = prepare("branch-ambiguous-healthy");
-    writeFileSync(join(healthyAmbiguous, ".git", "refs", "tags", "master"), readFileSync(join(healthyAmbiguous, ".git", "refs", "heads", "master")));
-    insert("p-branch-ambiguous-healthy", healthyAmbiguous);
-    const ambiguousImported = await importRepository({ config, store }, projectFor("p-branch-ambiguous-healthy", healthyAmbiguous), null, "tester");
-    expect(await Bun.file(join(ambiguousImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
-
-    const healthyMainWorktree = prepare("main-worktree-healthy");
-    git(healthyMainWorktree, ["checkout", "-q", "-b", "other"]);
-    mkdirSync(join(healthyMainWorktree, ".git", "refs", "bisect"), { recursive: true });
-    writeFileSync(join(healthyMainWorktree, ".git", "ORIG_HEAD"), "ref: refs/heads/master\n");
-    writeFileSync(join(healthyMainWorktree, ".git", "refs", "bisect", "bad"), "ref: main-worktree/ORIG_HEAD\n");
-    writeFileSync(join(healthyMainWorktree, ".git", "HEAD"), "ref: refs/bisect/bad\n");
-    insert("p-main-worktree-healthy", healthyMainWorktree);
-    const mainWorktreeImported = await importRepository({ config, store }, projectFor("p-main-worktree-healthy", healthyMainWorktree), null, "tester");
-    expect(await Bun.file(join(mainWorktreeImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
-
-    const healthyLinkedRoot = prepare("main-worktree-linked-healthy");
-    git(healthyLinkedRoot, ["checkout", "-q", "-b", "other"]);
-    mkdirSync(join(healthyLinkedRoot, ".git", "refs", "bisect"), { recursive: true });
-    writeFileSync(join(healthyLinkedRoot, ".git", "refs", "bisect", "bad"), "ref: refs/heads/master\n");
-    const healthyLinked = join(dir, "main-worktree-linked-healthy-child");
-    git(healthyLinkedRoot, ["worktree", "add", "-q", "-b", "wt-healthy", healthyLinked, "other"]);
-    const healthyLinkedGitdir = readFileSync(join(healthyLinked, ".git"), "utf8").trim();
-    const healthyLinkedDeclared = healthyLinkedGitdir.startsWith("gitdir: ") ? healthyLinkedGitdir.slice("gitdir: ".length).trim() : "";
-    const healthyLinkedGit = healthyLinkedDeclared.startsWith("/") ? healthyLinkedDeclared : join(healthyLinked, healthyLinkedDeclared);
-    mkdirSync(join(healthyLinkedGit, "refs", "bisect"), { recursive: true });
-    writeFileSync(join(healthyLinkedGit, "refs", "bisect", "bad"), "ref: main-worktree/refs/bisect/bad\n");
-    writeFileSync(join(healthyLinkedGit, "HEAD"), "ref: refs/bisect/bad\n");
-    insert("p-main-worktree-linked-healthy", healthyLinked);
-    const linkedImported = await importRepository({ config, store }, projectFor("p-main-worktree-linked-healthy", healthyLinked), null, "tester");
-    expect(await Bun.file(join(linkedImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
   });
 
   test("workspaces are read-only by default and owner-writable only on explicit request", async () => {

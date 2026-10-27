@@ -226,11 +226,9 @@ operation, preserving include/exclude short-circuit behavior.
    passed through. A pipe or symlink in metadata Git would read for that
    archive, including `config.worktree`, sparse-checkout, a config include
    wherever Git would start that section, and a pipe or symlink on a path Git
-   probes for `HEAD`, each branch named by the HEAD symref chain, and the requested revision, is rejected before Git starts. A linked worktree resolves later shared refs on that chain in its common directory, not in a same-named file under its own git directory. A `main-worktree/` prefix is followed only for a pseudoref or per-worktree ref, from that common directory. The
-   probes for the requested revision, is rejected before Git starts. A trailing
+   probes for `HEAD`, each branch named by the HEAD symref chain, and the requested revision, is rejected before Git starts. A linked worktree resolves a later shared ref on that chain in its common directory, not in a same-named file under its own git directory, and resolves a private ref on that chain beside the worktree `HEAD`. A `main-worktree/` prefix is followed only for a pseudoref or per-worktree ref, from that common directory. A trailing
    `~` or `^` suffix, the revision before `:`, and each side of `..` or `...`
-   select those paths. The
-  directory named by a gitfile or `commondir` is the path Git opens, with
+   select the requested-revision paths. The directory named by a gitfile or `commondir` is the path Git opens, with
   trailing breaks removed and `..` applied after each symlink is followed.
   The runtime `realpath` is not used for that walk. A pointer that is not
   valid UTF-8 is rejected. That directory is checked the same way. Configured exclude and attribute paths are not

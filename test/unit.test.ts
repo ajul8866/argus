@@ -1758,6 +1758,30 @@ describe("repository import", () => {
     insert("p-branch-split-origin", originLinked);
     expect(await attempt("p-branch-split-origin", originLinked, null)).toBe("invalid_repository");
 
+    // Abbreviation opens refs/tags/<branch> and follows main-worktree/ to the bare file.
+    const probed = prepare("branch-probed-main-worktree");
+    writeFileSync(join(probed, ".git", "refs", "tags", "master"), "ref: main-worktree/ORIG_HEAD\n");
+    fifo(join(probed, ".git", "ORIG_HEAD"));
+    insert("p-branch-probed-main-worktree", probed);
+    expect(await attempt("p-branch-probed-main-worktree", probed, null)).toBe("invalid_repository");
+
+    // The hop after that prefix is still the linked worktree's private ref.
+    const probedRoot = prepare("branch-probed-hop-main");
+    git(probedRoot, ["branch", "feature"]);
+    git(probedRoot, ["checkout", "-q", "-b", "other"]);
+    const probedChild = join(dir, "branch-probed-hop");
+    git(probedRoot, ["worktree", "add", "-q", "-b", "wt-probed", probedChild, "other"]);
+    const probedGit = worktreeGit(probedChild);
+    mkdirSync(join(probedRoot, ".git", "refs", "bisect"), { recursive: true });
+    mkdirSync(join(probedGit, "refs", "bisect"), { recursive: true });
+    writeFileSync(join(probedRoot, ".git", "refs", "bisect", "bad"), "ref: refs/heads/other\n");
+    writeFileSync(join(probedRoot, ".git", "ORIG_HEAD"), "ref: refs/bisect/bad\n");
+    writeFileSync(join(probedRoot, ".git", "refs", "tags", "master"), "ref: main-worktree/ORIG_HEAD\n");
+    writeFileSync(join(probedGit, "HEAD"), "ref: refs/heads/master\n");
+    fifo(join(probedGit, "refs", "bisect", "bad"));
+    insert("p-branch-probed-hop", probedChild);
+    expect(await attempt("p-branch-probed-hop", probedChild, null)).toBe("invalid_repository");
+
     // The worktree's private ref names the main worktree's copy with main-worktree/.
     const prefixedMain = prepare("branch-private-prefix-main");
     git(prefixedMain, ["branch", "feature"]);
@@ -1867,6 +1891,13 @@ describe("repository import", () => {
       "tester",
     );
     expect(await Bun.file(join(mainWorktreeLinkedImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const probedHealthy = prepare("branch-probed-main-worktree-healthy");
+    writeFileSync(join(probedHealthy, ".git", "ORIG_HEAD"), readFileSync(join(probedHealthy, ".git", "refs", "heads", "master")));
+    writeFileSync(join(probedHealthy, ".git", "refs", "tags", "master"), "ref: main-worktree/ORIG_HEAD\n");
+    insert("p-branch-probed-main-worktree-healthy", probedHealthy);
+    const probedImported = await importRepository({ config, store }, projectFor("p-branch-probed-main-worktree-healthy", probedHealthy), null, "tester");
+    expect(await Bun.file(join(probedImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
 
     const healthyAmbiguous = prepare("branch-ambiguous-healthy");
     writeFileSync(join(healthyAmbiguous, ".git", "refs", "tags", "master"), readFileSync(join(healthyAmbiguous, ".git", "refs", "heads", "master")));

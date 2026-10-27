@@ -219,13 +219,6 @@ operation, preserving include/exclude short-circuit behavior.
 3. A snapshot is copied under `$ARGUS_DATA_DIR/repos/<project>/<id>` (or a git
    archive for a ref) with the same open. The archive is taken from a git
    directory descriptor opened without following a symlink. A `.git` symlink,
-   a `gitdir:` file, a symlink under the object store, a `commondir` file, and
-   an alternate object directory outside the allowed locations are rejected.
-   The alternate path is the directory Git opens after following a symlink and
-   applying `..`, and nested alternates are checked the same way. A path that
-   enters `/proc` or `/dev/fd` is rejected because those locations are local to
-   the checking process. A subdirectory
-   import archives only that subdirectory. A symlink, a repository directory or
    a `gitdir:` file, a git common directory that does not resolve to that git
    directory, a symlink inside an object store (including a non-UTF-8 name), a
    multi-pack-index pack name that leaves that store, and an alternate object
@@ -233,46 +226,13 @@ operation, preserving include/exclude short-circuit behavior.
    alternate path follows a symlink before `..` and keeps the raw path bytes.
    A path that enters `/proc` or `/dev/fd` is rejected, because those locations
    are local to the checking process. Nested alternates are checked the same
-   way. A subdirectory import archives
+   way. Those Git commands pass `--no-replace-objects`, force exclude and
+   attribute files to `/dev/null`, and set `GIT_NO_LAZY_FETCH`, so a configured
+   exclude or attribute fifo cannot block `git archive` and a promisor remote
+   is not fetched. A subdirectory import archives
    only that subdirectory. A symlink, a repository directory or
    ancestor replaced by a symlink, a path that escapes the source, or bytes
-   that no longer match the inventory are not copied. A ref archive accepts
-   only Git metadata for that work tree: a `.git` symlink or gitfile, a Git
-   common directory other than that Git directory, an alternate object store,
-   or a symlink in the object store is rejected. Inherited `GIT_*` variables
-   are not passed through, and import sets `GIT_NO_LAZY_FETCH` so a promisor
-   remote cannot fetch missing commits or blobs from another repository or URL. A pipe or symlink in metadata Git would read for that
-   archive, including `config.worktree`, sparse-checkout, and a config include
-   wherever Git would start that section, is rejected before Git starts. The
-   or a symlink in the object store is rejected, and `GIT_*` variables are not
-   passed through. The archive itself runs from a separate repository that
-   unsets the `filter` attribute, so a configured smudge or process filter
-   cannot read or rewrite the snapshot. A subdirectory archives only its own
-   tree. The inventory is then rebuilt from the snapshot.
-   passed through. The archive reads that git directory's object store through
-   a new Git directory with the same object format, including SHA-256.
-   Repository, system, and global filter commands are not used, and system and
-   global attribute files are not read. Committed `export-subst` attributes are
-   disabled, so a signature placeholder cannot run `gpg`. Committed attributes
-   can still request line-ending conversion. A subdirectory archives only its
-   own tree. The inventory is then rebuilt from the snapshot.
-   passed through. A pipe or symlink in metadata Git would read for that
-   archive, including `config.worktree`, sparse-checkout, a config include
-   wherever Git would start that section, and a pipe or symlink on a path Git
-   probes for HEAD, the current branch, and the requested revision, is rejected before Git starts. The
-   probes for `HEAD`, each branch named by the HEAD symref chain, and the requested revision, is rejected before Git starts. A linked worktree resolves later shared refs on that chain in its common directory, not in a same-named file under its own git directory. A `main-worktree/` prefix is followed only for a pseudoref or per-worktree ref, from that common directory. The
-   probes for the requested revision, is rejected before Git starts. A trailing
-   `~` or `^` suffix, the revision before `:`, and each side of `..` or `...`
-   select those paths. The
-   archive, including a loose ref other than `HEAD`, worktree metadata, a
-   pseudoref, `config.worktree`, sparse-checkout, and a config include
-   wherever Git would start that section, is rejected before Git starts.
-   Replacement refs are not applied. The
-  directory named by a gitfile or `commondir` is the path Git opens, with
-  trailing breaks removed and `..` applied after each symlink is followed.
-  The runtime `realpath` is not used for that walk. A pointer that is not
-  valid UTF-8 is rejected. That directory is checked the same way. Configured exclude and attribute paths are not
-   opened. A subdirectory archives only its own tree. The inventory is then
+   that no longer match the inventory are not copied. The inventory is then
    rebuilt from the snapshot.
 4. Each task gets a fresh read-only copy under
    `$ARGUS_DATA_DIR/workspaces/<audit>/<session>`.

@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join, relative } from "node:path";
@@ -803,128 +802,6 @@ describe("repository import", () => {
     }
   });
 
-  test("a git ref import does not fetch commits or blobs from a promisor remote", async () => {
-    const outside = mkdtempSync(join(tmpdir(), "argus-outside-promisor-"));
-    const previousLazy = process.env.GIT_NO_LAZY_FETCH;
-    const git = (cwd: string, args: string[]): string => {
-      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
-        env: {
-          PATH: process.env.PATH ?? "/usr/bin:/bin",
-          GIT_AUTHOR_NAME: "Tester",
-          GIT_AUTHOR_EMAIL: "tester@example.com",
-          GIT_COMMITTER_NAME: "Tester",
-          GIT_COMMITTER_EMAIL: "tester@example.com",
-          GIT_CONFIG_GLOBAL: "/dev/null",
-          GIT_CONFIG_NOSYSTEM: "1",
-        },
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
-      return result.stdout.toString().trim();
-    };
-    const insert = (id: string, source: string): void => {
-      store.run(
-        `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
-         VALUES (?, ?, '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
-        id, id, source, JSON.stringify(["**/*.js"]),
-      );
-    };
-    const projectFor = (id: string) => {
-      const row = store.get<{ source_path: string; scope_include: string; scope_exclude: string }>(
-        "SELECT source_path, scope_include, scope_exclude FROM projects WHERE id = ?",
-        id,
-      )!;
-      return {
-        id,
-        source_path: row.source_path,
-        scope_include: row.scope_include,
-        scope_exclude: row.scope_exclude,
-      };
-    };
-    const objectMissing = (repo: string, oid: string): void => {
-      const result = Bun.spawnSync(["git", "-C", repo, "cat-file", "-e", oid], {
-        env: {
-          PATH: process.env.PATH ?? "/usr/bin:/bin",
-          GIT_NO_LAZY_FETCH: "1",
-          GIT_CONFIG_GLOBAL: "/dev/null",
-          GIT_CONFIG_NOSYSTEM: "1",
-        },
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      expect(result.exitCode).not.toBe(0);
-    };
-    try {
-      git(outside, ["init", "-q"]);
-      writeFileSync(join(outside, "secret.js"), "SECRET_OUTSIDE_SENTINEL\n");
-      git(outside, ["add", "secret.js"]);
-      git(outside, ["commit", "-qm", "secret"]);
-      const outsideSha = git(outside, ["rev-parse", "HEAD"]);
-      const outsideBlob = git(outside, ["rev-parse", "HEAD:secret.js"]);
-
-      const promisor = join(dir, "promisor-commit");
-      mkdirSync(promisor);
-      git(promisor, ["init", "-q"]);
-      writeFileSync(join(promisor, "a.js"), "LOCAL_ONLY\n");
-      git(promisor, ["add", "a.js"]);
-      git(promisor, ["commit", "-qm", "local"]);
-      git(promisor, ["config", "remote.origin.url", outside]);
-      git(promisor, ["config", "remote.origin.promisor", "true"]);
-      const head = readFileSync(join(promisor, ".git", "HEAD"), "utf8").trim();
-      expect(head.startsWith("ref: refs/heads/")).toBe(true);
-      writeFileSync(join(promisor, ".git", head.slice("ref: ".length)), `${outsideSha}\n`);
-      insert("p-promisor-commit", promisor);
-
-      const missing = join(dir, "promisor-blob");
-      mkdirSync(missing);
-      git(missing, ["init", "-q"]);
-      writeFileSync(join(missing, "a.js"), "LOCAL_ONLY\n");
-      writeFileSync(join(missing, "secret.js"), "SECRET_OUTSIDE_SENTINEL\n");
-      git(missing, ["add", "a.js", "secret.js"]);
-      git(missing, ["commit", "-qm", "both"]);
-      const blob = git(missing, ["rev-parse", "HEAD:secret.js"]);
-      expect(blob).toBe(outsideBlob);
-      git(missing, ["config", "extensions.partialClone", "origin"]);
-      git(missing, ["config", "remote.origin.url", outside]);
-      git(missing, ["config", "remote.origin.promisor", "true"]);
-      rmSync(join(missing, ".git", "objects", blob.slice(0, 2), blob.slice(2)));
-      insert("p-promisor-blob", missing);
-      objectMissing(missing, blob);
-
-      const complete = join(dir, "promisor-complete");
-      mkdirSync(complete);
-      git(complete, ["init", "-q"]);
-      writeFileSync(join(complete, "a.js"), "LOCAL_ONLY\n");
-      git(complete, ["add", "a.js"]);
-      git(complete, ["commit", "-qm", "local"]);
-      const localSha = git(complete, ["rev-parse", "HEAD"]);
-      git(complete, ["config", "extensions.partialClone", "origin"]);
-      git(complete, ["config", "remote.origin.url", outside]);
-      git(complete, ["config", "remote.origin.promisor", "true"]);
-      insert("p-promisor-complete", complete);
-
-      process.env.GIT_NO_LAZY_FETCH = "0";
-      await expect(importRepository({ config, store }, projectFor("p-promisor-commit"), "HEAD", "tester"))
-        .rejects.toMatchObject({ code: "bad_request", message: expect.stringContaining("Unknown git ref") });
-      objectMissing(promisor, outsideSha);
-      await expect(importRepository({ config, store }, projectFor("p-promisor-blob"), "HEAD", "tester"))
-        .rejects.toMatchObject({ code: "bad_request", message: expect.stringContaining("Failed to archive") });
-      objectMissing(missing, blob);
-      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
-
-      const imported = await importRepository({ config, store }, projectFor("p-promisor-complete"), "HEAD", "tester");
-      expect(imported.commit_sha).toBe(localSha);
-      expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
-      expect(existsSync(join(imported.path, "secret.js"))).toBe(false);
-      objectMissing(complete, outsideSha);
-    } finally {
-      if (previousLazy === undefined) delete process.env.GIT_NO_LAZY_FETCH;
-      else process.env.GIT_NO_LAZY_FETCH = previousLazy;
-      rmSync(outside, { recursive: true, force: true });
-    }
-  });
-
   test("a git ref import rejects a common directory that points at another repository", async () => {
     const outside = mkdtempSync(join(tmpdir(), "argus-outside-common-"));
     const git = (cwd: string, args: string[]): string => {
@@ -1008,18 +885,14 @@ describe("repository import", () => {
     }
   });
 
-  test("a git ref import archives the committed blob without running a smudge filter", async () => {
-    const outside = join(dir, "outside-filter");
-    mkdirSync(outside);
-    const secret = join(outside, "secret.txt");
-    writeFileSync(secret, "SECRET_OUTSIDE_SENTINEL\n");
-    const git = (cwd: string, args: string[]): string => {
   test("a git ref import does not run smudge or process filters", async () => {
     const source = join(dir, "filter-repo");
     const globalHome = join(dir, "filter-home");
+    const secret = join(dir, "outside-filter-secret.txt");
     const localMarker = join(dir, "local-filter-ran");
     const processMarker = join(dir, "process-filter-ran");
     const globalMarker = join(dir, "global-filter-ran");
+    const includeMarker = join(dir, "include-filter-ran");
     const previousHome = process.env.HOME;
     const git = (cwd: string, args: string[]): void => {
       const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
@@ -1034,81 +907,8 @@ describe("repository import", () => {
         stderr: "pipe",
       });
       if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
-      return result.stdout.toString().trim();
     };
-    const insert = (id: string, source: string): void => {
-      store.run(
-        `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
-         VALUES (?, ?, '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
-        id, id, source, JSON.stringify(["**/*.js"]),
-      );
-    };
-    const projectFor = (id: string) => {
-      const row = store.get<{ source_path: string; scope_include: string; scope_exclude: string }>(
-        "SELECT source_path, scope_include, scope_exclude FROM projects WHERE id = ?",
-        id,
-      )!;
-      return {
-        id,
-        source_path: row.source_path,
-        scope_include: row.scope_include,
-        scope_exclude: row.scope_exclude,
-      };
-    };
-    const prepare = (id: string, path: string, objectFormat?: "sha256"): void => {
-      mkdirSync(join(path, "src"), { recursive: true });
-      writeFileSync(join(path, "src", "a.js"), "COMMITTED_BLOB\n");
-      if (objectFormat !== "sha256") writeFileSync(join(path, ".gitattributes"), "*.js filter=leak\n");
-      git(path, objectFormat === "sha256" ? ["init", "-q", "--object-format=sha256"] : ["init", "-q"]);
-      git(path, ["add", "src/a.js", ...(objectFormat === "sha256" ? [] : [".gitattributes"])]);
-      git(path, ["commit", "-qm", "blob"]);
-      writeFileSync(join(path, "src", "a.js"), "WORKTREE_ONLY\n");
-      insert(id, path);
-    };
-    const previousHome = process.env.HOME;
-    try {
-      const local = join(dir, "smudge-local");
-      prepare("p-smudge", local);
-      const marker = join(dir, "smudge-marker");
-      const processMarker = join(dir, "process-marker");
-      git(local, ["config", "filter.leak.smudge", `touch ${marker}; cat ${secret}`]);
-      git(local, ["config", "filter.leak.process", `touch ${processMarker}; printf 'status=error\\n'`]);
-
-      const included = join(dir, "smudge-include");
-      prepare("p-include", included);
-      const includeMarker = join(dir, "include-marker");
-      const includeConfig = join(dir, "leak.config");
-      writeFileSync(includeConfig, `[filter "leak"]\n\tsmudge = touch ${includeMarker}; cat ${secret}\n`);
-      git(included, ["config", "include.path", includeConfig]);
-
-      const shaRepo = join(dir, "sha256-repo");
-      prepare("p-sha256", shaRepo, "sha256");
-
-      const globalRepo = join(dir, "smudge-global");
-      prepare("p-global", globalRepo);
-      const globalHome = join(dir, "filter-home");
-      const globalMarker = join(dir, "global-marker");
-      mkdirSync(globalHome);
-      writeFileSync(join(globalHome, ".gitconfig"), `[filter "leak"]\n\tsmudge = touch ${globalMarker}; cat ${secret}\n`);
-
-      const expectBlob = async (id: string): Promise<void> => {
-        const imported = await importRepository({ config, store }, projectFor(id), "HEAD", "tester");
-        expect(await Bun.file(join(imported.path, "src/a.js")).text()).toBe("COMMITTED_BLOB\n");
-        expect(existsSync(join(imported.path, "secret.txt"))).toBe(false);
-      };
-      await expectBlob("p-smudge");
-      expect(existsSync(marker)).toBe(false);
-      expect(existsSync(processMarker)).toBe(false);
-      await expectBlob("p-include");
-      expect(existsSync(includeMarker)).toBe(false);
-      await expectBlob("p-sha256");
-      process.env.HOME = globalHome;
-      await expectBlob("p-global");
-      expect(existsSync(globalMarker)).toBe(false);
-    } finally {
-      if (previousHome === undefined) delete process.env.HOME;
-      else process.env.HOME = previousHome;
-    };
+    writeFileSync(secret, "SECRET_OUTSIDE_SENTINEL\n");
     mkdirSync(source, { recursive: true });
     writeFileSync(join(source, "a.js"), "PLAIN_FILTER_BYTES\n");
     git(source, ["init", "-q"]);
@@ -1117,13 +917,14 @@ describe("repository import", () => {
     writeFileSync(join(source, ".gitattributes"), "* filter=pwn\n");
     git(source, ["add", ".gitattributes"]);
     git(source, ["commit", "-qm", "attrs"]);
-    git(source, ["config", "filter.pwn.smudge", `touch ${localMarker}; echo LOCAL_SMUDGE`]);
+    git(source, ["config", "filter.pwn.smudge", `touch ${localMarker}; cat ${secret}`]);
     git(source, ["config", "filter.pwn.process", `touch ${processMarker}`]);
     git(source, ["config", "filter.pwn.required", "true"]);
+    writeFileSync(join(source, "a.js"), "WORKTREE_ONLY\n");
 
     const globalSource = join(dir, "global-filter-repo");
     mkdirSync(join(globalHome, ".config"), { recursive: true });
-    writeFileSync(join(globalHome, ".gitconfig"), `[filter "pwn"]\n\tsmudge = touch ${globalMarker}; echo GLOBAL_SMUDGE\n\trequired = true\n`);
+    writeFileSync(join(globalHome, ".gitconfig"), `[filter "pwn"]\n\tsmudge = touch ${globalMarker}; cat ${secret}\n\trequired = true\n`);
     mkdirSync(globalSource, { recursive: true });
     writeFileSync(join(globalSource, "a.js"), "PLAIN_GLOBAL_BYTES\n");
     git(globalSource, ["init", "-q"]);
@@ -1132,6 +933,19 @@ describe("repository import", () => {
     writeFileSync(join(globalSource, ".gitattributes"), "* filter=pwn\n");
     git(globalSource, ["add", ".gitattributes"]);
     git(globalSource, ["commit", "-qm", "attrs"]);
+
+    const included = join(dir, "include-filter-repo");
+    const includeConfig = join(dir, "leak.config");
+    mkdirSync(included, { recursive: true });
+    writeFileSync(join(included, "a.js"), "PLAIN_INCLUDE_BYTES\n");
+    git(included, ["init", "-q"]);
+    git(included, ["add", "a.js"]);
+    git(included, ["commit", "-qm", "init"]);
+    writeFileSync(join(included, ".gitattributes"), "* filter=pwn\n");
+    git(included, ["add", ".gitattributes"]);
+    git(included, ["commit", "-qm", "attrs"]);
+    writeFileSync(includeConfig, `[filter "pwn"]\n\tsmudge = touch ${includeMarker}; cat ${secret}\n\trequired = true\n`);
+    git(included, ["config", "include.path", includeConfig]);
 
     const insert = (id: string, path: string): void => {
       store.run(
@@ -1142,6 +956,7 @@ describe("repository import", () => {
     };
     insert("p-filter-local", source);
     insert("p-filter-global", globalSource);
+    insert("p-filter-include", included);
     process.env.HOME = globalHome;
     try {
       const local = await importRepository({ config, store }, {
@@ -1151,6 +966,7 @@ describe("repository import", () => {
         scope_exclude: "[]",
       }, "HEAD", "tester");
       expect(await Bun.file(join(local.path, "a.js")).text()).toBe("PLAIN_FILTER_BYTES\n");
+      expect(existsSync(join(local.path, "secret.txt"))).toBe(false);
       expect(existsSync(localMarker)).toBe(false);
       expect(existsSync(processMarker)).toBe(false);
 
@@ -1162,6 +978,14 @@ describe("repository import", () => {
       }, "HEAD", "tester");
       expect(await Bun.file(join(global.path, "a.js")).text()).toBe("PLAIN_GLOBAL_BYTES\n");
       expect(existsSync(globalMarker)).toBe(false);
+
+      await expect(importRepository({ config, store }, {
+        id: "p-filter-include",
+        source_path: included,
+        scope_include: JSON.stringify(["**/*.js"]),
+        scope_exclude: "[]",
+      }, "HEAD", "tester")).rejects.toMatchObject({ code: "invalid_repository" });
+      expect(existsSync(includeMarker)).toBe(false);
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
@@ -1349,6 +1173,128 @@ describe("repository import", () => {
       else process.env.HOME = previousHome;
       if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
       else process.env.XDG_CONFIG_HOME = previousXdg;
+    }
+  });
+
+  test("a git ref import does not fetch commits or blobs from a promisor remote", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "argus-outside-promisor-"));
+    const previousLazy = process.env.GIT_NO_LAZY_FETCH;
+    const git = (cwd: string, args: string[]): string => {
+      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          GIT_AUTHOR_NAME: "Tester",
+          GIT_AUTHOR_EMAIL: "tester@example.com",
+          GIT_COMMITTER_NAME: "Tester",
+          GIT_COMMITTER_EMAIL: "tester@example.com",
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_CONFIG_NOSYSTEM: "1",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+      return result.stdout.toString().trim();
+    };
+    const insert = (id: string, source: string): void => {
+      store.run(
+        `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+         VALUES (?, ?, '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+        id, id, source, JSON.stringify(["**/*.js"]),
+      );
+    };
+    const projectFor = (id: string) => {
+      const row = store.get<{ source_path: string; scope_include: string; scope_exclude: string }>(
+        "SELECT source_path, scope_include, scope_exclude FROM projects WHERE id = ?",
+        id,
+      )!;
+      return {
+        id,
+        source_path: row.source_path,
+        scope_include: row.scope_include,
+        scope_exclude: row.scope_exclude,
+      };
+    };
+    const objectMissing = (repo: string, oid: string): void => {
+      const result = Bun.spawnSync(["git", "-C", repo, "cat-file", "-e", oid], {
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          GIT_NO_LAZY_FETCH: "1",
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_CONFIG_NOSYSTEM: "1",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(result.exitCode).not.toBe(0);
+    };
+    try {
+      git(outside, ["init", "-q"]);
+      writeFileSync(join(outside, "secret.js"), "SECRET_OUTSIDE_SENTINEL\n");
+      git(outside, ["add", "secret.js"]);
+      git(outside, ["commit", "-qm", "secret"]);
+      const outsideSha = git(outside, ["rev-parse", "HEAD"]);
+      const outsideBlob = git(outside, ["rev-parse", "HEAD:secret.js"]);
+
+      const promisor = join(dir, "promisor-commit");
+      mkdirSync(promisor);
+      git(promisor, ["init", "-q"]);
+      writeFileSync(join(promisor, "a.js"), "LOCAL_ONLY\n");
+      git(promisor, ["add", "a.js"]);
+      git(promisor, ["commit", "-qm", "local"]);
+      git(promisor, ["config", "remote.origin.url", outside]);
+      git(promisor, ["config", "remote.origin.promisor", "true"]);
+      const head = readFileSync(join(promisor, ".git", "HEAD"), "utf8").trim();
+      expect(head.startsWith("ref: refs/heads/")).toBe(true);
+      writeFileSync(join(promisor, ".git", head.slice("ref: ".length)), `${outsideSha}\n`);
+      insert("p-promisor-commit", promisor);
+
+      const missing = join(dir, "promisor-blob");
+      mkdirSync(missing);
+      git(missing, ["init", "-q"]);
+      writeFileSync(join(missing, "a.js"), "LOCAL_ONLY\n");
+      writeFileSync(join(missing, "secret.js"), "SECRET_OUTSIDE_SENTINEL\n");
+      git(missing, ["add", "a.js", "secret.js"]);
+      git(missing, ["commit", "-qm", "both"]);
+      const blob = git(missing, ["rev-parse", "HEAD:secret.js"]);
+      expect(blob).toBe(outsideBlob);
+      git(missing, ["config", "extensions.partialClone", "origin"]);
+      git(missing, ["config", "remote.origin.url", outside]);
+      git(missing, ["config", "remote.origin.promisor", "true"]);
+      rmSync(join(missing, ".git", "objects", blob.slice(0, 2), blob.slice(2)));
+      insert("p-promisor-blob", missing);
+      objectMissing(missing, blob);
+
+      const complete = join(dir, "promisor-complete");
+      mkdirSync(complete);
+      git(complete, ["init", "-q"]);
+      writeFileSync(join(complete, "a.js"), "LOCAL_ONLY\n");
+      git(complete, ["add", "a.js"]);
+      git(complete, ["commit", "-qm", "local"]);
+      const localSha = git(complete, ["rev-parse", "HEAD"]);
+      git(complete, ["config", "extensions.partialClone", "origin"]);
+      git(complete, ["config", "remote.origin.url", outside]);
+      git(complete, ["config", "remote.origin.promisor", "true"]);
+      insert("p-promisor-complete", complete);
+
+      process.env.GIT_NO_LAZY_FETCH = "0";
+      await expect(importRepository({ config, store }, projectFor("p-promisor-commit"), "HEAD", "tester"))
+        .rejects.toMatchObject({ code: "bad_request", message: expect.stringContaining("Unknown git ref") });
+      objectMissing(promisor, outsideSha);
+      await expect(importRepository({ config, store }, projectFor("p-promisor-blob"), "HEAD", "tester"))
+        .rejects.toMatchObject({ code: "bad_request", message: expect.stringContaining("Failed to archive") });
+      objectMissing(missing, blob);
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+
+      const imported = await importRepository({ config, store }, projectFor("p-promisor-complete"), "HEAD", "tester");
+      expect(imported.commit_sha).toBe(localSha);
+      expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+      expect(existsSync(join(imported.path, "secret.js"))).toBe(false);
+      objectMissing(complete, outsideSha);
+    } finally {
+      if (previousLazy === undefined) delete process.env.GIT_NO_LAZY_FETCH;
+      else process.env.GIT_NO_LAZY_FETCH = previousLazy;
+      rmSync(outside, { recursive: true, force: true });
     }
   });
 
@@ -1860,7 +1806,6 @@ describe("repository import", () => {
   });
 
   test("import does not wait on a loose ref pipe Git probes for that revision", async () => {
-  test("import does not wait on a pipe in a loose ref, pseudoref, or worktree", async () => {
     const gitEnv = {
       PATH: process.env.PATH ?? "/usr/bin:/bin",
       GIT_AUTHOR_NAME: "Tester",
@@ -1926,7 +1871,6 @@ describe("repository import", () => {
     writeFileSync(join(symref, ".git", "refs", "heads", "alias"), "ref: root.fifo\n");
     insert("p-ref-symref", symref);
     expect(await attempt("p-ref-symref", symref, "alias")).toBe("invalid_repository");
-    expect(await attempt("p-ref-symref", symref, "alias:a.js")).toBe("invalid_repository");
 
     const linkedRef = prepare("ref-symlink");
     fifo(join(dir, "feature.fifo"));
@@ -1943,34 +1887,13 @@ describe("repository import", () => {
     insert("p-ref-child", join(parent, "child"));
     expect(await attempt("p-ref-child", join(parent, "child"), "HEAD")).toBe("invalid_repository");
 
-    const syntax = prepare("ref-syntax");
-    git(syntax, ["branch", "other"]);
-    fifo(join(syntax, ".git", "refs", "tags", "master"));
-    insert("p-ref-syntax", syntax);
-    expect(await attempt("p-ref-syntax", syntax, "master:a.js")).toBe("invalid_repository");
-    expect(await attempt("p-ref-syntax", syntax, "master~1:a.js")).toBe("invalid_repository");
-    expect(await attempt("p-ref-syntax", syntax, "master..other")).toBe("invalid_repository");
-    expect(await attempt("p-ref-syntax", syntax, "master...other")).toBe("invalid_repository");
-    expect(await attempt("p-ref-syntax", syntax, "other..master")).toBe("invalid_repository");
-
-    const qualified = prepare("ref-qualified");
-    const qualifiedFifo = join(qualified, ".git", "refs", "tags", "refs", "heads");
-    mkdirSync(qualifiedFifo, { recursive: true });
-    fifo(join(qualifiedFifo, "master"));
-    insert("p-ref-qualified", qualified);
-    expect(await attempt("p-ref-qualified", qualified, "refs/heads/master:a.js")).toBe("invalid_repository");
-
     const healthy = prepare("ref-healthy");
     git(healthy, ["tag", "v1"]);
-    git(healthy, ["tag", "v1.2"]);
-    git(healthy, ["branch", "other"]);
     git(healthy, ["update-ref", "refs/remotes/origin/master", "HEAD"]);
     git(healthy, ["update-ref", "refs/remotes/master/HEAD", "HEAD"]);
     insert("p-ref-healthy", healthy);
-    const imported = await importRepository({ config, store }, project("p-ref-healthy", healthy), "v1.2", "tester");
+    const imported = await importRepository({ config, store }, project("p-ref-healthy", healthy), "master", "tester");
     expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
-    expect(await attempt("p-ref-healthy", healthy, "master:a.js")).toBe("bad_request");
-    expect(await attempt("p-ref-healthy", healthy, "master..other")).toBe("bad_request");
   });
 
   test("import does not wait on a pipe Git opens for the current branch", async () => {
@@ -1997,8 +1920,6 @@ describe("repository import", () => {
       const source = join(dir, name);
       mkdirSync(source);
       git(source, ["init", "-q", "-b", "master"]);
-      mkdirSync(source);
-      git(source, ["init", "-q"]);
       writeFileSync(join(source, "a.js"), "LOCAL_ONLY\n");
       git(source, ["add", "a.js"]);
       git(source, ["commit", "-qm", "local"]);
@@ -2211,78 +2132,6 @@ describe("repository import", () => {
     fifo(join(otherMain, ".git", "refs", "tags", "feature"));
     insert("p-branch-other-worktree", otherA);
     expect(await attempt("p-branch-other-worktree", otherA, null)).toBe("invalid_repository");
-    const chain = prepare("branch-chain");
-    writeFileSync(join(chain, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
-    writeFileSync(join(chain, ".git", "HEAD"), "ref: refs/heads/alias\n");
-    fifo(join(chain, ".git", "refs", "tags", "master"));
-    insert("p-branch-chain", chain);
-    expect(await attempt("p-branch-chain", chain, null)).toBe("invalid_repository");
-
-    const chainRef = prepare("branch-chain-ref");
-    writeFileSync(join(chainRef, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
-    writeFileSync(join(chainRef, ".git", "HEAD"), "ref: refs/heads/alias\n");
-    git(chainRef, ["tag", "v1"]);
-    fifo(join(chainRef, ".git", "master"));
-    insert("p-branch-chain-ref", chainRef);
-    expect(await attempt("p-branch-chain-ref", chainRef, "v1")).toBe("invalid_repository");
-
-    const ambiguous = prepare("branch-chain-ambiguous");
-    writeFileSync(join(ambiguous, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
-    writeFileSync(join(ambiguous, ".git", "HEAD"), "ref: refs/heads/alias\n");
-    writeFileSync(join(ambiguous, ".git", "refs", "tags", "master"), readFileSync(join(ambiguous, ".git", "refs", "heads", "master")));
-    fifo(join(ambiguous, ".git", "heads", "master"));
-    insert("p-branch-chain-ambiguous", ambiguous);
-    expect(await attempt("p-branch-chain-ambiguous", ambiguous, null)).toBe("invalid_repository");
-
-    const chainMain = prepare("branch-chain-worktree-main");
-    git(chainMain, ["branch", "feature"]);
-    writeFileSync(join(chainMain, ".git", "refs", "heads", "alias"), "ref: refs/heads/feature\n");
-    const chainLinked = join(dir, "branch-chain-worktree");
-    git(chainMain, ["worktree", "add", "-q", chainLinked, "feature"]);
-    const gitdirLine = readFileSync(join(chainLinked, ".git"), "utf8").trim();
-    const declaredGitDir = gitdirLine.startsWith("gitdir: ") ? gitdirLine.slice("gitdir: ".length).trim() : "";
-    const worktreeGit = declaredGitDir.startsWith("/") ? declaredGitDir : join(chainLinked, declaredGitDir);
-    writeFileSync(join(worktreeGit, "HEAD"), "ref: refs/heads/alias\n");
-    fifo(join(chainMain, ".git", "refs", "tags", "feature"));
-    insert("p-branch-chain-worktree", chainLinked);
-    expect(await attempt("p-branch-chain-worktree", chainLinked, null)).toBe("invalid_repository");
-
-    const bisectMain = prepare("branch-bisect-main");
-    git(bisectMain, ["checkout", "-q", "-b", "other"]);
-    const bisectChild = prepare("branch-bisect-child");
-    writeFileSync(join(bisectChild, ".git", "commondir"), `${join(bisectMain, ".git")}\n`);
-    mkdirSync(join(bisectChild, ".git", "refs", "bisect"), { recursive: true });
-    writeFileSync(join(bisectChild, ".git", "refs", "bisect", "bad"), "ref: refs/heads/master\n");
-    writeFileSync(join(bisectChild, ".git", "HEAD"), "ref: refs/bisect/bad\n");
-    fifo(join(bisectMain, ".git", "refs", "tags", "master"));
-    insert("p-branch-bisect", bisectChild);
-    expect(await attempt("p-branch-bisect", bisectChild, null)).toBe("invalid_repository");
-
-    const mainWorktree = prepare("main-worktree-pseudo");
-    git(mainWorktree, ["checkout", "-q", "-b", "other"]);
-    mkdirSync(join(mainWorktree, ".git", "refs", "bisect"), { recursive: true });
-    writeFileSync(join(mainWorktree, ".git", "ORIG_HEAD"), "ref: refs/heads/master\n");
-    writeFileSync(join(mainWorktree, ".git", "refs", "bisect", "bad"), "ref: main-worktree/ORIG_HEAD\n");
-    writeFileSync(join(mainWorktree, ".git", "HEAD"), "ref: refs/bisect/bad\n");
-    fifo(join(mainWorktree, ".git", "refs", "tags", "master"));
-    insert("p-main-worktree-pseudo", mainWorktree);
-    expect(await attempt("p-main-worktree-pseudo", mainWorktree, null)).toBe("invalid_repository");
-
-    const mainWorktreeRoot = prepare("main-worktree-root");
-    git(mainWorktreeRoot, ["checkout", "-q", "-b", "other"]);
-    mkdirSync(join(mainWorktreeRoot, ".git", "refs", "bisect"), { recursive: true });
-    writeFileSync(join(mainWorktreeRoot, ".git", "refs", "bisect", "bad"), "ref: refs/heads/master\n");
-    const mainWorktreeChild = join(dir, "main-worktree-child");
-    git(mainWorktreeRoot, ["worktree", "add", "-q", "-b", "wt", mainWorktreeChild, "other"]);
-    const mainWorktreeGitdir = readFileSync(join(mainWorktreeChild, ".git"), "utf8").trim();
-    const mainWorktreeDeclared = mainWorktreeGitdir.startsWith("gitdir: ") ? mainWorktreeGitdir.slice("gitdir: ".length).trim() : "";
-    const mainWorktreeGit = mainWorktreeDeclared.startsWith("/") ? mainWorktreeDeclared : join(mainWorktreeChild, mainWorktreeDeclared);
-    mkdirSync(join(mainWorktreeGit, "refs", "bisect"), { recursive: true });
-    writeFileSync(join(mainWorktreeGit, "refs", "bisect", "bad"), "ref: main-worktree/refs/bisect/bad\n");
-    writeFileSync(join(mainWorktreeGit, "HEAD"), "ref: refs/bisect/bad\n");
-    fifo(join(mainWorktreeRoot, ".git", "refs", "tags", "master"));
-    insert("p-main-worktree-linked", mainWorktreeChild);
-    expect(await attempt("p-main-worktree-linked", mainWorktreeChild, null)).toBe("invalid_repository");
 
     const healthy = prepare("branch-healthy");
     insert("p-branch-healthy", healthy);
@@ -2292,8 +2141,6 @@ describe("repository import", () => {
     const healthyChain = prepare("branch-chain-healthy");
     git(healthyChain, ["symbolic-ref", "refs/heads/link", "refs/heads/master"]);
     git(healthyChain, ["symbolic-ref", "HEAD", "refs/heads/link"]);
-    writeFileSync(join(healthyChain, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
-    writeFileSync(join(healthyChain, ".git", "HEAD"), "ref: refs/heads/alias\n");
     insert("p-branch-chain-healthy", healthyChain);
     const chainImported = await importRepository({ config, store }, projectFor("p-branch-chain-healthy", healthyChain), null, "tester");
     expect(await Bun.file(join(chainImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
@@ -2354,211 +2201,6 @@ describe("repository import", () => {
       "tester",
     );
     expect(await Bun.file(join(mainWorktreeLinkedImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
-    const healthyAmbiguous = prepare("branch-ambiguous-healthy");
-    writeFileSync(join(healthyAmbiguous, ".git", "refs", "tags", "master"), readFileSync(join(healthyAmbiguous, ".git", "refs", "heads", "master")));
-    insert("p-branch-ambiguous-healthy", healthyAmbiguous);
-    const ambiguousImported = await importRepository({ config, store }, projectFor("p-branch-ambiguous-healthy", healthyAmbiguous), null, "tester");
-    expect(await Bun.file(join(ambiguousImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
-
-    const healthyMainWorktree = prepare("main-worktree-healthy");
-    git(healthyMainWorktree, ["checkout", "-q", "-b", "other"]);
-    mkdirSync(join(healthyMainWorktree, ".git", "refs", "bisect"), { recursive: true });
-    writeFileSync(join(healthyMainWorktree, ".git", "ORIG_HEAD"), "ref: refs/heads/master\n");
-    writeFileSync(join(healthyMainWorktree, ".git", "refs", "bisect", "bad"), "ref: main-worktree/ORIG_HEAD\n");
-    writeFileSync(join(healthyMainWorktree, ".git", "HEAD"), "ref: refs/bisect/bad\n");
-    insert("p-main-worktree-healthy", healthyMainWorktree);
-    const mainWorktreeImported = await importRepository({ config, store }, projectFor("p-main-worktree-healthy", healthyMainWorktree), null, "tester");
-    expect(await Bun.file(join(mainWorktreeImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
-
-    const healthyLinkedRoot = prepare("main-worktree-linked-healthy");
-    git(healthyLinkedRoot, ["checkout", "-q", "-b", "other"]);
-    mkdirSync(join(healthyLinkedRoot, ".git", "refs", "bisect"), { recursive: true });
-    writeFileSync(join(healthyLinkedRoot, ".git", "refs", "bisect", "bad"), "ref: refs/heads/master\n");
-    const healthyLinked = join(dir, "main-worktree-linked-healthy-child");
-    git(healthyLinkedRoot, ["worktree", "add", "-q", "-b", "wt-healthy", healthyLinked, "other"]);
-    const healthyLinkedGitdir = readFileSync(join(healthyLinked, ".git"), "utf8").trim();
-    const healthyLinkedDeclared = healthyLinkedGitdir.startsWith("gitdir: ") ? healthyLinkedGitdir.slice("gitdir: ".length).trim() : "";
-    const healthyLinkedGit = healthyLinkedDeclared.startsWith("/") ? healthyLinkedDeclared : join(healthyLinked, healthyLinkedDeclared);
-    mkdirSync(join(healthyLinkedGit, "refs", "bisect"), { recursive: true });
-    writeFileSync(join(healthyLinkedGit, "refs", "bisect", "bad"), "ref: main-worktree/refs/bisect/bad\n");
-    writeFileSync(join(healthyLinkedGit, "HEAD"), "ref: refs/bisect/bad\n");
-    insert("p-main-worktree-linked-healthy", healthyLinked);
-    const linkedImported = await importRepository({ config, store }, projectFor("p-main-worktree-linked-healthy", healthyLinked), null, "tester");
-    expect(await Bun.file(join(linkedImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
-  });
-
-  test("import does not wait on a pipe Git opens while resolving HEAD", async () => {
-    const side = prepare("ref-fifo");
-    fifo(join(side, ".git", "refs", "heads", "side"));
-    insert("p-ref-fifo", side);
-
-    const linked = prepare("ref-link-fifo");
-    const linkedFifo = join(dir, "ref-link.fifo");
-    fifo(linkedFifo);
-    symlinkSync(linkedFifo, join(linked, ".git", "refs", "heads", "side"));
-    insert("p-ref-link-fifo", linked);
-
-    const worktree = prepare("worktree-fifo");
-    mkdirSync(join(worktree, ".git", "worktrees", "evil"), { recursive: true });
-    fifo(join(worktree, ".git", "worktrees", "evil", "HEAD"));
-    insert("p-worktree-fifo", worktree);
-
-    const pseudo = prepare("pseudo-fifo");
-    fifo(join(pseudo, ".git", "FETCH_HEAD"));
-    insert("p-pseudo-fifo", pseudo);
-
-    for (const [id, source, ref] of [
-      ["p-ref-fifo", side, "side"],
-      ["p-ref-link-fifo", linked, "side"],
-      ["p-worktree-fifo", worktree, "worktrees/evil/HEAD"],
-      ["p-pseudo-fifo", pseudo, "FETCH_HEAD"],
-    ] as const) {
-      expect(await attempt(id, source, ref)).toBe("invalid_repository");
-    }
-    expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories WHERE project_id IN ('p-ref-fifo', 'p-ref-link-fifo', 'p-worktree-fifo', 'p-pseudo-fifo')")?.count).toBe(0);
-
-    const healthy = prepare("ref-healthy");
-    const trunk = Bun.spawnSync(["git", "-C", healthy, "branch", "--show-current"], {
-      env: gitEnv,
-      stdout: "pipe",
-      stderr: "pipe",
-    }).stdout.toString().trim();
-    expect(trunk.length).toBeGreaterThan(0);
-    writeFileSync(join(healthy, "a.js"), "SIDE\n");
-    git(healthy, ["checkout", "-q", "-b", "side"]);
-    git(healthy, ["add", "a.js"]);
-    git(healthy, ["commit", "-qm", "side"]);
-    git(healthy, ["checkout", "-q", trunk]);
-    mkdirSync(join(healthy, ".git", "worktrees", "demo"), { recursive: true });
-    const socket = Bun.spawnSync([
-      "python3",
-      "-c",
-      "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); t=socket.socket(socket.AF_UNIX); t.bind(sys.argv[2])",
-      join(healthy, ".git", "fsmonitor--daemon.ipc"),
-      join(healthy, ".git", "worktrees", "demo", "fsmonitor--daemon.ipc"),
-    ]);
-    expect(socket.exitCode).toBe(0);
-    insert("p-ref-healthy", healthy);
-    const imported = await importRepository({ config, store }, projectFor("p-ref-healthy", healthy), "side", "tester");
-    expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("SIDE\n");
-    const head = await importRepository({ config, store }, projectFor("p-ref-healthy", healthy), "HEAD", "tester");
-    expect(await Bun.file(join(head.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
-  });
-
-  test("a git ref import archives the requested commit without replacement refs", async () => {
-    const gitEnv = {
-      PATH: process.env.PATH ?? "/usr/bin:/bin",
-      GIT_AUTHOR_NAME: "Tester",
-      GIT_AUTHOR_EMAIL: "tester@example.com",
-      GIT_COMMITTER_NAME: "Tester",
-      GIT_COMMITTER_EMAIL: "tester@example.com",
-    };
-    const git = (cwd: string, args: string[]): void => {
-      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
-        env: gitEnv,
-    const source = join(dir, "replace-ref");
-    mkdirSync(source);
-    const git = (args: string[], stdin?: Buffer): string => {
-      const result = Bun.spawnSync(["git", "-C", source, ...args], {
-        env: gitEnv,
-        stdin,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
-    };
-    const fifo = (path: string): void => {
-      expect(Bun.spawnSync(["mkfifo", path]).exitCode).toBe(0);
-    };
-    const prepare = (name: string, branch = "master"): string => {
-      const source = join(dir, name);
-      mkdirSync(source, { recursive: true });
-      git(source, ["init", "-q", "-b", "master"]);
-      writeFileSync(join(source, "a.js"), "LOCAL_ONLY\n");
-      git(source, ["add", "a.js"]);
-      git(source, ["commit", "-qm", "local"]);
-      if (branch !== "master") git(source, ["checkout", "-q", "-b", branch]);
-      return source;
-    };
-    const project = (id: string, source: string) => ({
-      id,
-      source_path: source,
-      scope_include: JSON.stringify(["**/*.js"]),
-      scope_exclude: "[]",
-    });
-    const insert = (id: string, source: string): void => {
-      store.run(
-        `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
-         VALUES (?, ?, '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
-        id, id, source, JSON.stringify(["**/*.js"]),
-      );
-    };
-    const attempt = async (id: string, source: string, ref: string | null): Promise<string> => {
-      insert(id, source);
-      return Promise.race([
-        importRepository({ config, store }, project(id, source), ref, "tester")
-          .then(() => "imported")
-          .catch((error: { code?: string }) => error.code ?? "error"),
-        Bun.sleep(800).then(() => "blocked"),
-      ]);
-    };
-
-    const tagsBranch = prepare("head-tags-branch");
-    fifo(join(tagsBranch, ".git", "refs", "tags", "master"));
-    expect(await attempt("p-head-tags-worktree", tagsBranch, null)).toBe("invalid_repository");
-    expect(await attempt("p-head-tags-head", tagsBranch, "HEAD")).toBe("invalid_repository");
-
-    const gitBranch = prepare("head-git-branch");
-    git(gitBranch, ["tag", "v1"]);
-    fifo(join(gitBranch, ".git", "master"));
-    expect(await attempt("p-head-git-worktree", gitBranch, null)).toBe("invalid_repository");
-    expect(await attempt("p-head-git-v1", gitBranch, "v1")).toBe("invalid_repository");
-
-    const nested = prepare("head-nested", "feature/foo");
-    mkdirSync(join(nested, ".git", "refs", "tags", "feature"), { recursive: true });
-    fifo(join(nested, ".git", "refs", "tags", "feature", "foo"));
-    expect(await attempt("p-head-nested", nested, null)).toBe("invalid_repository");
-
-    const chained = prepare("head-chain");
-    git(chained, ["symbolic-ref", "refs/heads/next", "refs/heads/master"]);
-    git(chained, ["symbolic-ref", "HEAD", "refs/heads/next"]);
-    fifo(join(chained, ".git", "refs", "tags", "master"));
-    expect(await attempt("p-head-chain", chained, null)).toBe("invalid_repository");
-
-    const holder = prepare("head-common-holder", "other");
-    fifo(join(holder, ".git", "refs", "tags", "master"));
-    const child = prepare("head-common-child");
-    writeFileSync(join(child, ".git", "commondir"), `${join(holder, ".git")}\n`);
-    expect(await attempt("p-head-common", child, null)).toBe("invalid_repository");
-
-    const healthy = prepare("head-healthy");
-    git(healthy, ["tag", "v1"]);
-    git(healthy, ["update-ref", "refs/remotes/origin/master", "HEAD"]);
-    expect(await attempt("p-head-healthy", healthy, null)).toBe("imported");
-      return result.stdout.toString().trim();
-    };
-    git(["init", "-q"]);
-    writeFileSync(join(source, "a.js"), "VISIBLE\n");
-    git(["add", "a.js"]);
-    git(["commit", "-qm", "visible"]);
-    const commit = git(["rev-parse", "HEAD"]);
-    const blob = git(["rev-parse", "HEAD:a.js"]);
-    const hidden = git(["hash-object", "-w", "--stdin"], Buffer.from("HIDDEN\n"));
-    mkdirSync(join(source, ".git", "refs", "replace"));
-    writeFileSync(join(source, ".git", "refs", "replace", blob), `${hidden}\n`);
-    store.run(
-      `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
-       VALUES ('p-replace', 'replace', '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
-      source, JSON.stringify(["**/*.js"]),
-    );
-    const imported = await importRepository({ config, store }, {
-      id: "p-replace",
-      source_path: source,
-      scope_include: JSON.stringify(["**/*.js"]),
-      scope_exclude: "[]",
-    }, "HEAD", "tester");
-    expect(imported.commit_sha).toBe(commit);
-    expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("VISIBLE\n");
   });
 
   test("workspaces are read-only by default and owner-writable only on explicit request", async () => {

@@ -639,3 +639,77 @@ test("sensitive settings require confirmation only when newly enabled", async ()
   expect((await update({ "security.allow_shell_tools": false, "security.allow_writable_workspace": false })).status).toBe(200);
   expect((await update(settings)).status).toBe(400);
 });
+
+test("dynamic target, authorization, and identity routes enforce roles and hide secrets", async () => {
+  const { api, headers } = await projectClient();
+  const projectResponse = await api(new Request("http://localhost/api/projects", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ name: "Targets", source_path: dir, scope_include: ["**/*"] }),
+  }));
+  expect(projectResponse.status).toBe(201);
+  const projectId = (await projectResponse.json()).project.id;
+
+  const targetResponse = await api(new Request(`http://localhost/api/projects/${projectId}/targets`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      label: "Staging",
+      base_url: "https://app.example.test",
+      environment: "staging",
+      allowed_hosts: ["app.example.test"],
+      allowed_methods: ["GET"],
+    }),
+  }));
+  expect(targetResponse.status).toBe(201);
+  const target = (await targetResponse.json()).target;
+  expect(target.allowedHosts).toEqual(["app.example.test"]);
+
+  const authorizationResponse = await api(new Request(`http://localhost/api/targets/${target.id}/authorizations`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      authorized_by: "Tester",
+      authorization_ref: "AUTH-1",
+      valid_from: "2020-01-01T00:00:00.000Z",
+      valid_until: "2099-01-01T00:00:00.000Z",
+      authorized_actions: { methods: ["GET"] },
+      restrictions: {},
+    }),
+  }));
+  expect(authorizationResponse.status).toBe(201);
+
+  const identityResponse = await api(new Request(`http://localhost/api/targets/${target.id}/identities`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ label: "User A", role: "user_a", auth_kind: "header", secret_ref: "cred_a" }),
+  }));
+  expect(identityResponse.status).toBe(201);
+  const identity = (await identityResponse.json()).identity;
+  expect(identity).not.toHaveProperty("secretRef");
+  expect(identity).not.toHaveProperty("secret_ref");
+
+  const list = await api(new Request(`http://localhost/api/projects/${projectId}/targets`, { headers }));
+  expect(list.status).toBe(200);
+  expect((await list.json()).targets).toHaveLength(1);
+
+  await auth.createUser("viewer@test.local", "Viewer", "viewer-password", "viewer");
+  const viewerLogin = await auth.login("viewer@test.local", "viewer-password", "local", "test");
+  const viewerHeaders = {
+    cookie: `argus_session=${viewerLogin.token}`,
+    "x-csrf-token": viewerLogin.csrf,
+    "content-type": "application/json",
+  };
+  const forbiddenResponse = await api(new Request(`http://localhost/api/projects/${projectId}/targets`, {
+    method: "POST",
+    headers: viewerHeaders,
+    body: JSON.stringify({
+      label: "Nope",
+      base_url: "https://nope.example.test",
+      environment: "staging",
+      allowed_hosts: ["nope.example.test"],
+    }),
+  }));
+  expect(forbiddenResponse.status).toBe(403);
+  expect(store.all("SELECT action FROM audit_log WHERE action LIKE 'target.%' ORDER BY id")).toHaveLength(3);
+});

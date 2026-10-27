@@ -384,6 +384,15 @@ export class TargetService {
     return row ? authorizationFromRow(row) : null;
   }
 
+  listAuthorizations(targetId: string): TargetAuthorization[] {
+    return this.store
+      .all<AuthorizationRow>(
+        "SELECT * FROM target_authorizations WHERE target_id = ? ORDER BY created_at DESC, id",
+        targetId,
+      )
+      .map(authorizationFromRow);
+  }
+
   activeAuthorization(targetId: string, at: string = now()): TargetAuthorization | null {
     const row = this.store.get<AuthorizationRow>(
       `SELECT * FROM target_authorizations

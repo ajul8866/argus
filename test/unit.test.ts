@@ -671,6 +671,45 @@ describe("evidence chain", () => {
     });
   });
 
+  for (const truncate of [false, true]) {
+    test(`evidence content ${truncate ? "rejects EOF" : "reassembles partial reads"} after opening the sidecar`, async () => {
+      const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "partial", content: "alpha" });
+      const probe = await open(row.content_path, "r");
+      const proto = Object.getPrototypeOf(probe) as {
+        read: (
+          this: unknown,
+          buffer: Buffer,
+          offset: number,
+          length: number,
+          position: number,
+        ) => Promise<{ bytesRead: number }>;
+      };
+      await probe.close();
+      const originalRead = proto.read;
+      let reads = 0;
+      proto.read = async function (buffer, offset, length, position) {
+        reads += 1;
+        const result = await originalRead.call(this, buffer, offset, Math.min(length, 7), position);
+        if (truncate && reads === 1) writeFileSync(row.content_path, "");
+        return result;
+      };
+      try {
+        if (truncate) {
+          await expect(evidence.content(row.id)).rejects.toMatchObject({
+            status: 409,
+            code: "conflict",
+            message: "Evidence integrity check failed; Evidence file is missing or unreadable",
+          });
+        } else {
+          expect((await evidence.content(row.id))?.content).toBe("alpha");
+        }
+        expect(reads).toBeGreaterThan(1);
+      } finally {
+        proto.read = originalRead;
+      }
+    });
+  }
+
   test("reports omit a code excerpt whose sidecar does not match the database record", async () => {
     store.run(
       `INSERT INTO findings (

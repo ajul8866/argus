@@ -26,9 +26,10 @@ import { evaluateEvidence } from "./evidence-gate.ts";
 import { validateAuditOverrides } from "./options.ts";
 import { TargetService, type AuditScopeSnapshot } from "../dynamic/targets.ts";
 import { createBrokerDynamicExecutor, runPocChecks } from "../dynamic/executor.ts";
+import type { DynamicExecutor, IntentDecision, IntentInput } from "../dynamic/types.ts";
 import { RetestService } from "../dynamic/retest.ts";
 import { evaluateRun, validatePoc, type PocManifest } from "../dynamic/poc.ts";
-import { GraphStore, type Coverage, type ExplorationNode } from "../dynamic/graph.ts";
+import { GraphStore } from "../dynamic/graph.ts";
 import type { Inventory } from "../repo/inventory.ts";
 import { inventoryForAgent, inventorySummary } from "../repo/inventory.ts";
 import {
@@ -240,37 +241,13 @@ const RESULT_SESSION_STATUS: Record<string, SessionRow["status"]> = {
   failed: "failed",
 };
 
-export type IntentInput = {
-  title: string;
-  assetIds: string[];
-  method: string;
-  path: string;
-  expectedSignal?: string;
-  rationale?: string;
-  category?: string;
-};
-
-export type IntentDecision = {
-  accepted: string[];
-  rejected: Array<{ index: number; reason: string }>;
-};
-
-export type DynamicPlannerContext = {
-  auditId: string;
-  snapshot: AuditScopeSnapshot;
-  coverage: Coverage[];
-  frontier: ExplorationNode[];
-};
-
-export type DynamicExecutionResult = {
-  costUsd: number;
-  facts: Array<{ status: number; assetIds: string[]; summary?: string }>;
-};
-
-export type DynamicExecutor = {
-  plan(context: DynamicPlannerContext): Promise<IntentInput[]>;
-  execute(auditId: string, intent: IntentInput & { nodeId: string }): Promise<DynamicExecutionResult>;
-};
+export type {
+  DynamicExecutionResult,
+  DynamicExecutor,
+  DynamicPlannerContext,
+  IntentDecision,
+  IntentInput,
+} from "../dynamic/types.ts";
 
 export class AuditEngine {
   private timer: ReturnType<typeof setInterval> | null = null;

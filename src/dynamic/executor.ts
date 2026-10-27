@@ -1,31 +1,12 @@
-import { request as httpRequest } from "node:http";
 import type { Config } from "../config.ts";
 import type { Store } from "../db/index.ts";
-import type { DynamicExecutor, DynamicExecutionResult, DynamicPlannerContext } from "../orchestrator/engine.ts";
+import type { DynamicExecutor, DynamicExecutionResult, DynamicPlannerContext } from "./types.ts";
 import { BrokerServer } from "./broker.ts";
 import { CredentialBroker } from "./credentials.ts";
 import type { EgressPolicy } from "./egress.ts";
 import { GraphStore } from "./graph.ts";
 import { TargetService } from "./targets.ts";
-
-function proxyGet(port: number, target: string, identityId: string | null): Promise<{ status: number; body: string }> {
-  return new Promise((resolve, reject) => {
-    const headers: Record<string, string> = {};
-    if (identityId) headers["x-argus-identity"] = identityId;
-    const request = httpRequest(
-      { host: "127.0.0.1", port, method: "GET", path: target, headers },
-      (response) => {
-        const chunks: Buffer[] = [];
-        response.on("data", (chunk: Buffer) => chunks.push(chunk));
-        response.on("end", () =>
-          resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }),
-        );
-      },
-    );
-    request.on("error", reject);
-    request.end();
-  });
-}
+import { requestThroughBroker } from "./http.ts";
 
 export type BrokerCheckExchanges = {
   positive: { status: number; body: string };
@@ -63,7 +44,7 @@ export async function runPocChecks(
     const run = async (name: "positive" | "exploit" | "negative") => {
       const check = manifest.checks[name];
       const target = new URL(check.request.path, snapshot.target.base_url).toString();
-      return proxyGet(port, target, check.identity);
+      return requestThroughBroker(port, target, check.request.method, check.identity);
     };
     return { positive: await run("positive"), exploit: await run("exploit"), negative: await run("negative") };
   } finally {
@@ -123,7 +104,7 @@ export function createBrokerDynamicExecutor(config: Config, store: Store): Dynam
       const port = (await broker.start()).port;
       try {
         const target = new URL(intent.path, snapshot.target.base_url).toString();
-        const response = await proxyGet(port, target, snapshot.identities[0]?.id ?? null);
+        const response = await requestThroughBroker(port, target, intent.method, snapshot.identities[0]?.id ?? null);
         return {
           costUsd: 0,
           facts: [

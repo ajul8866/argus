@@ -1,8 +1,8 @@
 import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { connect as netConnect, isIP, type Socket } from "node:net";
+import { connect as netConnect, type Socket } from "node:net";
 import type { ClientRequest } from "node:http";
-import { checkRequest, checkTunnel, isLoopbackHost, RateLimiter, resolveAndValidate, type EgressPolicy } from "./egress.ts";
+import { checkRequest, checkRequestScope, checkTunnel, RateLimiter, resolveAndValidate, type AddressLookup, type EgressPolicy } from "./egress.ts";
 import type { CredentialBroker } from "./credentials.ts";
 
 /** The only capability the broker needs from a credential source. */
@@ -28,28 +28,41 @@ export type BrokerOptions = {
   /** Health checks report whether the broker is ready to serve traffic. */
   isReady?: () => boolean;
   rateLimiter?: RateLimiter;
+  lookup?: AddressLookup;
 };
 
+export const BROKER_FORWARD_PATH = "/__argus/forward";
+export const BROKER_TARGET_HEADER = "x-argus-target-url";
+export const BROKER_DEADLINE_HEADER = "x-argus-deadline";
+
 const SENSITIVE = new Set(["authorization", "cookie", "set-cookie", "x-api-key", "x-argus-identity"]);
-const HOP_BY_HOP = new Set(["host", "proxy-connection", "connection", "content-length", "x-argus-identity"]);
+const HOP_BY_HOP = new Set(["host", "proxy-connection", "connection", "content-length", "x-argus-identity", BROKER_TARGET_HEADER, BROKER_DEADLINE_HEADER]);
 
 export class BrokerServer {
   private server: Server | null = null;
   private readonly sockets = new Set<Socket>();
+  private readonly upstreamRequests = new Map<ClientRequest, (error: Error) => void>();
   private readonly limiter: RateLimiter;
+  private stopping = false;
 
   constructor(private readonly options: BrokerOptions) {
     this.limiter = options.rateLimiter ?? new RateLimiter();
   }
 
   start(port = 0, host = "127.0.0.1"): Promise<{ port: number }> {
+    this.stopping = false;
     this.server = createServer((request, response) => {
       void this.handleHttp(request, response).catch((error) => {
+        if (response.destroyed) return;
         if (!response.headersSent) {
           response.writeHead(502, { "content-type": "application/json" });
         }
         response.end(JSON.stringify({ error: { code: "broker_error", message: String(error) } }));
       });
+    });
+    this.server.on("connection", (socket) => {
+      this.sockets.add(socket);
+      socket.once("close", () => this.sockets.delete(socket));
     });
     this.server.on("connect", (request, socket, head) => {
       void this.handleConnect(request, socket as Socket, head).catch(() => socket.destroy());
@@ -64,6 +77,9 @@ export class BrokerServer {
   }
 
   async stop(): Promise<void> {
+    this.stopping = true;
+    for (const cancel of this.upstreamRequests.values()) cancel(new Error("the broker stopped"));
+    this.upstreamRequests.clear();
     for (const socket of this.sockets) socket.destroy();
     this.sockets.clear();
     await new Promise<void>((resolve) => {
@@ -76,19 +92,25 @@ export class BrokerServer {
   private async handleHttp(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const started = Date.now();
     const method = (request.method ?? "GET").toUpperCase();
-    const url = request.url ?? "";
+    const requestedDeadline = Number(request.headers[BROKER_DEADLINE_HEADER]);
+    const deadline = Math.min(started + 30_000, Number.isFinite(requestedDeadline) ? requestedDeadline : Infinity);
+    const target = request.headers[BROKER_TARGET_HEADER];
+    const url = request.url === BROKER_FORWARD_PATH
+      ? typeof target === "string" ? target : ""
+      : request.url ?? "";
     // Container health checks must not be treated as proxied traffic.
-    if (url === "/__argus/health" && (method === "GET" || method === "HEAD")) {
+    if (request.url === "/__argus/health" && (method === "GET" || method === "HEAD")) {
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({ ok: this.options.isReady?.() ?? true }));
       return;
     }
-    const decision = checkRequest(this.options.policy, { method, url });
+    const decision = checkRequestScope(this.options.policy, { method, url });
     if (!decision.allowed) {
       await this.reject(response, "scope_blocked", decision.reason ?? "request blocked", method, url, started);
       return;
     }
     const resolved = await this.resolveTarget(url);
+    if (this.stopping || response.destroyed) return;
     if (!resolved.allowed) {
       await this.reject(response, "scope_blocked", resolved.reason ?? "address not allowed", method, url, started);
       return;
@@ -122,10 +144,13 @@ export class BrokerServer {
 
     try {
       const body = await this.readBody(request);
+      if (this.stopping || response.destroyed) return;
       if (!resolved.address) throw new Error("the target address was not resolved");
-      const pinned = await this.pinnedFetch(url, method, headers, body, resolved.address);
-      response.writeHead(pinned.status, pinned.headers);
-      response.end(pinned.body);
+      const pinned = await this.pinnedFetch(url, method, headers, body, resolved.address, request, response, deadline);
+      if (!response.destroyed) {
+        response.writeHead(pinned.status, pinned.headers);
+        response.end(pinned.body);
+      }
       await this.record({
         method,
         url,
@@ -138,8 +163,10 @@ export class BrokerServer {
       });
       return;
     } catch (error) {
-      response.writeHead(502, { "content-type": "application/json" });
-      response.end(JSON.stringify({ error: { code: "upstream_error", message: String(error) } }));
+      if (!response.destroyed) {
+        response.writeHead(502, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { code: "upstream_error", message: String(error) } }));
+      }
       await this.record({
         method,
         url,
@@ -167,12 +194,7 @@ export class BrokerServer {
       return { allowed: false, reason: "url is invalid" };
     }
     const host = parsed.hostname.replace(/^\[|\]$/g, "");
-    if (isIP(host) || isLoopbackHost(host)) {
-      const address = isIP(host) ? host : "127.0.0.1";
-      const decision = checkRequest(this.options.policy, { method: "GET", url }, [address]);
-      return { allowed: decision.allowed, reason: decision.reason, address };
-    }
-    const resolved = await resolveAndValidate(this.options.policy, host);
+    const resolved = await resolveAndValidate(this.options.policy, host, this.options.lookup);
     if (!resolved.allowed) return { allowed: false, reason: resolved.reason };
     const address = resolved.addresses[0];
     if (!address) return { allowed: false, reason: `host ${host} did not resolve` };
@@ -189,13 +211,42 @@ export class BrokerServer {
     headers: Headers,
     body: Buffer,
     address: string,
+    incoming: IncomingMessage,
+    downstream: ServerResponse,
+    deadline: number,
   ): Promise<{ status: number; headers: Record<string, string>; recordedHeaders: Record<string, string>; body: Buffer }> {
+    if (deadline <= Date.now()) return Promise.reject(new Error("the broker request timed out"));
     const parsed = new URL(url);
     const isHttps = parsed.protocol === "https:";
     const plain = new Headers(headers);
     plain.delete("host");
     plain.delete("content-length");
     return new Promise((resolve, reject) => {
+      const controller = new AbortController();
+      const clientSocket = downstream.socket;
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let upstreamResponse: IncomingMessage | undefined;
+      const cleanup = () => {
+        clearTimeout(timer);
+        downstream.removeListener("close", disconnected);
+        incoming.removeListener("aborted", disconnected);
+        clientSocket?.removeListener("close", disconnected);
+        this.upstreamRequests.delete(request);
+      };
+      const fail = (error: Error) => {
+        if (settled) return;
+        // Bun can emit end after destroy. Latch failure before closing the
+        // request so neither that event nor a client abort can accept a prefix.
+        settled = true;
+        cleanup();
+        reject(error);
+        controller.abort(error);
+        upstreamResponse?.destroy();
+        request.socket?.destroy();
+        request.destroy();
+      };
+      const disconnected = () => fail(new Error("the broker client disconnected"));
       const options = {
         host: address,
         port: Number(parsed.port || (isHttps ? 443 : 80)),
@@ -203,44 +254,65 @@ export class BrokerServer {
         path: `${parsed.pathname}${parsed.search}`,
         headers: { ...Object.fromEntries(plain.entries()), host: parsed.host },
         timeout: 30_000,
+        signal: controller.signal,
       };
       const request: ClientRequest = isHttps
         ? httpsRequest({ ...options, servername: parsed.hostname }, handle)
         : httpRequest(options, handle);
       function handle(response: IncomingMessage): void {
-        {
-          const chunks: Buffer[] = [];
-          let size = 0;
-          response.on("data", (chunk: Buffer) => {
-            size += chunk.length;
-            if (size > 5_000_000) {
-              request.destroy(new Error("response exceeds the broker limit"));
-              return;
-            }
-            chunks.push(chunk);
-          });
-          response.on("end", () => {
-            const forwarded: Record<string, string> = {};
-            const recorded: Record<string, string> = {};
-            for (const [key, value] of Object.entries(response.headers)) {
-              if (["content-encoding", "content-length", "transfer-encoding", "connection"].includes(key)) continue;
-              const text = Array.isArray(value) ? value.join(", ") : String(value ?? "");
-              forwarded[key] = text;
-              recorded[key] = SENSITIVE.has(key) ? "[REDACTED]" : text;
-            }
-            resolve({ status: response.statusCode ?? 0, headers: forwarded, recordedHeaders: recorded, body: Buffer.concat(chunks) });
-          });
-          response.on("error", reject);
+        upstreamResponse = response;
+        if (settled) {
+          response.destroy();
+          return;
         }
+        const chunks: Buffer[] = [];
+        let size = 0;
+        response.on("data", (chunk: Buffer) => {
+          size += chunk.length;
+          if (size > 5_000_000) {
+            fail(new Error("response exceeds the broker limit"));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        response.on("end", () => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          const forwarded: Record<string, string> = {};
+          const recorded: Record<string, string> = {};
+          for (const [key, value] of Object.entries(response.headers)) {
+            if (["content-encoding", "content-length", "transfer-encoding", "connection"].includes(key)) continue;
+            const text = Array.isArray(value) ? value.join(", ") : String(value ?? "");
+            forwarded[key] = text;
+            recorded[key] = SENSITIVE.has(key) ? "[REDACTED]" : text;
+          }
+          resolve({ status: response.statusCode ?? 0, headers: forwarded, recordedHeaders: recorded, body: Buffer.concat(chunks) });
+        });
+        response.on("error", fail);
+        response.on("aborted", () => fail(new Error("the upstream response was interrupted")));
       }
-      request.on("timeout", () => request.destroy(new Error("the broker request timed out")));
-      request.on("error", reject);
+      this.upstreamRequests.set(request, fail);
+      downstream.once("close", disconnected);
+      incoming.once("aborted", disconnected);
+      clientSocket?.once("close", disconnected);
+      request.on("timeout", () => fail(new Error("the broker request timed out")));
+      request.on("error", fail);
+      timer = setTimeout(() => fail(new Error("the broker request timed out")), Math.max(0, deadline - Date.now()));
+      if (this.stopping || incoming.aborted || downstream.destroyed) {
+        disconnected();
+        return;
+      }
       if (body.length > 0) request.write(body);
       request.end();
     });
   }
 
   private async handleConnect(request: IncomingMessage, socket: Socket, head: Buffer): Promise<void> {
+    // Bun's CONNECT event exposes a different socket wrapper from connection.
+    // Track it before DNS so shutdown can close a pending tunnel too.
+    this.sockets.add(socket);
+    socket.once("close", () => this.sockets.delete(socket));
     const started = Date.now();
     const target = request.url ?? "";
     const separator = target.lastIndexOf(":");
@@ -262,6 +334,7 @@ export class BrokerServer {
       return;
     }
     const resolved = await this.resolveTunnelHost(host, port);
+    if (this.stopping || socket.destroyed) return;
     if (!resolved.allowed || !resolved.address) {
       socket.end(`HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n\r\n${resolved.reason ?? "address not allowed"}\n`);
       void this.record({
@@ -277,6 +350,10 @@ export class BrokerServer {
       return;
     }
     const upstream = netConnect(port, resolved.address, () => {
+      if (this.stopping || socket.destroyed) {
+        upstream.destroy();
+        return;
+      }
       socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       if (head.length > 0) upstream.write(head);
       upstream.pipe(socket);
@@ -292,7 +369,6 @@ export class BrokerServer {
         responseHeaders: {},
       });
     });
-    this.sockets.add(socket);
     this.sockets.add(upstream);
     upstream.on("error", () => socket.destroy());
     socket.on("error", () => upstream.destroy());
@@ -308,15 +384,14 @@ export class BrokerServer {
     port: number,
   ): Promise<{ allowed: boolean; reason?: string; address?: string }> {
     const name = host.replace(/^\[|\]$/g, "");
-    if (isIP(name) || isLoopbackHost(name)) {
-      const decision = checkTunnel(this.options.policy, name, port);
-      if (!decision.allowed) return { allowed: false, reason: decision.reason };
-      const addresses = await resolveAndValidate(this.options.policy, name);
-      if (!addresses.allowed) return { allowed: false, reason: addresses.reason };
-      return { allowed: true, address: addresses.addresses[0] ?? name };
-    }
-    const resolved = await resolveAndValidate(this.options.policy, name);
+    const tunnel = checkTunnel(this.options.policy, name, port);
+    if (!tunnel.allowed) return { allowed: false, reason: tunnel.reason };
+    const resolved = await resolveAndValidate(this.options.policy, name, this.options.lookup);
     if (!resolved.allowed) return { allowed: false, reason: resolved.reason };
+    // Preserve the existing eligibility gate for opaque tunnels. Unlike the
+    // forwarding endpoint, CONNECT cannot inspect inner methods or paths.
+    const eligible = checkRequest(this.options.policy, { method: "GET", url: `http://${name}/` }, resolved.addresses);
+    if (!eligible.allowed) return { allowed: false, reason: eligible.reason };
     const address = resolved.addresses[0];
     if (!address) return { allowed: false, reason: `host ${name} did not resolve` };
     return { allowed: true, address };

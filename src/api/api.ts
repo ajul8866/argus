@@ -1,5 +1,3 @@
-import { constants } from "node:fs";
-import { open } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { Config } from "../config.ts";
 import { APP_NAME, APP_VERSION, PHASE_NAMES } from "../config.ts";
@@ -21,6 +19,7 @@ import { listRepositoryFolders } from "../repo/directories.ts";
 import { agentDefinition, getSetting, harnessConfig, listAgents, listSettings, saveHarnessConfig, setSetting } from "../settings.ts";
 import { decryptSecret, encryptSecret, type StoredCredential } from "../security/credentials.ts";
 import { redactObject, redactSecrets } from "../security/redact.ts";
+import { readRegularFile } from "../security/regular-file.ts";
 import {
   AppError,
   badRequest,
@@ -45,6 +44,7 @@ import { GraphStore } from "../dynamic/graph.ts";
 import { runPocChecks } from "../dynamic/executor.ts";
 import { DynamicProofService } from "../dynamic/proof.ts";
 import { TokenService } from "../auth/tokens.ts";
+import { authorizeTokenRoute } from "./token-policy.ts";
 
 type ApiDeps = {
   config: Config;
@@ -86,6 +86,7 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
           return json({ error: { code: "csrf_invalid", message: "Missing or invalid CSRF token" } }, 403);
         }
       }
+      if (tokenAuth) authorizeTokenRoute(tokens, tokenAuth.token, method, path);
       const ip = clientIp(peerAddress);
       const tokenUser: AuthUser | null = tokenAuth
         ? {
@@ -653,14 +654,30 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
 
       if (path === "/api/audits" && method === "GET") {
         requireUser();
+        requireScope("audit:read");
         const projectId = url.searchParams.get("project_id");
+        const clauses: string[] = [];
+        const params: string[] = [];
+        if (projectId) {
+          requireProjectScope(projectId);
+          clauses.push("a.project_id = ?");
+          params.push(projectId);
+        }
+        if (tokenAuth?.token.projectId) {
+          clauses.push("a.project_id = ?");
+          params.push(tokenAuth.token.projectId);
+        }
+        if (tokenAuth?.token.auditId) {
+          clauses.push("a.id = ?");
+          params.push(tokenAuth.token.auditId);
+        }
         const rows = deps.store.all(
           `SELECT a.*, p.name AS project_name, r.commit_sha,
              (SELECT COUNT(*) FROM findings f WHERE f.audit_id = a.id) AS finding_count,
              (SELECT COUNT(*) FROM tasks t WHERE t.audit_id = a.id AND t.status IN ('running','queued')) AS active_tasks
            FROM audits a JOIN projects p ON p.id = a.project_id LEFT JOIN repositories r ON r.id = a.repository_id
-           ${projectId ? "WHERE a.project_id = ?" : ""} ORDER BY a.created_at DESC LIMIT 100`,
-          ...(projectId ? [projectId] : []),
+           ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""} ORDER BY a.created_at DESC LIMIT 100`,
+          ...params,
         );
         return json({ audits: rows });
       }
@@ -725,6 +742,7 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
       if (auditActionMatch) {
         const auditId = auditActionMatch[1]!;
         const action = auditActionMatch[2]!;
+        if (tokenAuth) requireAuditScope(auditId);
         if (action === "stream" && method === "GET") {
           requireUser();
           return streamEvents(deps, request, auditId, eventCursor(url));
@@ -928,8 +946,10 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
       const taskMatch = path.match(/^\/api\/tasks\/([^/]+)$/);
       if (taskMatch && method === "GET") {
         requireUser();
+        requireScope("audit:read");
         const task = deps.store.get<Record<string, unknown>>("SELECT * FROM tasks WHERE id = ?", taskMatch[1]);
         if (!task) throw notFound("Task not found");
+        requireAuditScope(String(task.audit_id));
         const dependencies = deps.store.all<{ depends_on_task_id: string; status: string; title: string }>(
           `SELECT d.depends_on_task_id, t.status, t.title FROM task_dependencies d JOIN tasks t ON t.id = d.depends_on_task_id WHERE d.task_id = ?`,
           taskMatch[1],
@@ -1069,8 +1089,17 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         const clauses: string[] = [];
         const params: string[] = [];
         if (auditId) {
+          requireAuditScope(auditId);
           clauses.push("audit_id = ?");
           params.push(auditId);
+        }
+        if (tokenAuth?.token.projectId) {
+          clauses.push("project_id = ?");
+          params.push(tokenAuth.token.projectId);
+        }
+        if (tokenAuth?.token.auditId) {
+          clauses.push("audit_id = ?");
+          params.push(tokenAuth.token.auditId);
         }
         if (status) {
           clauses.push("status = ?");
@@ -1573,7 +1602,7 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         if (typeof expectedSize !== "number" || !Number.isSafeInteger(expectedSize) || expectedSize < 0) {
           throw conflict("Report file is missing or unreadable");
         }
-        const bytes = await readRegularFile(report.path, expectedSize);
+        const bytes = await readReportFile(report.path, expectedSize);
         if (!report.sha256 || sha256(bytes) !== report.sha256) {
           throw conflict("Report integrity check failed; the stored file does not match its recorded hash");
         }
@@ -1722,44 +1751,18 @@ function fsErrorCode(error: unknown): string | undefined {
   return typeof code === "string" ? code : undefined;
 }
 
-async function readRegularFile(path: string, expectedSize: number): Promise<Uint8Array<ArrayBuffer>> {
-  // Both flags are required for the open below to fail closed. A missing flag
-  // is `undefined`, and `number | undefined` becomes `number | 0`.
-  const noFollow = constants.O_NOFOLLOW;
-  const nonBlock = constants.O_NONBLOCK;
-  if (typeof noFollow !== "number" || typeof nonBlock !== "number" || noFollow === 0 || nonBlock === 0) {
-    throw conflict("Report file is missing or unreadable");
-  }
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
+async function readReportFile(path: string, expectedSize: number): Promise<Uint8Array<ArrayBuffer>> {
   try {
-    // O_NOFOLLOW binds the size check and the read to one inode. O_NONBLOCK
-    // makes a replaced pipe return immediately; opening it for read would
-    // otherwise wait until another process connects a writer.
-    handle = await open(path, constants.O_RDONLY | noFollow | nonBlock);
-    const info = await handle.stat();
-    if (!info.isFile()) throw conflict("Report file is missing or unreadable");
-    if (info.size !== expectedSize) {
+    const read = await readRegularFile(path, { exactBytes: expectedSize });
+    if (read.ok) return new Uint8Array(read.bytes);
+    if (read.reason === "size_mismatch") {
       throw conflict("Report integrity check failed; the stored file does not match its recorded size");
     }
-    // Cap the read at the size just observed. readFile() stats again and would
-    // load a file that grew past the bound after this check.
-    const buffer = Buffer.alloc(expectedSize);
-    let offset = 0;
-    while (offset < expectedSize) {
-      const { bytesRead } = await handle.read(buffer, offset, expectedSize - offset, offset);
-      if (bytesRead === 0) break;
-      offset += bytesRead;
-    }
-    if (offset !== expectedSize) {
-      throw conflict("Report integrity check failed; the stored file does not match its recorded size");
-    }
-    return new Uint8Array(buffer);
+    throw read.error ?? conflict("Report file is missing or unreadable");
   } catch (error) {
     if (error instanceof AppError) throw error;
     if (fsErrorCode(error) === "ENOENT") throw notFound("Report file is not available");
     throw conflict("Report file is missing or unreadable");
-  } finally {
-    await handle?.close().catch(() => undefined);
   }
 }
 

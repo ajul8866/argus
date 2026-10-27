@@ -58,6 +58,14 @@ subagent mechanism and never sends the whole workflow as one prompt.
   instances (`src/concurrency.ts`). Each queue serializes work per audit,
   continues after failures, and releases completed audit keys.
 
+Dynamic and hybrid audits also use target authorization snapshots, asset and
+exploration graphs, broker requests, PoC confirmation, and retests from
+`src/dynamic/`. The engine coordinates that exploration alongside the static
+phase barriers. Executor and intent contracts live in `src/dynamic/types.ts`;
+the engine re-exports them for existing callers. The default executor uses an
+in-process broker for a baseline GET probe. Container runtime support is a
+separate integration surface; server composition does not select it by default.
+
 ### 2.2 Harness Manager
 
 `src/harness/manager.ts` builds adapters from persisted harness configuration
@@ -154,6 +162,13 @@ on that open file.
 Verification rows are also append-only. Finding provenance columns are
 immutable; retest session can be set once, never changed.
 
+Evidence sidecars and report downloads share the bounded regular-file reader
+in `src/security/regular-file.ts`. It opens once with `O_NOFOLLOW` and
+`O_NONBLOCK`, checks that descriptor, reads only the observed size, and closes
+it on every path. Evidence supplies a maximum encoded sidecar size; report
+downloads supply the exact recorded size. Domain validation and error mapping
+remain with each caller.
+
 The **platform evidence gate** verifies each cited quote against the repository
 snapshot:
 
@@ -238,6 +253,13 @@ task state, harness status, or report. SSE events trigger debounced refresh;
 SSE is not the source of truth. A refresh for a live route is held while a
 dialog or drawer is open and runs when the last overlay closes, so the audit
 shows its current phase after a task drawer closes.
+
+Coverage and Exploration share their REST payload types, audit selection, and
+row projections through `web/src/exploration-data.ts`. The projections index
+anchors once per invocation rather than scanning every anchor per displayed
+row. Duplicate anchors, input ordering, missing-asset fallbacks, and coverage
+sorting retain their existing semantics. The page modules re-export their
+previous data helpers and types for existing callers.
 
 ## 6. Request flow example (confirmation)
 

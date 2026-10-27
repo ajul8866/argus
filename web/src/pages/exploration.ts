@@ -10,39 +10,10 @@ import {
   section,
   statCard,
 } from "../ui.ts";
-import { selectAudit, type ExplorationPayload, type ExplorationNode } from "./coverage.ts";
+import { explorationRows, selectAudit, type ExplorationPayload } from "../exploration-data.ts";
 
-export type ExplorationRow = {
-  id: string;
-  kind: string;
-  status: string;
-  label: string;
-  taskId: string | null;
-  sessionId: string | null;
-  findingId: string | null;
-  assets: string[];
-  payload: Record<string, unknown>;
-};
-
-export function explorationRows(payload: ExplorationPayload): ExplorationRow[] {
-  const assetKeys = new Map(payload.assets.map((asset) => [asset.id, asset.assetKey]));
-  return payload.nodes.map((node: ExplorationNode) => ({
-    id: node.id,
-    kind: node.kind,
-    status: node.status,
-    label:
-      (typeof node.payload.title === "string" && node.payload.title) ||
-      (typeof node.payload.text === "string" && node.payload.text) ||
-      node.kind,
-    taskId: node.taskId,
-    sessionId: node.sessionId,
-    findingId: typeof node.payload.finding_id === "string" ? node.payload.finding_id : null,
-    assets: payload.anchors
-      .filter((anchor) => anchor.nodeId === node.id)
-      .map((anchor) => assetKeys.get(anchor.assetId) ?? anchor.assetId),
-    payload: node.payload,
-  }));
-}
+export { explorationRows } from "../exploration-data.ts";
+export type { ExplorationRow } from "../exploration-data.ts";
 
 export async function renderExploration(root: HTMLElement, params: URLSearchParams): Promise<void> {
   root.replaceChildren(loading("Loading exploration"));
@@ -58,8 +29,11 @@ export async function renderExploration(root: HTMLElement, params: URLSearchPara
     const payload = await api<ExplorationPayload>(`/api/audits/${audit.id}/exploration`);
     const allRows = explorationRows(payload);
     const assetFilter = params.get("asset");
-    const rows = assetFilter
-      ? allRows.filter((row) => payload.anchors.some((anchor) => anchor.nodeId === row.id && anchor.assetId === assetFilter))
+    const anchoredNodes = assetFilter
+      ? new Set(payload.anchors.filter((anchor) => anchor.assetId === assetFilter).map((anchor) => anchor.nodeId))
+      : null;
+    const rows = anchoredNodes
+      ? allRows.filter((row) => anchoredNodes.has(row.id))
       : allRows;
     const nodeIds = new Set(rows.map((row) => row.id));
     const edges = payload.edges.filter((edge) => nodeIds.has(edge.fromNodeId) && nodeIds.has(edge.toNodeId));

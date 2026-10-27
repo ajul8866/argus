@@ -6,7 +6,6 @@ import { shouldDeferRefresh, shouldRefreshOnReturn } from "../web/src/refresh-po
 import { createAuditWithSnapshot, createProjectWithSnapshot } from "../web/src/components/audit-setup.ts";
 import { coverageRows, type ExplorationPayload } from "../web/src/pages/coverage.ts";
 import { explorationRows } from "../web/src/pages/exploration.ts";
-import { createWorkerToken, revokeWorkerToken, WORKER_SCOPES } from "../web/src/components/worker-tokens.ts";
 
 type Dispatched = { type: string };
 
@@ -552,42 +551,5 @@ describe("dynamic audit setup", () => {
     expect(result.id).toBe("a2");
     expect(calls.map((call) => call.path)).toEqual(["/api/projects/p1/import", "/api/audits"]);
     expect(calls[1]!.body).toMatchObject({ repository_id: "r1", mode: "hybrid", target_id: "t1" });
-  });
-});
-
-describe("worker tokens", () => {
-  function script(results: Array<{ status?: number; body: unknown }>) {
-    const calls: Array<{ path: string; method: string; body: Record<string, unknown> }> = [];
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      calls.push({
-        path: String(input),
-        method: init?.method ?? "GET",
-        body: init?.body ? JSON.parse(String(init.body)) : {},
-      });
-      const next = results.shift();
-      if (!next) throw new Error("Unexpected extra request");
-      return response(next.status ?? 200, next.body);
-    }) as typeof fetch;
-    return calls;
-  }
-
-  test("a worker token is issued with an audit scope and worker scopes only", async () => {
-    const calls = script([{ status: 201, body: { token: { id: "t1", raw: "argus_abc" } } }]);
-    const issued = await createWorkerToken("a1", "cli worker");
-    expect(issued).toEqual({ id: "t1", raw: "argus_abc" });
-    expect(calls.map((call) => `${call.method} ${call.path}`)).toEqual(["POST /api/tokens"]);
-    expect(calls[0]!.body).toMatchObject({
-      label: "cli worker",
-      audit_id: "a1",
-      scopes: ["audit:read", "audit:propose_candidate"],
-    });
-    // A worker must never be able to confirm its own candidate.
-    expect(calls[0]!.body.scopes).not.toContain("audit:confirm_candidate");
-  });
-
-  test("revoking a worker token calls the delete route", async () => {
-    const calls = script([{ body: { ok: true } }]);
-    await revokeWorkerToken("t1");
-    expect(calls.map((call) => `${call.method} ${call.path}`)).toEqual(["DELETE /api/tokens/t1"]);
   });
 });

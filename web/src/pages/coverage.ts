@@ -1,4 +1,5 @@
 import { api } from "../api.ts";
+import { coverageRows, selectAudit, type ExplorationPayload } from "../exploration-data.ts";
 import {
   badge,
   emptyState,
@@ -10,64 +11,16 @@ import {
   statCard,
 } from "../ui.ts";
 
-export type ExplorationAsset = { id: string; kind: string; assetKey: string };
-export type ExplorationNode = {
-  id: string;
-  kind: string;
-  status: string;
-  payload: Record<string, unknown>;
-  taskId: string | null;
-  sessionId: string | null;
-};
-export type ExplorationEdge = { fromNodeId: string; toNodeId: string; kind: string };
-export type CoverageEntry = { assetId: string; kind: string; assetKey: string; tested: boolean };
-export type ExplorationPayload = {
-  assets: ExplorationAsset[];
-  nodes: ExplorationNode[];
-  edges: ExplorationEdge[];
-  anchors: Array<{ nodeId: string; assetId: string }>;
-  coverage: CoverageEntry[];
-};
-
-export type CoverageRow = {
-  assetId: string;
-  kind: string;
-  assetKey: string;
-  tested: boolean;
-  nodes: number;
-  findings: number;
-};
-
-export function coverageRows(payload: ExplorationPayload): CoverageRow[] {
-  const nodes = new Map(payload.nodes.map((node) => [node.id, node]));
-  return payload.coverage
-    .map((entry) => {
-      const anchored = payload.anchors
-        .filter((anchor) => anchor.assetId === entry.assetId)
-        .map((anchor) => nodes.get(anchor.nodeId))
-        .filter((node): node is ExplorationNode => Boolean(node));
-      return {
-        ...entry,
-        nodes: anchored.length,
-        findings: anchored.filter((node) => node.kind === "finding").length,
-      };
-    })
-    .sort((left, right) => Number(left.tested) - Number(right.tested) || left.assetKey.localeCompare(right.assetKey));
-}
-
-export type Audit = { id: string; project_name: string; mode?: string; status: string };
-
-export async function selectAudit(params: URLSearchParams): Promise<Audit | null> {
-  const projectId = params.get("project");
-  const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
-  const { audits } = await api<{ audits: Audit[] }>(`/api/audits${query}`);
-  if (audits.length === 0) return null;
-  const requested = params.get("audit");
-  if (requested && audits.some((audit) => audit.id === requested)) {
-    return audits.find((audit) => audit.id === requested)!;
-  }
-  return audits.find((audit) => audit.mode === "dynamic" || audit.mode === "hybrid") ?? audits[0]!;
-}
+export { coverageRows, selectAudit } from "../exploration-data.ts";
+export type {
+  Audit,
+  CoverageEntry,
+  CoverageRow,
+  ExplorationAsset,
+  ExplorationEdge,
+  ExplorationNode,
+  ExplorationPayload,
+} from "../exploration-data.ts";
 
 export async function renderCoverage(root: HTMLElement, params: URLSearchParams): Promise<void> {
   root.replaceChildren(loading("Loading coverage"));

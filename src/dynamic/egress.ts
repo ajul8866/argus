@@ -1,4 +1,5 @@
 import { lookup } from "node:dns/promises";
+import { BlockList, isIP } from "node:net";
 
 export type EgressPolicy = {  baseUrl: string;
   allowedHosts: string[];
@@ -14,60 +15,40 @@ export type EgressPolicy = {  baseUrl: string;
 export type EgressRequest = { method: string; url: string; identityId?: string | null };
 export type EgressDecision = { allowed: boolean; reason?: string };
 
-function ipv4ToInt(ip: string): number | null {
-  const parts = ip.split(".");
-  if (parts.length !== 4) return null;
-  let value = 0;
-  for (const part of parts) {
-    if (!/^\d+$/.test(part)) return null;
-    const octet = Number(part);
-    if (octet < 0 || octet > 255) return null;
-    value = (value << 8) | octet;
+function subnetList(cidrs: string[]): BlockList {
+  const list = new BlockList();
+  for (const cidr of cidrs) {
+    const parts = cidr.trim().split("/");
+    const network = parts[0];
+    const rawPrefix = parts[1];
+    if (parts.length !== 2 || !network || !rawPrefix || !/^\d+$/.test(rawPrefix)) continue;
+    const family = isIP(network);
+    const prefix = Number(rawPrefix);
+    if (!family || !Number.isInteger(prefix) || prefix < 0 || prefix > (family === 6 ? 128 : 32)) continue;
+    list.addSubnet(network, prefix, family === 6 ? "ipv6" : "ipv4");
   }
-  return value >>> 0;
+  return list;
 }
 
-function cidrMatch(ip: string, cidr: string): boolean {
-  const [network, prefixRaw] = cidr.trim().split("/");
-  if (!network || prefixRaw === undefined) return false;
-  const prefix = Number(prefixRaw);
-  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32) return false;
-  const address = ipv4ToInt(ip);
-  const base = ipv4ToInt(network);
-  if (address === null || base === null) return false;
-  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
-  return (address & mask) === (base & mask);
-}
-
-function isBlockedAddress(ip: string): boolean {
-  if (ip.includes(":")) {
-    const lower = ip.toLowerCase();
-    return (
-      lower === "::1" ||
-      lower === "::" ||
-      lower.startsWith("fc") ||
-      lower.startsWith("fd") ||
-      lower.startsWith("fe80:") ||
-      lower.startsWith("::ffff:127.") ||
-      lower.startsWith("::ffff:10.") ||
-      lower.startsWith("::ffff:192.168.")
-    );
-  }
-  const blocked = [
-    "0.0.0.0/8",
-    "10.0.0.0/8",
-    "100.64.0.0/10",
-    "127.0.0.0/8",
-    "169.254.0.0/16",
-    "172.16.0.0/12",
-    "192.0.0.0/24",
-    "192.168.0.0/16",
-    "198.18.0.0/15",
-    "224.0.0.0/4",
-    "240.0.0.0/4",
-  ];
-  return blocked.some((cidr) => cidrMatch(ip, cidr));
-}
+// BlockList normalizes expanded and IPv4-mapped IPv6 addresses before matching.
+const BLOCKED_ADDRESSES = subnetList([
+  "0.0.0.0/8",
+  "10.0.0.0/8",
+  "100.64.0.0/10",
+  "127.0.0.0/8",
+  "169.254.0.0/16",
+  "172.16.0.0/12",
+  "192.0.0.0/24",
+  "192.168.0.0/16",
+  "198.18.0.0/15",
+  "224.0.0.0/4",
+  "240.0.0.0/4",
+  "::/96",
+  "fc00::/7",
+  "fe80::/10",
+  "fec0::/10",
+  "ff00::/8",
+]);
 
 function hostAllowed(host: string, allowedHosts: string[]): boolean {
   const target = host.toLowerCase();
@@ -85,11 +66,8 @@ function pathAllowed(path: string, restrictions: EgressPolicy["restrictions"]): 
   return true;
 }
 
-export function checkRequest(
-  policy: EgressPolicy,
-  request: EgressRequest,
-  resolvedIps: string[] = [],
-): EgressDecision {
+/** Request scope only; forwarding still requires resolved address validation. */
+export function checkRequestScope(policy: EgressPolicy, request: EgressRequest): EgressDecision {
   const method = request.method.trim().toUpperCase();
   const methods = [
     ...policy.allowedMethods,
@@ -103,6 +81,9 @@ export function checkRequest(
   } catch {
     return { allowed: false, reason: "url is invalid" };
   }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return { allowed: false, reason: "target requires http or https" };
+  }
   if (policy.tls && url.protocol !== "https:") {
     return { allowed: false, reason: "target requires https" };
   }
@@ -112,18 +93,39 @@ export function checkRequest(
   if (!pathAllowed(url.pathname, policy.restrictions)) {
     return { allowed: false, reason: `path ${url.pathname} is not allowed` };
   }
-  if (resolvedIps.length > 0) {
-    const cidrs = policy.allowedCidrs.filter(Boolean);
-    for (const ip of resolvedIps) {
-      if (cidrs.length > 0) {
-        if (!cidrs.some((cidr) => cidrMatch(ip, cidr))) {
-          return { allowed: false, reason: `address ${ip} is outside the allowed CIDRs` };
-        }
-      } else if (isBlockedAddress(ip)) {
-        return { allowed: false, reason: `address ${ip} is not routable` };
+  return { allowed: true };
+}
+
+function checkAddresses(policy: EgressPolicy, addresses: string[]): EgressDecision {
+  const cidrs = policy.allowedCidrs.filter(Boolean);
+  const allowed = cidrs.length ? subnetList(cidrs) : null;
+  for (const ip of addresses) {
+    const family = isIP(ip);
+    if (!family) return { allowed: false, reason: `address ${ip} is invalid` };
+    const type = family === 6 ? "ipv6" : "ipv4";
+    if (allowed) {
+      if (!allowed.check(ip, type)) {
+        return { allowed: false, reason: `address ${ip} is outside the allowed CIDRs` };
       }
+    } else if (BLOCKED_ADDRESSES.check(ip, type)) {
+      return { allowed: false, reason: `address ${ip} is not routable` };
     }
-  } else if (!isLoopbackHost(url.hostname) && !policy.allowedCidrs.filter(Boolean).length) {
+  }
+  return { allowed: true };
+}
+
+export function checkRequest(
+  policy: EgressPolicy,
+  request: EgressRequest,
+  resolvedIps: string[] = [],
+): EgressDecision {
+  const scope = checkRequestScope(policy, request);
+  if (!scope.allowed) return scope;
+  if (resolvedIps.length > 0) {
+    return checkAddresses(policy, resolvedIps);
+  }
+  const url = new URL(request.url);
+  if (!isLoopbackHost(url.hostname) && !policy.allowedCidrs.filter(Boolean).length) {
     // Without a resolution result the address class is unknown, so a request
     // could reach a private or metadata address through DNS. Fail closed.
     return { allowed: false, reason: "the request was not resolved and pinned" };
@@ -136,6 +138,13 @@ export function isLoopbackHost(host: string): boolean {
   return name === "localhost" || name === "::1" || name.startsWith("127.");
 }
 
+export type AddressLookup = (host: string) => Promise<string[]>;
+
+async function lookupAddresses(host: string): Promise<string[]> {
+  const records = await lookup(host, { all: true, verbatim: true });
+  return records.map((record) => record.address);
+}
+
 /**
  * Resolves a hostname once and returns every address. The caller must pin one
  * of these addresses for the actual connection so a second, independent
@@ -144,24 +153,21 @@ export function isLoopbackHost(host: string): boolean {
 export async function resolveAndValidate(
   policy: EgressPolicy,
   host: string,
+  resolve: AddressLookup = lookupAddresses,
 ): Promise<{ allowed: boolean; reason?: string; addresses: string[] }> {
-  if (isLoopbackHost(host)) {
-    const address = host === "localhost" || host === "::1" || host === "[::1]" ? "127.0.0.1" : host;
-    const decision = checkRequest(policy, { method: "GET", url: `http://${host}/` }, [address]);
-    return { allowed: decision.allowed, reason: decision.reason, addresses: [address] };
+  if (!hostAllowed(host, policy.allowedHosts)) {
+    return { allowed: false, reason: `host ${host} is outside the scope`, addresses: [] };
   }
   let addresses: string[] = [];
   try {
-    const records = await lookup(host, { all: true, verbatim: true });
-    addresses = records.map((record) => record.address);
+    addresses = isIP(host) ? [host] : host.toLowerCase() === "localhost" ? ["127.0.0.1"] : await resolve(host);
   } catch {
     return { allowed: false, reason: `host ${host} did not resolve`, addresses: [] };
   }
   if (addresses.length === 0) {
     return { allowed: false, reason: `host ${host} did not resolve`, addresses: [] };
   }
-  const decision = checkRequest(policy, { method: "GET", url: `http://${host}/` }, addresses);
-  return { allowed: decision.allowed, reason: decision.reason, addresses };
+  return { ...checkAddresses(policy, addresses), addresses };
 }
 
 export function checkRedirect(

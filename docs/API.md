@@ -5,8 +5,46 @@ HttpOnly cookie. Mutating requests (`POST`, `PUT`, `PATCH`, `DELETE`) require
 `x-csrf-token` from `GET /api/auth/me` or the login response. Errors are
 `{"error":{"code":"...","message":"...","details":...}}`.
 
+Worker and adapter requests may instead use `Authorization: Bearer <token>`
+on the endpoints listed below. Bearer authentication does not use CSRF; it
+requires the token owner's current role, the operation scope, and matching
+project/audit bindings. An invalid bearer is rejected even when a valid cookie
+is also present.
+
 Roles: `viewer` read-only, `auditor` can create/import/run/generate, `admin`
 can also configure harnesses/settings/credentials/users and decide approvals.
+
+## Bearer token boundary
+
+Bearer access is denied unless its method and path are explicitly supported.
+The remaining endpoints require a cookie session, including `/api/auth/*`
+(except public login), `/api/tokens`, settings, users, credentials, local
+Skills/MCP administration, and the global event stream. Unsupported bearer
+requests return `403`; invalid, expired, or revoked tokens return `401`.
+Token issuance, listing, and revocation require a cookie session, so a worker
+token cannot create a broader replacement token.
+
+| Scope | Supported operations |
+| --- | --- |
+| `audit:read` | List/get audits; get audit tasks, sessions, exploration, events, stream, evidence, and reports; get one task |
+| `finding:read` | List/get findings; list findings for an audit |
+| `task:create` | Create a task within an audit; exploration also needs `audit:launch_dynamic` |
+| `task:control` | Retry/cancel one task |
+| `audit:launch_static` | Create/start a static audit |
+| `audit:launch_dynamic` | Create/start a dynamic or hybrid audit |
+| `audit:propose_candidate` | Propose a dynamic candidate |
+| `audit:confirm_candidate` | Confirm a proposed dynamic candidate |
+| `audit:retest` | Request a finding retest |
+| `target:read` | List project targets and target authorizations/identities |
+| `target:manage` | Create project targets and target authorizations/identities |
+
+An audit binding restricts audit operations to that audit and project checks
+to its owning project. A project binding restricts audit operations to audits
+in that project. If both bindings are supplied when issuing a token, the audit
+must belong to the project. Collection queries intersect these bindings before
+applying their limits; an explicitly conflicting query filter returns `403`.
+An audit-bound token cannot create another audit. New audits require an
+appropriate project-bound or unrestricted launch grant.
 
 ## Public
 

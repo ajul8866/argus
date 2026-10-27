@@ -79,8 +79,12 @@ export class TokenService {
     if (input.projectId && !this.store.get("SELECT id FROM projects WHERE id = ?", input.projectId)) {
       throw notFound("Project not found");
     }
-    if (input.auditId && !this.store.get("SELECT id FROM audits WHERE id = ?", input.auditId)) {
-      throw notFound("Audit not found");
+    if (input.auditId) {
+      const audit = this.store.get<{ project_id: string }>("SELECT project_id FROM audits WHERE id = ?", input.auditId);
+      if (!audit) throw notFound("Audit not found");
+      if (input.projectId && audit.project_id !== input.projectId) {
+        throw badRequest("audit_id must belong to project_id");
+      }
     }
     const raw = `argus_${randomBytes(32).toString("base64url")}`;
     const id = uid();
@@ -144,10 +148,20 @@ export class TokenService {
   }
 
   allowsProject(token: ApiToken, projectId: string): boolean {
-    return token.projectId === null || token.projectId === projectId;
+    if (token.projectId !== null && token.projectId !== projectId) return false;
+    if (token.auditId !== null) {
+      const audit = this.store.get<{ project_id: string }>("SELECT project_id FROM audits WHERE id = ?", token.auditId);
+      return audit?.project_id === projectId;
+    }
+    return true;
   }
 
   allowsAudit(token: ApiToken, auditId: string): boolean {
-    return token.auditId === null || token.auditId === auditId;
+    if (token.auditId !== null && token.auditId !== auditId) return false;
+    if (token.projectId !== null) {
+      const audit = this.store.get<{ project_id: string }>("SELECT project_id FROM audits WHERE id = ?", auditId);
+      return audit?.project_id === token.projectId;
+    }
+    return true;
   }
 }

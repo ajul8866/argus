@@ -1,6 +1,5 @@
 import { api, session } from "../api.ts";
 import { openAuditCreate } from "../components/audit-create.ts";
-import { openWorkerToken } from "../components/worker-token-dialog.ts";
 import { openFindingDetail, openTaskDetail } from "../components/execution-detail.ts";
 import { previewReport } from "../components/report-preview.ts";
 import {
@@ -251,9 +250,6 @@ export async function renderAuditDetail(root: HTMLElement, auditId: string, para
           startButton,
           cancelButton,
           h("a", { class: "btn btn-secondary", href: `#/projects/${audit.project_id}` }, "Project"),
-          session.user?.role !== "viewer" && audit.mode !== "static"
-            ? button("Worker token", () => openWorkerToken(audit.id), "ghost")
-            : null,
           session.user?.role !== "viewer" ? button("New audit", () => void openAuditCreate(audit.project_id), "ghost") : null,
         ),
       ),

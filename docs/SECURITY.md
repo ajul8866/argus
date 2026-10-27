@@ -184,7 +184,9 @@ absence of vulnerabilities. Human review is required.
 - Argon2id password hashes; 12-character minimum for new passwords.
 - Random 256-bit session tokens; only SHA-256(token) is stored.
 - HttpOnly, SameSite=Lax cookies; `Secure` when `ARGUS_SECURE_COOKIES=1`.
-- CSRF token required on all mutations.
+- Cookie-authenticated mutations require CSRF. Bearer requests are limited to
+  explicit method/path/operation scopes and project/audit bindings; all other
+  endpoints require a cookie session. Worker tokens cannot issue more tokens.
 - Login rate limit and audit logging.
 - The login throttle uses the socket peer address instead of caller-provided
   forwarding headers.
@@ -226,3 +228,44 @@ absence of vulnerabilities. Human review is required.
     closed) or a per-engagement container for strict repository boundaries.
     Docker Compose uses the container as its boundary and does not claim
     namespace isolation between authorized repositories mounted inside it.
+
+## Dynamic replay transport
+
+PoC replay and the default dynamic executor pass the declared HTTP method,
+path, and query to the broker. Their internal forwarding request uses
+`/__argus/forward` with `x-argus-target-url`; this is a broker endpoint, not an
+Argus `/api` endpoint. Internal target and deadline headers are removed before forwarding. This
+avoids Bun 1.3.14 converting an absolute HTTPS proxy path into CONNECT, which
+would hide the inner request from broker policy and credential injection.
+
+The broker checks the actual method, HTTP(S) scheme, hostname, and path before
+resolution. It then validates every resolved address against CIDR/private
+address restrictions and connects to one of those validated addresses, keeping
+the original Host and TLS server name. Address validation never invents a GET,
+plaintext scheme, or root path. Missing/failed resolution fails closed. TLS
+certificate verification stays enabled.
+
+Private-address and CIDR checks normalize IPv6, including expanded loopback and
+IPv4-mapped addresses. All DNS answers must pass. Explicit IPv4 or IPv6 CIDRs
+can authorize private targets; an invalid CIDR grants no access.
+
+The replay client has a 35-second absolute deadline and a 5,000,000-byte response
+limit. It passes an absolute `x-argus-deadline` to the broker, which caps upstream
+work at 30 seconds from receipt and honors a shorter client deadline. This also
+bounds work when Bun 1.3.14 misses a client disconnect after reading its request
+body. Broker shutdown cancels active upstream requests and closes CONNECT
+clients even while their DNS lookup is pending. Timeout, interruption,
+and overflow fail with a broker 502 or client rejection; a partial response is
+never accepted as a successful exchange. Exactly 5,000,000 bytes are permitted.
+
+Replay supports GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS, and TRACE. Unsupported
+method tokens fail before a connection is made because Bun can otherwise turn
+them into GET. The existing PoC request contract still contains method and path
+only; arbitrary request bodies are not added here.
+
+Opaque CONNECT support retains its prior eligibility gate. TLS-required,
+POST-only, or root-excluding policies continue to refuse those tunnels. The
+broker cannot inspect encrypted inner methods or paths; replay and the default
+executor use the forwarding endpoint rather than opaque tunnels. This change
+does not establish full method/path enforcement for other clients using
+CONNECT under a permissive legacy policy.

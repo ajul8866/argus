@@ -27,8 +27,7 @@
     "demo": "bun run scripts/e2e-real.ts",
     "e2e": "bun run scripts/e2e-real.ts",
     "harness:check": "bun run scripts/check-harnesses.ts",
-    "check": "bun run typecheck && bun run test",
-    "e2e:dynamic": "bun run scripts/e2e-dynamic.ts"
+    "check": "bun run typecheck && bun run test"
   },
   "devDependencies": {
     "@types/bun": "latest",

@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, readdir, realpath, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readdir, readlink, rm } from "node:fs/promises";
 import { dirname, join, relative, sep } from "node:path";
 import type { Config } from "../config.ts";
 import type { Store } from "../db/index.ts";
@@ -65,7 +65,11 @@ const GIT_CONFIG_MAX_BYTES = 1_048_576;
 
 // HEAD and loose refs are tiny text files. A larger file is not a ref Git can
 // use, and reading it could block or pull in an unrelated payload.
-async function readSmallGitText(path: string, maxBytes = 4_096): Promise<string | null> {
+async function readSmallGitText(
+  path: string,
+  maxBytes = 4_096,
+  options?: { requireUtf8?: boolean },
+): Promise<string | null> {
   const noFollow = constants.O_NOFOLLOW;
   const nonBlock = constants.O_NONBLOCK;
   if (typeof noFollow !== "number" || typeof nonBlock !== "number" || noFollow === 0 || nonBlock === 0) {
@@ -95,7 +99,11 @@ async function readSmallGitText(path: string, maxBytes = 4_096): Promise<string 
       if (bytesRead === 0) throw invalidGitMetadata();
       offset += bytesRead;
     }
-    return buffer.toString("utf8");
+    const text = buffer.toString("utf8");
+    // Git uses the raw bytes of a gitfile or commondir. A replacement character
+    // would name a different directory than the one Git opens.
+    if (options?.requireUtf8 && !Buffer.from(text, "utf8").equals(buffer)) throw invalidGitMetadata();
+    return text;
   } finally {
     await handle.close().catch(() => undefined);
   }
@@ -270,7 +278,8 @@ async function assertConfigHasNoInclude(path: string): Promise<void> {
 }
 
 // Git strips only trailing CR and LF from a gitfile or commondir. Spaces and
-// embedded newlines stay in the path, and ".." is resolved after symlinks.
+// embedded newlines stay in the path. ".." is applied after symlinks are
+// followed; see resolveGitDirectoryPath.
 function gitPointerTarget(gitDir: string, text: string): string {
   let end = text.length;
   while (end > 0 && (text[end - 1] === "\n" || text[end - 1] === "\r")) end -= 1;
@@ -279,26 +288,85 @@ function gitPointerTarget(gitDir: string, text: string): string {
   return raw.startsWith("/") ? raw : `${gitDir}/${raw}`;
 }
 
+const MAX_GIT_SYMLINKS = 32;
+
+function stripLastPathComponent(path: string): string {
+  const offset = path.startsWith("/") ? 1 : 0;
+  let length = path.length;
+  while (offset < length && path[length - 1] !== "/") length -= 1;
+  while (offset < length && path[length - 1] === "/") length -= 1;
+  return path.slice(0, length);
+}
+
+// Git follows each symlink and only then applies "..". The runtime realpath
+// cancels ".." against the symlink's name first, so it can return a different
+// directory from the one Git opens. A final symlink is rejected: Git would
+// follow it, and refusing it fails closed before that open.
+async function resolveGitDirectoryPath(target: string): Promise<string> {
+  if (!target.startsWith("/")) throw invalidGitMetadata();
+  let resolved = "/";
+  let remaining = target.slice(1);
+  let symlinks = 0;
+  while (remaining.length > 0) {
+    let start = 0;
+    while (start < remaining.length && remaining[start] === "/") start += 1;
+    let end = start;
+    while (end < remaining.length && remaining[end] !== "/") end += 1;
+    const component = remaining.slice(start, end);
+    remaining = remaining.slice(end);
+    if (!component || component === ".") continue;
+    if (component === "..") {
+      resolved = stripLastPathComponent(resolved);
+      continue;
+    }
+    if (!resolved.endsWith("/")) resolved += "/";
+    resolved += component;
+    let info;
+    try {
+      info = await lstat(resolved);
+    } catch {
+      throw invalidGitMetadata();
+    }
+    if (!info.isSymbolicLink()) continue;
+    const pending = remaining.replace(/^\/+/, "");
+    if (!pending) throw invalidGitMetadata();
+    symlinks += 1;
+    if (symlinks > MAX_GIT_SYMLINKS) throw invalidGitMetadata();
+    let linkBytes: Buffer;
+    try {
+      const linked = await readlink(resolved, { encoding: "buffer" });
+      if (!Buffer.isBuffer(linked)) throw invalidGitMetadata();
+      linkBytes = linked;
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      throw invalidGitMetadata();
+    }
+    const link = linkBytes.toString("utf8");
+    if (!link || link.includes("\0") || !Buffer.from(link, "utf8").equals(linkBytes)) throw invalidGitMetadata();
+    resolved = stripLastPathComponent(resolved);
+    remaining = link.startsWith("/") ? `${link.slice(1)}/${pending}` : `${link}/${pending}`;
+    if (link.startsWith("/")) resolved = "/";
+  }
+  return resolved;
+}
+
 async function resolveExistingGitDirectory(target: string): Promise<string | null> {
+  const resolved = await resolveGitDirectoryPath(target);
   let info;
   try {
-    info = await lstat(target);
-  } catch {
-    return null;
-  }
-  if (info.isSymbolicLink() || !info.isDirectory()) throw invalidGitMetadata();
-  try {
-    return await realpath(target);
+    info = await lstat(resolved);
   } catch {
     throw invalidGitMetadata();
   }
+  if (info.isSymbolicLink() || !info.isDirectory()) throw invalidGitMetadata();
+  return resolved;
 }
 
 // commondir is a path relative to this git directory, or an absolute path.
 // Git reads config and exclude files from that other directory before the
 // later equality check can reject it.
 async function linkedGitDirectory(gitDir: string): Promise<string | null> {
-  const text = await readSmallGitText(join(gitDir, "commondir"));
+  const text = await readSmallGitText(join(gitDir, "commondir"), 4_096, { requireUtf8: true });
   if (text === null) return null;
   return resolveExistingGitDirectory(gitPointerTarget(gitDir, text));
 }
@@ -337,7 +405,7 @@ async function assertGitDirectoryMetadata(gitDir: string, seen = new Set<string>
 // A gitfile is "gitdir: <path>". The path is relative to the file's directory.
 // Git follows it and then opens metadata in that directory.
 async function assertGitFileTarget(gitFilePath: string): Promise<void> {
-  const text = await readSmallGitText(gitFilePath);
+  const text = await readSmallGitText(gitFilePath, 4_096, { requireUtf8: true });
   if (text === null || !text.startsWith("gitdir: ")) return;
   const resolved = await resolveExistingGitDirectory(gitPointerTarget(dirname(gitFilePath), text.slice("gitdir: ".length)));
   if (resolved) await assertGitDirectoryMetadata(resolved);

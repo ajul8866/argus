@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join, relative } from "node:path";
@@ -1066,6 +1066,9 @@ describe("repository import", () => {
       if (existsSync(path)) rmSync(path);
       expect(Bun.spawnSync(["mkfifo", path]).exitCode).toBe(0);
     };
+    // The path types accept strings. A Buffer still reaches the runtime so a
+    // directory name can contain a byte that is not valid UTF-8.
+    const bytePath = (bytes: Buffer): string => bytes as unknown as string;
     const prepare = (name: string): string => {
       const source = join(dir, name);
       mkdirSync(source, { recursive: true });
@@ -1233,6 +1236,90 @@ describe("repository import", () => {
     insert("p-common-link", linkedCommon);
     expect(await attempt("p-common-link", linkedCommon, "HEAD")).toBe("invalid_repository");
 
+    // Lexical ".." and Git's symlink walk name different directories.
+    const dotdot = prepare("common-dotdot");
+    const dotdotInside = join(dir, "dotdot-pivot", "inside");
+    mkdirSync(dotdotInside, { recursive: true });
+    symlinkSync(dotdotInside, join(dotdot, ".git", "link"));
+    const dotdotEvil = join(dir, "dotdot-pivot", "evil-git");
+    cpSync(join(dotdot, ".git"), dotdotEvil, { recursive: true });
+    const dotdotFifo = join(dir, "dotdot-common.fifo");
+    fifo(dotdotFifo);
+    const dotdotConfig = join(dotdotEvil, "config");
+    writeFileSync(dotdotConfig, `${readFileSync(dotdotConfig, "utf8")}\n[include]\n\tpath = ${dotdotFifo}\n`);
+    mkdirSync(join(dotdot, ".git", "evil-git"));
+    writeFileSync(join(dotdot, ".git", "commondir"), "link/../evil-git\n");
+    insert("p-common-dotdot", dotdot);
+    expect(await attempt("p-common-dotdot", dotdot, "HEAD")).toBe("invalid_repository");
+
+    const relParent = prepare("gitfile-rel-link");
+    mkdirSync(join(relParent, "child"));
+    writeFileSync(join(relParent, "child", "a.js"), "LOCAL_CHILD\n");
+    git(relParent, ["add", "child/a.js"]);
+    git(relParent, ["commit", "-qm", "child"]);
+    const relPivot = join(dir, "gitfile-rel-pivot", "inside");
+    mkdirSync(relPivot, { recursive: true });
+    const relEvil = join(dir, "gitfile-rel-pivot", "evil-git");
+    cpSync(join(relParent, ".git"), relEvil, { recursive: true });
+    const relFifo = join(dir, "gitfile-rel.fifo");
+    fifo(relFifo);
+    const relConfig = join(relEvil, "config");
+    writeFileSync(relConfig, `${readFileSync(relConfig, "utf8")}\n[include]\n\tpath = ${relFifo}\n`);
+    renameSync(join(relParent, ".git"), join(relParent, "plain-git"));
+    symlinkSync(relative(relParent, relPivot), join(relParent, "link"));
+    mkdirSync(join(relParent, "evil-git"));
+    writeFileSync(join(relParent, ".git"), "gitdir: link/../evil-git\n");
+    insert("p-gitfile-rel-link", join(relParent, "child"));
+    expect(await attempt("p-gitfile-rel-link", join(relParent, "child"), "HEAD")).toBe("invalid_repository");
+
+    const utf8Common = prepare("utf8-common");
+    const utf8Git = join(utf8Common, ".git");
+    const utf8Template = join(dir, "utf8-common-template");
+    cpSync(utf8Git, utf8Template, { recursive: true });
+    const utf8Evil = Buffer.concat([Buffer.from(`${utf8Git}/evil`), Buffer.from([0xff]), Buffer.from("dir")]);
+    cpSync(utf8Template, bytePath(utf8Evil), { recursive: true });
+    const utf8Fifo = join(dir, "utf8-common.fifo");
+    fifo(utf8Fifo);
+    const utf8Config = Buffer.concat([utf8Evil, Buffer.from("/config")]);
+    writeFileSync(utf8Config, Buffer.concat([readFileSync(utf8Config), Buffer.from(`\n[include]\n\tpath = ${utf8Fifo}\n`)]));
+    mkdirSync(join(utf8Git, "evil\uFFFDdir"));
+    writeFileSync(join(utf8Git, "commondir"), Buffer.concat([Buffer.from("evil"), Buffer.from([0xff]), Buffer.from("dir\n")]));
+    insert("p-utf8-common", utf8Common);
+    expect(await attempt("p-utf8-common", utf8Common, "HEAD")).toBe("invalid_repository");
+
+    const utf8Parent = prepare("utf8-gitfile");
+    mkdirSync(join(utf8Parent, "child"));
+    writeFileSync(join(utf8Parent, "child", "a.js"), "LOCAL_CHILD\n");
+    git(utf8Parent, ["add", "child/a.js"]);
+    git(utf8Parent, ["commit", "-qm", "child"]);
+    const utf8FileEvil = Buffer.concat([Buffer.from(`${utf8Parent}/evil`), Buffer.from([0xff]), Buffer.from("dir")]);
+    cpSync(join(utf8Parent, ".git"), bytePath(utf8FileEvil), { recursive: true });
+    const utf8FileFifo = join(dir, "utf8-gitfile.fifo");
+    fifo(utf8FileFifo);
+    const utf8FileConfig = Buffer.concat([utf8FileEvil, Buffer.from("/config")]);
+    writeFileSync(utf8FileConfig, Buffer.concat([readFileSync(utf8FileConfig), Buffer.from(`\n[include]\n\tpath = ${utf8FileFifo}\n`)]));
+    mkdirSync(join(utf8Parent, "evil\uFFFDdir"));
+    renameSync(join(utf8Parent, ".git"), join(utf8Parent, "plain-git"));
+    writeFileSync(join(utf8Parent, ".git"), Buffer.concat([Buffer.from("gitdir: evil"), Buffer.from([0xff]), Buffer.from("dir\n")]));
+    insert("p-utf8-gitfile", join(utf8Parent, "child"));
+    expect(await attempt("p-utf8-gitfile", join(utf8Parent, "child"), "HEAD")).toBe("invalid_repository");
+
+    const utf8Link = prepare("utf8-link");
+    const utf8LinkGit = join(utf8Link, ".git");
+    const utf8Pivot = Buffer.concat([Buffer.from(`${dir}/utf8-pivot`), Buffer.from([0xff])]);
+    mkdirSync(Buffer.concat([utf8Pivot, Buffer.from("/inside")]), { recursive: true });
+    const utf8LinkEvil = Buffer.concat([utf8Pivot, Buffer.from("/evil-git")]);
+    cpSync(utf8LinkGit, bytePath(utf8LinkEvil), { recursive: true });
+    const utf8LinkFifo = join(dir, "utf8-link.fifo");
+    fifo(utf8LinkFifo);
+    const utf8LinkConfig = Buffer.concat([utf8LinkEvil, Buffer.from("/config")]);
+    writeFileSync(utf8LinkConfig, Buffer.concat([readFileSync(utf8LinkConfig), Buffer.from(`\n[include]\n\tpath = ${utf8LinkFifo}\n`)]));
+    mkdirSync(join(dir, "utf8-pivot\uFFFD", "evil-git"), { recursive: true });
+    symlinkSync(Buffer.concat([utf8Pivot, Buffer.from("/inside")]), join(utf8LinkGit, "link"));
+    writeFileSync(join(utf8LinkGit, "commondir"), "link/../evil-git\n");
+    insert("p-utf8-link", utf8Link);
+    expect(await attempt("p-utf8-link", utf8Link, "HEAD")).toBe("invalid_repository");
+
     const continued = prepare("include-continued");
     const continuedFifo = join(dir, "continued.fifo");
     fifo(continuedFifo);
@@ -1247,6 +1334,18 @@ describe("repository import", () => {
     renameSync(join(healthy, ".git"), join(healthy, "gitdir"));
     writeFileSync(join(healthy, ".git"), "gitdir: gitdir\n");
     insert("p-gitfile-ok", join(healthy, "child"));
+
+    const linkedOk = prepare("gitfile-link-ok");
+    mkdirSync(join(linkedOk, "child"));
+    writeFileSync(join(linkedOk, "child", "a.js"), "LOCAL_CHILD\n");
+    git(linkedOk, ["add", "child/a.js"]);
+    git(linkedOk, ["commit", "-qm", "child"]);
+    const linkedOkNested = join(linkedOk, "nested");
+    mkdirSync(linkedOkNested);
+    renameSync(join(linkedOk, ".git"), join(linkedOkNested, "gitdir"));
+    symlinkSync(linkedOkNested, join(linkedOk, "link"));
+    writeFileSync(join(linkedOk, ".git"), "gitdir: link/gitdir\n");
+    insert("p-gitfile-link-ok", join(linkedOk, "child"));
 
     const worktreeMain = prepare("worktree-main");
     const linkedWorktree = join(dir, "linked-worktree");
@@ -1274,6 +1373,14 @@ describe("repository import", () => {
     const childImport = await importRepository({ config, store }, project("p-gitfile-ok", join(healthy, "child")), "HEAD", "tester");
     expect(await Bun.file(join(childImport.path, "a.js")).text()).toBe("LOCAL_CHILD\n");
     expect(await Bun.file(join(childImport.path, "child")).exists()).toBe(false);
+
+    const linkedOkImport = await importRepository(
+      { config, store },
+      project("p-gitfile-link-ok", join(linkedOk, "child")),
+      "HEAD",
+      "tester",
+    );
+    expect(await Bun.file(join(linkedOkImport.path, "a.js")).text()).toBe("LOCAL_CHILD\n");
 
     const worktreeImport = await importRepository(
       { config, store },

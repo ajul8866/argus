@@ -16,6 +16,7 @@ import { harnessConfig, saveHarnessConfig, seedDefaults, setSetting } from "../s
 import { now, toJson, uid } from "../src/util.ts";
 import { LocalCatalog } from "../src/local/catalog.ts";
 import { TargetService } from "../src/dynamic/targets.ts";
+import { GraphStore } from "../src/dynamic/graph.ts";
 import { mkdirSync, writeFileSync } from "node:fs";
 
 const fixture = join(import.meta.dir, "fixtures", "vulnerable-app");
@@ -1339,5 +1340,84 @@ describe("audit modes", () => {
     const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
 
     await expect(engine.startAudit(id, "u1")).rejects.toMatchObject({ code: "identity_required" });
+  });
+
+  test("accepts in-scope intents and rejects out-of-scope or duplicate intents", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget();
+    targets.createIdentity({ targetId: target.id, label: "User A", role: "user_a", authKind: "none" });
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+    await engine.startAudit(id, "u1");
+    const graph = new GraphStore(store);
+    const asset = graph.upsertAsset({ projectId: "p2", kind: "endpoint", assetKey: "GET /invoices/:id" });
+
+    const decision = engine.acceptIntents(id, [
+      { title: "read invoice", assetIds: [asset.id], method: "GET", path: "/invoices/123", rationale: "check ownership" },
+      { title: "off scope", assetIds: [asset.id], method: "GET", path: "https://evil.example.test/x" },
+      { title: "read invoice again", assetIds: [asset.id], method: "GET", path: "/invoices/123" },
+    ]);
+
+    expect(decision.accepted).toHaveLength(1);
+    expect(decision.rejected).toHaveLength(2);
+    const nodes = store.all<{ status: string }>(
+      "SELECT status FROM exploration_nodes WHERE audit_id = ? AND kind = 'intent' ORDER BY created_at",
+      id,
+    );
+    expect(nodes.map((node) => node.status)).toEqual(["approved", "rejected", "rejected"]);
+
+    await engine.closeExploration(id, "test finished");
+    expect(
+      store.get<{ exploration_status: string }>("SELECT exploration_status FROM audits WHERE id = ?", id)
+        ?.exploration_status,
+    ).toBe("closed");
+  });
+
+  test("phase 2 stays open until exploration closes", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget();
+    targets.createIdentity({ targetId: target.id, label: "User A", role: "user_a", authKind: "none" });
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+    await engine.startAudit(id, "u1");
+    store.run(
+      "INSERT INTO tasks (id, audit_id, phase, kind, task_key, title, status, payload, attempts, max_attempts, created_at) VALUES ('t2', ?, 2, 'phase2.discover', 'phase2:test', 'Discover', 'completed', '{}', 1, 2, ?)",
+      id,
+      now(),
+    );
+
+    await (engine as unknown as { reconcile(id: string): Promise<void> }).reconcile(id);
+    expect(
+      store.get<{ status: string }>("SELECT status FROM audit_phases WHERE audit_id = ? AND phase = 2", id)?.status,
+    ).toBe("running");
+
+    await engine.closeExploration(id, "done");
+    await (engine as unknown as { reconcile(id: string): Promise<void> }).reconcile(id);
+    expect(
+      store.get<{ status: string }>("SELECT status FROM audit_phases WHERE audit_id = ? AND phase = 2", id)?.status,
+    ).toBe("completed");
+  });
+
+  test("prove_goal requires coverage or an unreachable rationale", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget();
+    targets.createIdentity({ targetId: target.id, label: "User A", role: "user_a", authKind: "none" });
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+    await engine.startAudit(id, "u1");
+    const graph = new GraphStore(store);
+    const asset = graph.upsertAsset({ projectId: "p2", kind: "endpoint", assetKey: "GET /invoices/:id" });
+    const goal = graph.listGoal(id)!;
+
+    await expect(engine.proveGoal(id, goal.id, "")).rejects.toThrow(/coverage|rationale/i);
+
+    const fact = graph.createNode({ auditId: id, kind: "fact", status: "completed", payload: {} });
+    graph.anchor(fact.id, asset.id);
+    graph.upsertAsset({ projectId: "p2", kind: "endpoint", assetKey: "GET /admin" });
+    await expect(engine.proveGoal(id, goal.id, "")).rejects.toThrow(/coverage|rationale/i);
+
+    await engine.proveGoal(id, goal.id, "the admin endpoint is unreachable from the test network");
+    expect(graph.getNode(goal.id)?.status).toBe("completed");
+    expect(
+      store.get<{ exploration_status: string }>("SELECT exploration_status FROM audits WHERE id = ?", id)
+        ?.exploration_status,
+    ).toBe("closed");
   });
 });

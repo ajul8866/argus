@@ -24,7 +24,8 @@ import { assertAuthorizedRoot, createWorkspace, verifyQuote } from "../repo/work
 import { redactObject, redactSecrets } from "../security/redact.ts";
 import { evaluateEvidence } from "./evidence-gate.ts";
 import { validateAuditOverrides } from "./options.ts";
-import { TargetService } from "../dynamic/targets.ts";
+import { TargetService, type AuditScopeSnapshot } from "../dynamic/targets.ts";
+import { GraphStore } from "../dynamic/graph.ts";
 import type { Inventory } from "../repo/inventory.ts";
 import { inventoryForAgent, inventorySummary } from "../repo/inventory.ts";
 import {
@@ -235,6 +236,21 @@ const RESULT_SESSION_STATUS: Record<string, SessionRow["status"]> = {
   failed: "failed",
 };
 
+export type IntentInput = {
+  title: string;
+  assetIds: string[];
+  method: string;
+  path: string;
+  expectedSignal?: string;
+  rationale?: string;
+  category?: string;
+};
+
+export type IntentDecision = {
+  accepted: string[];
+  rejected: Array<{ index: number; reason: string }>;
+};
+
 export class AuditEngine {
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
@@ -252,9 +268,11 @@ export class AuditEngine {
     private readonly catalog?: LocalCatalog,
   ) {
     this.targets = new TargetService(store);
+    this.graph = new GraphStore(store);
   }
 
   private readonly targets: TargetService;
+  private readonly graph: GraphStore;
 
   start(): void {
     this.recoverAfterRestart();
@@ -599,6 +617,20 @@ export class AuditEngine {
           createdBy: userId,
         });
       }
+      if (audit.mode !== "static") {
+        this.graph.createNode({
+          auditId,
+          kind: "goal",
+          payload: {
+            text: "Explore the authorized target",
+            target_id: config.target_id ?? null,
+            mode: audit.mode,
+          },
+        });
+        this.store.run("UPDATE audits SET exploration_status = 'open' WHERE id = ?", auditId);
+      } else {
+        this.store.run("UPDATE audits SET exploration_status = 'not_applicable' WHERE id = ?", auditId);
+      }
       this.store.transaction(() => {
         this.store.run(
           "UPDATE audits SET status = 'running', started_at = COALESCE(started_at, ?), finished_at = NULL, error = NULL, current_phase = 1 WHERE id = ?",
@@ -659,6 +691,160 @@ export class AuditEngine {
         });
         throw error;
       }
+    });
+    await this.reconcile(auditId);
+    this.schedule(auditId);
+  }
+
+  acceptIntents(auditId: string, intents: IntentInput[]): IntentDecision {
+    const audit = this.store.get<AuditRow>("SELECT * FROM audits WHERE id = ?", auditId);
+    if (!audit) throw new AppError(404, "audit_not_found", "Audit not found");
+    if (audit.status !== "running") {
+      throw new AppError(409, "audit_not_running", "Intents can be accepted only while the audit is running");
+    }
+    if (audit.mode === "static") {
+      throw new AppError(409, "audit_not_dynamic", "Static audits do not accept exploration intents");
+    }
+    const snapshotRow = this.targets.getSnapshot(auditId);
+    if (!snapshotRow) throw new AppError(409, "scope_snapshot_missing", "The audit has no scope snapshot");
+    const snapshot = snapshotRow.snapshot;
+    const assets = new Map(this.graph.listAssets(audit.project_id).map((asset) => [asset.id, asset]));
+    const existing = new Set<string>();
+    for (const row of this.store.all<{ payload: string }>(
+      "SELECT payload FROM exploration_nodes WHERE audit_id = ? AND kind = 'intent'",
+      auditId,
+    )) {
+      const payload = parseJson<Record<string, unknown>>(row.payload, {});
+      if (typeof payload.dedup_key === "string") existing.add(payload.dedup_key);
+    }
+    const tasksSoFar = this.store.get<{ count: number }>(
+      "SELECT COUNT(*) AS count FROM tasks WHERE audit_id = ?",
+      auditId,
+    )?.count ?? 0;
+    const authorization = this.targets.activeAuthorization(snapshot.target.id);
+    const accepted: string[] = [];
+    const rejected: Array<{ index: number; reason: string }> = [];
+
+    for (const [index, intent] of intents.entries()) {
+      const reason = this.validateIntent(
+        intent,
+        snapshot,
+        assets,
+        existing,
+        authorization !== null,
+        tasksSoFar + accepted.length,
+        snapshot.budget.max_tasks,
+      );
+      if (reason) {
+        rejected.push({ index, reason });
+        this.graph.createNode({
+          auditId,
+          kind: "intent",
+          status: "rejected",
+          payload: { ...intent, rejection_reason: reason },
+        });
+        continue;
+      }
+      const method = intent.method.trim().toUpperCase();
+      const url = new URL(intent.path, snapshot.target.base_url);
+      const dedupKey = `${method} ${url.pathname}${url.search}`;
+      existing.add(dedupKey);
+      const node = this.graph.createNode({
+        auditId,
+        kind: "intent",
+        status: "approved",
+        payload: { ...intent, method, url: url.toString(), dedup_key: dedupKey },
+      });
+      for (const assetId of new Set(intent.assetIds)) this.graph.anchor(node.id, assetId);
+      accepted.push(node.id);
+    }
+
+    this.events.append({
+      auditId,
+      type: "exploration.intents",
+      payload: { accepted: accepted.length, rejected: rejected.length },
+    });
+    return { accepted, rejected };
+  }
+
+  private validateIntent(
+    intent: IntentInput,
+    snapshot: AuditScopeSnapshot,
+    assets: Map<string, unknown>,
+    existing: Set<string>,
+    authorizationValid: boolean,
+    nextTaskCount: number,
+    maxTasks: number,
+  ): string | null {
+    if (!intent.title?.trim()) return "title is required";
+    if (!Array.isArray(intent.assetIds) || intent.assetIds.length === 0) return "at least one asset is required";
+    for (const assetId of intent.assetIds) {
+      if (!assets.has(assetId)) return `unknown asset: ${assetId}`;
+    }
+    const method = intent.method?.trim().toUpperCase();
+    if (!method) return "method is required";
+    if (!snapshot.target.allowed_methods.map((entry) => entry.toUpperCase()).includes(method)) {
+      return `method ${method} is not allowed`;
+    }
+    let url: URL;
+    try {
+      url = new URL(intent.path, snapshot.target.base_url);
+    } catch {
+      return "path is not a valid URL";
+    }
+    if (snapshot.target.tls && url.protocol !== "https:") return "target requires https";
+    const host = url.hostname.toLowerCase();
+    const allowed = snapshot.target.allowed_hosts.some((entry) => {
+      const rule = entry.toLowerCase();
+      return rule.startsWith("*.") ? host.endsWith(rule.slice(1)) : host === rule;
+    });
+    if (!allowed) return `host ${host} is outside the snapshot scope`;
+    if (!authorizationValid) return "authorization is no longer valid";
+    if (nextTaskCount >= maxTasks) return "task budget exhausted";
+    const dedupKey = `${method} ${url.pathname}${url.search}`;
+    if (existing.has(dedupKey)) return "duplicate intent";
+    return null;
+  }
+
+  async closeExploration(auditId: string, reason: string): Promise<void> {
+    const audit = this.store.get<AuditRow>("SELECT * FROM audits WHERE id = ?", auditId);
+    if (!audit) throw new AppError(404, "audit_not_found", "Audit not found");
+    if (audit.exploration_status === "closed") return;
+    this.store.run("UPDATE audits SET exploration_status = 'closed' WHERE id = ?", auditId);
+    this.events.append({ auditId, type: "exploration.closed", payload: { reason } });
+    await this.reconcile(auditId);
+    this.schedule(auditId);
+  }
+
+  async proveGoal(auditId: string, nodeId: string, rationale: string): Promise<void> {
+    const audit = this.store.get<AuditRow>("SELECT * FROM audits WHERE id = ?", auditId);
+    if (!audit) throw new AppError(404, "audit_not_found", "Audit not found");
+    const node = this.graph.getNode(nodeId);
+    if (!node || node.auditId !== auditId) {
+      throw new AppError(404, "exploration_node_not_found", "Exploration node not found");
+    }
+    if (node.kind !== "goal" && node.kind !== "intent") {
+      throw new AppError(400, "invalid_exploration_node", "Only a goal or intent can be proven");
+    }
+    const untested = this.graph.coverage(auditId).filter((asset) => !asset.tested);
+    const hasRationale = typeof rationale === "string" && rationale.trim().length >= 10;
+    const supportingFact = this.store.get(
+      "SELECT id FROM exploration_nodes WHERE audit_id = ? AND kind = 'fact' LIMIT 1",
+      auditId,
+    );
+    if (untested.length > 0 && !(hasRationale && supportingFact)) {
+      throw new AppError(
+        409,
+        "goal_not_proven",
+        "Goal needs full asset coverage or an unreachable rationale backed by a fact",
+      );
+    }
+    this.graph.updateNodeStatus(nodeId, "completed");
+    this.store.run("UPDATE audits SET exploration_status = 'closed' WHERE id = ?", auditId);
+    this.events.append({
+      auditId,
+      type: "exploration.goal_proven",
+      payload: { node_id: nodeId, rationale, untested: untested.map((asset) => asset.assetId) },
     });
     await this.reconcile(auditId);
     this.schedule(auditId);
@@ -2732,8 +2918,10 @@ export class AuditEngine {
       for (let phase = 1; phase <= 6; phase += 1) {
         const stats = phaseStats.get(phase)!;
         if (stats.total > 0) {
+          const explorationOpen =
+            phase === 2 && audit.mode !== "static" && audit.exploration_status !== "closed";
           const status =
-            stats.active > 0
+            explorationOpen || stats.active > 0
               ? "running"
               : stats.failed === stats.total
                 ? "failed"
@@ -2755,7 +2943,11 @@ export class AuditEngine {
       }
 
       const phase2 = phaseStats.get(2)!;
-      if (phase2.total > 0 && phase2.active === 0 && phase2.terminal === phase2.total) {
+      const explorationClosed =
+        audit.mode === "static" ||
+        audit.exploration_status === "closed" ||
+        audit.exploration_status === "not_applicable";
+      if (phase2.total > 0 && phase2.active === 0 && phase2.terminal === phase2.total && explorationClosed) {
         const candidates = this.store.all<CandidateRow>(
           "SELECT * FROM candidates WHERE audit_id = ? AND status = 'discovered' ORDER BY created_at",
           auditId,

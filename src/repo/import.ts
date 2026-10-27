@@ -1,17 +1,20 @@
-import { lstat, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
-import { join, relative, sep } from "node:path";
-import { constants } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, readdir, readlink, rm } from "node:fs/promises";
-import { dirname, join, relative, sep } from "node:path";
-import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { constants, existsSync } from "node:fs";
+import { lstat, mkdir, mkdtemp, open, readdir, readlink, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, join, relative } from "node:path";
 import type { Config } from "../config.ts";
 import type { Store } from "../db/index.ts";
 import { runCommand } from "../harness/process.ts";
 import { AppError, badRequest, now, parseJson, toJson, uid } from "../util.ts";
-import { DEFAULT_EXCLUDES, buildInventory, gitArgv, gitInfo } from "./inventory.ts";
-import { assertAuthorizedRoot, canonicalDirectory, createWorkspace } from "./workspace.ts";
+import { DEFAULT_EXCLUDES, buildInventory, gitInfo } from "./inventory.ts";
+import {
+  GIT_DIRECTORY_ERROR,
+  GIT_METADATA_ERROR as REAL_GIT_DIRECTORY_ERROR,
+  assertAuthorizedRoot,
+  createWorkspace,
+  openAuthorizedGitDirectory,
+  openWorktreeGit,
+  type PinnedGitDir,
+} from "./workspace.ts";
 
 const GIT_METADATA_ERROR = "Git metadata must stay inside the repository";
 
@@ -166,7 +169,7 @@ async function assertLooseRef(gitDir: string, refName: string, depth: number): P
 
 // "name~3" and "name^2" select an ancestor. Git opens the loose ref for the
 // prefix, not for the suffix. A "~" or "^" earlier in the name is part of the
-// ref. The requested ref cannot contain "{"; the verifier appends "^{commit}".
+// ref. Braced peels are not accepted in a requested ref.
 function ancestorPrefix(name: string): string | null {
   let index = name.length - 1;
   while (index >= 0) {
@@ -304,7 +307,9 @@ const SYMREF_READ_LIMIT = 5;
 type SymrefFollow = { name: string; depth: number };
 
 // C isspace(), not String.trim(). Git keeps a trailing Unicode space in the
-// symref target and opens that path.
+// symref target and opens that path. Newlines after "ref:" are whitespace, so
+// the target may begin on the next line. A break left inside the target is
+// not a name Git resolves.
 function isGitRefSpace(char: string): boolean {
   return char === " " || char === "\t" || char === "\n" || char === "\r" || char === "\f" || char === "\v";
 }
@@ -317,8 +322,6 @@ function looseSymrefTarget(text: string): string | null {
   let index = "ref:".length;
   while (index < body.length && isGitRefSpace(body[index] ?? "")) index += 1;
   const target = body.slice(index);
-  // Git skips every isspace byte after "ref:", so the target can start on a
-  // later line. An interior break is not a ref Git can resolve.
   if (target.includes("\n") || target.includes("\r")) return null;
   return target ? target : null;
 }
@@ -338,24 +341,6 @@ function isCurrentWorktreeRef(name: string): boolean {
     if (char >= "A" && char <= "Z") continue;
     if (char === "-" || char === "_") continue;
     return false;
-async function looseRefLine(gitDir: string, refName: string): Promise<string | null> {
-  const parts = gitRefParts(refName);
-  let path = gitDir;
-  for (const part of parts) path = join(path, part);
-  const text = await readSmallGitText(path);
-  return text?.split("\n", 1)[0] ?? null;
-}
-
-// Pseudorefs and the per-worktree ref namespaces live beside HEAD. Shared
-// refs such as branches and tags live in the common directory.
-function isWorktreePrivateRef(refName: string): boolean {
-  if (refName.startsWith("refs/bisect/") || refName.startsWith("refs/worktree/") || refName.startsWith("refs/rewritten/")) {
-    return true;
-  }
-  if (!refName || refName.includes("/")) return false;
-  for (const char of refName) {
-    const upper = char >= "A" && char <= "Z";
-    if (!upper && char !== "-" && char !== "_") return false;
   }
   return true;
 }
@@ -399,29 +384,16 @@ async function readLooseRefLine(gitDir: string, refName: string): Promise<string
 }
 
 // `--abbrev-ref HEAD` shortens the ref the symref chain resolves to and opens
-// that name's loose-ref candidates. A linked worktree reads shared refs from
-// its common directory, so a same-named file in the worktree git directory
-// must not end the chain.
+// that name's loose-ref candidates. A linked worktree reads a shared ref from
+// its common directory and the next private ref from the worktree that owns
+// HEAD, even when the previous hop was shared. `main-worktree/<private>` is
+// the common directory's file. A same-named file in the other directory must
+// not end the chain. Short names are recorded for the caller to probe.
 async function addSymrefAbbreviations(
   gitDir: string,
   names: Set<string>,
   follow: readonly SymrefFollow[],
-  sharedRefsElsewhere: boolean,
-// Git keeps only HEAD and a few namespaces in a linked worktree's own
-// directory; every other ref is read from the common directory, so a
-// same-named file in the worktree directory is a decoy Git never opens.
-function isPerWorktreeRef(refName: string): boolean {
-  return refName === "HEAD"
-    || refName.startsWith("refs/bisect/")
-    || refName.startsWith("refs/worktree/")
-    || refName.startsWith("refs/rewritten/");
-}
-
-async function addSymrefAbbreviations(
-  gitDir: string,
-  common: string | null,
-  names: Set<string>,
-  follow: readonly SymrefFollow[],
+  sharedRoot: string | null,
 ): Promise<SymrefFollow[]> {
   const carry: SymrefFollow[] = [];
   const pending = [...follow];
@@ -430,10 +402,11 @@ async function addSymrefAbbreviations(
     const item = pending.pop();
     if (!item || visited.has(item.name)) continue;
     visited.add(item.name);
-    const store = common && !isPerWorktreeRef(item.name) ? common : gitDir;
+    const inThisDirectory = mainWorktreeBareRef(item.name) === null && isCurrentWorktreeRef(item.name);
+    const store = sharedRoot && !inThisDirectory ? sharedRoot : gitDir;
     const line = await readLooseRefLine(store, item.name);
     if (line === null) {
-      carry.push(item);
+      if (inThisDirectory || sharedRoot === null) carry.push(item);
       continue;
     }
     const target = looseSymrefTarget(line);
@@ -450,43 +423,8 @@ async function addSymrefAbbreviations(
 // requested revision is verified. Those commands open the same six candidates
 // for HEAD and for each branch named by the HEAD symref chain. A linked
 // worktree stores shared refs in the common directory. A same-named file in
-// the worktree git directory is not the file Git opens.
-// `main-worktree/HEAD` and `main-worktree/refs/bisect/...` name the main
-// worktree's private refs. Git reads them from the common directory under
-// the bare name, not from a `main-worktree` directory.
-function mainWorktreeRefName(refName: string): string | null {
-  const prefix = "main-worktree/";
-  if (!refName.startsWith(prefix)) return null;
-  const bare = refName.slice(prefix.length);
-  return isWorktreePrivateRef(bare) ? bare : null;
-}
-
-// `--abbrev-ref HEAD` follows the symref chain and shortens the final ref.
-// A linked worktree stores shared refs in the common directory. The next hop
-// of a private ref is still the file next to HEAD.
-async function finalHeadRef(headDir: string, refRoot: string): Promise<string | null> {
-  const head = await readSmallGitText(join(headDir, "HEAD"));
-  let line = head?.split("\n", 1)[0] ?? "";
-  let full: string | null = null;
-  const seen = new Set<string>();
-  for (let depth = 0; line.startsWith("ref:"); depth += 1) {
-    if (depth > 8) throw invalidGitMetadata();
-    const target = line.slice("ref:".length).trim();
-    if (!target || seen.has(target)) throw invalidGitMetadata();
-    seen.add(target);
-    full = target;
-    const bare = mainWorktreeRefName(target);
-    const next = await looseRefLine(bare ? refRoot : isWorktreePrivateRef(target) ? headDir : refRoot, bare ?? target);
-    if (next === null) break;
-    line = next;
-  }
-  return full;
-}
-
-// Every import runs `rev-parse HEAD` and `--abbrev-ref HEAD` before the
-// requested revision is verified. Those commands open the six candidates for
-// HEAD and for every abbreviation of the final branch. A linked worktree
-// stores the branch refs in the common directory, so that directory is probed too.
+// the worktree git directory is not the file Git opens. A private ref later
+// in that chain is still the file next to the worktree HEAD.
 async function assertGitLookups(
   gitDir: string,
   ref: string | null,
@@ -506,17 +444,16 @@ async function assertGitLookups(
   seen.add(mark);
   const names = new Set<string>(["HEAD", ...inherited]);
   if (ref) {
-    const base = revisionRefName(ref);
-    if (base) names.add(base);
+    for (const base of revisionProbeNames(ref)) names.add(base);
   }
-  // Git reads commondir once, from the git directory the command started in.
-  // A commondir inside the common directory is not a link Git follows, and the
-  // shared refs on the chain are read there in place.
-  const common = isStartedGitDirectory ? await linkedGitDirectory(gitDir) : null;
-  const sharedRefsElsewhere = common !== null && await distinctGitDirectory(gitDir, common);
-  const carry = await addSymrefAbbreviations(gitDir, names, follow, sharedRefsElsewhere);
+  const common = await linkedGitDirectory(gitDir);
+  const sharedRoot = common !== null && await distinctGitDirectory(gitDir, common) ? common : null;
+  const carry = await addSymrefAbbreviations(gitDir, names, follow, sharedRoot);
   for (const name of names) await assertRequestedRevision(gitDir, name);
-  if (common) await assertGitLookups(common, ref, [...names], seen, [{ name: "HEAD", depth: 0 }, ...carry], false);
+  if (common) {
+    if (seen.size > MAX_COMMON_DIRECTORY_LINKS) throw invalidGitMetadata();
+    await assertGitLookups(common, ref, [...names], seen, [{ name: "HEAD", depth: 0 }, ...carry]);
+  }
 }
 
 async function distinctGitDirectory(left: string, right: string): Promise<boolean> {
@@ -526,71 +463,6 @@ async function distinctGitDirectory(left: string, right: string): Promise<boolea
   } catch (error) {
     if (error instanceof AppError) throw error;
     throw invalidGitMetadata();
-  }
-  const common = await linkedGitDirectory(gitDir);
-  const finalRef = await finalHeadRef(gitDir, common ?? gitDir);
-  if (finalRef) {
-    names.add(finalRef);
-    for (const shortName of gitShortRefNames(finalRef)) names.add(shortName);
-  }
-  for (const name of names) await assertRequestedRevision(gitDir, name);
-  if (common) await assertGitLookups(common, ref, [...names], seen);
-}
-
-// abbrev-ref follows the symref chain and probes the final short name.
-// A worktree import does not pass a revision, but gitInfo still runs that
-// command. The loose refs may live in a linked common directory.
-function symrefShortName(full: string): string | null {
-  if (full.startsWith("refs/heads/") && full.length > "refs/heads/".length) {
-    return full.slice("refs/heads/".length);
-  }
-  if (full.startsWith("refs/tags/") && full.length > "refs/tags/".length) {
-    return full.slice("refs/tags/".length);
-  }
-  if (full.startsWith("refs/remotes/") && full.endsWith("/HEAD")) {
-    const remote = full.slice("refs/remotes/".length, -"/HEAD".length);
-    return remote.length > 0 ? remote : null;
-  }
-  if (full.startsWith("refs/remotes/") && full.length > "refs/remotes/".length) {
-    return full.slice("refs/remotes/".length);
-  }
-  return null;
-}
-
-async function readLooseRefLine(gitDir: string, refName: string): Promise<string | null> {
-  const parts = gitRefParts(refName);
-  let path = gitDir;
-  for (const part of parts) path = join(path, part);
-  const text = await readSmallGitText(path);
-  return text?.split("\n", 1)[0] ?? null;
-}
-
-async function resolvedBranchName(headDir: string, refRoot: string): Promise<string | null> {
-  const head = await readSmallGitText(join(headDir, "HEAD"));
-  let line = head?.split("\n", 1)[0] ?? "";
-  let short: string | null = null;
-  const seen = new Set<string>();
-  for (let depth = 0; depth < 8 && line.startsWith("ref:"); depth += 1) {
-    const full = line.slice("ref:".length).trim();
-    if (!full || seen.has(full)) break;
-    seen.add(full);
-    const nextShort = symrefShortName(full);
-    if (nextShort) short = nextShort;
-    const next = await readLooseRefLine(refRoot, full);
-    line = next ?? "";
-  }
-  return short;
-}
-
-async function assertResolvedHeadProbes(gitDir: string): Promise<void> {
-  const common = await linkedGitDirectory(gitDir);
-  const refRoot = common ?? gitDir;
-  const names = ["HEAD"];
-  const branch = await resolvedBranchName(gitDir, refRoot);
-  if (branch) names.push(branch);
-  const roots = common && common !== gitDir ? [gitDir, common] : [gitDir];
-  for (const root of roots) {
-    for (const name of names) await assertRequestedRevision(root, name);
   }
 }
 
@@ -809,34 +681,6 @@ async function resolveExistingGitDirectory(target: string): Promise<string | nul
 // is left in place; a pipe, device, or symlink is not.
 const PSEUDO_REF_NAME = /^[A-Z_-]+$/;
 
-async function assertPlainGitTree(directory: string): Promise<void> {
-  let entries;
-  try {
-    entries = await readdir(directory, { withFileTypes: true });
-  } catch {
-    throw invalidGitMetadata();
-  }
-  for (const entry of entries) {
-    if (entry.isDirectory()) {
-      await assertPlainGitTree(join(directory, entry.name));
-      continue;
-    }
-    if (entry.isFile() || entry.isSocket()) continue;
-    throw invalidGitMetadata();
-  }
-}
-
-async function assertPlainGitTreeIfPresent(directory: string): Promise<void> {
-  let info;
-  try {
-    info = await lstat(directory);
-  } catch {
-    return;
-  }
-  if (info.isSymbolicLink() || !info.isDirectory()) throw invalidGitMetadata();
-  await assertPlainGitTree(directory);
-}
-
 async function assertPlainPseudoRefs(gitDir: string): Promise<void> {
   let entries;
   try {
@@ -883,15 +727,10 @@ async function assertGitDirectoryMetadata(gitDir: string, seen = new Set<string>
   await assertRealGitDirectory(join(gitDir, "refs"));
   await assertConfigHasNoInclude(join(gitDir, "config"));
   await assertConfigHasNoInclude(join(gitDir, "config.worktree"));
+  await assertPlainPseudoRefs(gitDir);
   const head = await readSmallGitText(join(gitDir, "HEAD"), 4_096, { requireUtf8: true });
   const headTarget = looseSymrefTarget(head ?? "");
   if (headTarget) await assertLooseRef(gitDir, headTarget, 0);
-  await assertPlainPseudoRefs(gitDir);
-  await assertPlainGitTreeIfPresent(join(gitDir, "refs"));
-  await assertPlainGitTreeIfPresent(join(gitDir, "worktrees"));
-  const head = await readSmallGitText(join(gitDir, "HEAD"));
-  const headLine = head?.split("\n", 1)[0] ?? "";
-  if (headLine.startsWith("ref:")) await assertLooseRef(gitDir, headLine.slice("ref:".length).trim(), 0);
   const common = await linkedGitDirectory(gitDir);
   if (common) await assertGitDirectoryMetadata(common, seen);
 }
@@ -910,7 +749,7 @@ async function assertGitFileTarget(gitFilePath: string): Promise<string | null> 
 // is a regular file; ref imports reject it separately so worktree snapshots can
 // still copy the selected files. The directory a gitfile names, including one
 // found by walking parents, is checked before Git starts.
-async function assertLocalGitReadable(sourceRoot: string): Promise<string | null> {
+async function assertLocalGitReadable(sourceRoot: string): Promise<{ gitDir: string; workTree: string } | null> {
   let current = sourceRoot;
   while (true) {
     const gitPath = join(current, ".git");
@@ -925,231 +764,42 @@ async function assertLocalGitReadable(sourceRoot: string): Promise<string | null
     }
     if (info.isDirectory()) {
       await assertGitDirectoryMetadata(gitPath);
-      return gitPath;
+      return { gitDir: gitPath, workTree: current };
     }
     if (!info.isFile()) throw invalidGitMetadata();
-    return assertGitFileTarget(gitPath);
+    const gitDir = await assertGitFileTarget(gitPath);
+    if (!gitDir) throw invalidGitMetadata();
+    return { gitDir, workTree: current };
   }
 }
 
-// Alternate object databases and symlinked packs live outside the repository
-// even when .git itself is a real directory. git archive would copy those bytes.
-async function assertContainedObjectStore(gitDir: string): Promise<void> {
-  const objectsPath = join(gitDir, "objects");
-  let rootInfo;
-  try {
-    rootInfo = await lstat(objectsPath);
-  } catch {
-    throw invalidGitMetadata();
-  }
-  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) throw invalidGitMetadata();
-  const pending = [objectsPath];
-  while (pending.length > 0) {
-    const current = pending.pop();
-    if (!current) break;
-    let entries;
-    try {
-      entries = await readdir(current, { withFileTypes: true });
-    } catch {
-      throw invalidGitMetadata();
-    }
-    for (const entry of entries) {
-      if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) throw invalidGitMetadata();
-      if (entry.isDirectory()) {
-        pending.push(join(current, entry.name));
-        continue;
-      }
-      if (entry.name === "alternates" && current === join(objectsPath, "info")) throw invalidGitMetadata();
-    }
-  }
-}
-
-// Git walks parent directories and follows a .git file or symlink. Archive only
-// when that discovered metadata is the work tree containing this source path,
-// and the object store does not point at another repository. subpath is the
-// directory to archive when the source sits below the work tree root.
-async function prepareRefArchive(sourceRoot: string): Promise<{ gitDir: string; subpath: string | null }> {
-async function prepareRefArchive(sourceRoot: string): Promise<{ subpath: string | null; gitDir: string }> {
-  const gitPath = join(sourceRoot, ".git");
-  let localGit;
-  try {
-    localGit = await lstat(gitPath);
-  } catch {
-    localGit = null;
-  }
-  if (localGit && (localGit.isSymbolicLink() || !localGit.isDirectory())) throw invalidGitMetadata();
-  const env = gitCommandEnv();
-  const gitDirResult = await runCommand(
-    gitArgv(["-C", sourceRoot, "rev-parse", "--absolute-git-dir"]),
-    { env, timeoutMs: 20_000 },
-  );
-  const topResult = await runCommand(
-    gitArgv(["-C", sourceRoot, "rev-parse", "--show-toplevel"]),
-    { env, timeoutMs: 20_000 },
-  );
-  if (
-    gitDirResult.code !== 0 ||
-    gitDirResult.timedOut ||
-    topResult.code !== 0 ||
-    topResult.timedOut
-  ) {
-    throw badRequest("Git refs require a git repository");
-  }
-  let pinnedGit: string;
-  let pinnedTop: string;
-  try {
-    pinnedGit = await canonicalDirectory(gitDirResult.stdout.trim());
-    pinnedTop = await canonicalDirectory(topResult.stdout.trim());
-  } catch {
-    throw invalidGitMetadata();
-  }
-  if (!pathInside(sourceRoot, pinnedTop) || !pathInside(pinnedGit, pinnedTop)) throw invalidGitMetadata();
-  // A commondir file leaves this git directory inside the work tree while
-  // archive reads objects from another repository. The common directory Git
-  // will use has to be the git directory checked above.
-  const commonResult = await runCommand(
-    gitArgv(["-C", sourceRoot, "rev-parse", "--git-common-dir"]),
-    { env, timeoutMs: 20_000 },
-  );
-  if (commonResult.code !== 0 || commonResult.timedOut) throw invalidGitMetadata();
-  let pinnedCommon: string;
-  try {
-    pinnedCommon = await canonicalDirectory(resolveReportedGitPath(sourceRoot, commonResult.stdout));
-  } catch {
-    throw invalidGitMetadata();
-  }
-  if (pinnedCommon !== pinnedGit) throw invalidGitMetadata();
-  await assertContainedObjectStore(pinnedGit);
-  const relativePath = relative(pinnedTop, sourceRoot);
-  if (!relativePath) return { gitDir: pinnedGit, subpath: null };
-  if (!relativePath) return { subpath: null, gitDir: pinnedGit };
-  if (
-    relativePath.startsWith("..") ||
-    relativePath.startsWith("/") ||
-    relativePath.includes("\0")
-  ) {
-    throw invalidGitMetadata();
-  }
-  return { gitDir: pinnedGit, subpath: relativePath.split(sep).join("/") };
-}
-
-// `git archive` runs smudge and process filters named by the committed
-// attributes. Those commands come from Git config and can read files outside
-// the repository. Archive through a new repository that only shares the object
-// store already checked above, and unset filter so a global or system Git
-// config cannot supply the command either.
-async function archiveSanitizedCommit(
-  repoPath: string,
-  gitDir: string,
-  treeish: string,
-  archivePath: string,
-  env: Record<string, string>,
-): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> {
-  const objects = join(gitDir, "objects");
-  if (objects.includes("\n") || objects.includes("\0")) throw invalidGitMetadata();
-  return { subpath: relativePath.split(sep).join("/"), gitDir: pinnedGit };
-}
-
-// `git archive` runs smudge and process filters named by attributes. The
-// command is taken from the repository config, the system Git config, or the
-// user's global Git config. Global and system attribute files can also rewrite
-// archived bytes. Archive through a Git directory we created and the object
-// store checked above, with those config and attribute sources replaced.
-// The new directory has to use the source object format; a SHA-256 store is
-// not readable from a SHA-1 Git directory.
-async function archivePinnedCommit(
-  gitDir: string,
-  treeish: string,
-  archivePath: string,
-  staging: string,
-): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> {
-  const archiveGit = join(staging, "archive.git");
-  const privateHome = join(staging, "home");
-  await mkdir(join(archiveGit, "objects"), { recursive: true, mode: 0o700 });
-  await mkdir(join(archiveGit, "refs"), { mode: 0o700 });
-  await mkdir(privateHome, { mode: 0o700 });
-  const globalConfig = join(staging, "gitconfig");
-  await writeFile(globalConfig, "", { mode: 0o600 });
-  const env = gitCommandEnv();
-  env.HOME = privateHome;
-  delete env.XDG_CONFIG_HOME;
-  env.GIT_CONFIG_NOSYSTEM = "1";
-  env.GIT_CONFIG_GLOBAL = globalConfig;
-  env.GIT_ATTR_NOSYSTEM = "1";
-  const format = await runCommand(
-    ["git", "--git-dir", gitDir, "rev-parse", "--show-object-format"],
-    { env, timeoutMs: 20_000 },
-  );
-  const objectFormat = format.code === 0 && !format.timedOut && format.stdout.trim() === "sha256" ? "sha256" : "sha1";
-  const initArgs = ["git", "init", "-q", "--template="];
-  if (objectFormat === "sha256") initArgs.push("--object-format=sha256");
-  initArgs.push(repoPath);
-  const init = await runCommand(initArgs, { env, timeoutMs: 20_000 });
-  if (init.code !== 0 || init.timedOut) {
-    throw badRequest(`Failed to prepare the git archive: ${init.stderr.slice(0, 500)}`);
-  }
-  await mkdir(join(repoPath, ".git", "info"), { recursive: true, mode: 0o700 });
-  await mkdir(join(repoPath, ".git", "objects", "info"), { recursive: true, mode: 0o700 });
-  await writeFile(join(repoPath, ".git", "info", "attributes"), "* -filter\n", { mode: 0o600 });
-  await writeFile(join(repoPath, ".git", "objects", "info", "alternates"), `${objects}\n`, { mode: 0o600 });
-  return runCommand(
-    ["git", "-C", repoPath, "archive", "--format=tar", "--output", archivePath, treeish],
-  if (format.timedOut) throw badRequest("Failed to read the git object format");
-  // Any other answer keeps the historical SHA-1 Git directory. A SHA-256
-  // repository then fails the archive instead of being read as SHA-1.
-  const repositoryConfig = format.code === 0 && format.stdout.trim() === "sha256"
-    ? "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectFormat = sha256\n"
-    : "[core]\n\trepositoryformatversion = 0\n";
-  await writeFile(join(archiveGit, "config"), repositoryConfig, { mode: 0o600 });
-  await writeFile(join(archiveGit, "HEAD"), "ref: refs/heads/argus\n", { mode: 0o600 });
-  // `export-subst` expands pretty-format placeholders. `%G?` on a commit with a
-  // gpgsig header executes `gpg`. This file outranks `.gitattributes` in the
-  // tree, including a macro that sets the attribute. Line-ending rules stay.
-  await mkdir(join(archiveGit, "info"), { mode: 0o700 });
-  await writeFile(join(archiveGit, "info", "attributes"), "* -export-subst\n", { mode: 0o600 });
-  env.GIT_DIR = archiveGit;
-  env.GIT_OBJECT_DIRECTORY = join(gitDir, "objects");
-  return runCommand(
-    ["git", "archive", "--format=tar", "--output", archivePath, treeish],
-    { env, timeoutMs: 180_000 },
-  );
-import { DEFAULT_EXCLUDES, buildInventory, gitInfo } from "./inventory.ts";
-import {
-  GIT_DIRECTORY_ERROR,
-  GIT_METADATA_ERROR,
-  assertAuthorizedRoot,
-  createWorkspace,
-  openAuthorizedGitDirectory,
-  openWorktreeGit,
-  type PinnedGitDir,
-} from "./workspace.ts";
-
-function gitEnv(): Record<string, string> {
-  return { PATH: process.env.PATH ?? "/usr/bin:/bin" };
+function pathContains(root: string, candidate: string): boolean {
+  const prefix = root.endsWith("/") ? root : `${root}/`;
+  return candidate === root || candidate.startsWith(prefix);
 }
 
 function pinnedGitDirFlag(): string {
   if (existsSync("/proc/self/fd")) return "--git-dir=/proc/self/fd/3";
   if (existsSync("/dev/fd")) return "--git-dir=/dev/fd/3";
-  throw new AppError(400, "invalid_repository", GIT_METADATA_ERROR);
+  throw new AppError(400, "invalid_repository", REAL_GIT_DIRECTORY_ERROR);
 }
 
 // Git reads this descriptor, not the path. Replacing `.git` with a symlink
 // after the open does not change the inode git archives. GIT_COMMON_DIR is the
 // same descriptor, so a commondir file written after the metadata check cannot
-// redirect object reads.
+// redirect object reads. Promisor fetch stays off, and replacement refs are
+// not applied.
 export async function runPinnedGit(
   git: PinnedGitDir,
   args: string[],
   timeoutMs: number,
 ): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> {
   const flag = pinnedGitDirFlag();
-  return runCommand(["git", flag, ...args], {
+  const env = gitCommandEnv();
+  env.GIT_COMMON_DIR = flag.slice("--git-dir=".length);
+  return runCommand(["git", "--no-replace-objects", "-c", "core.excludesFile=/dev/null", "-c", "core.attributesFile=/dev/null", flag, ...args], {
     timeoutMs,
-    env: {
-      ...gitEnv(),
-      GIT_COMMON_DIR: flag.slice("--git-dir=".length),
-    },
+    env,
     extraFd: git.fd,
   });
 }
@@ -1158,16 +808,16 @@ async function pinnedGitInfo(git: PinnedGitDir): Promise<{ commit: string | null
   const commit = await runPinnedGit(git, ["rev-parse", "HEAD"], 20_000);
   const branch = await runPinnedGit(git, ["rev-parse", "--abbrev-ref", "HEAD"], 20_000);
   return {
-    commit: commit.code === 0 ? commit.stdout.trim() || null : null,
-    branch: branch.code === 0 ? branch.stdout.trim() || null : null,
+    commit: commit.code === 0 && !commit.timedOut ? commit.stdout.trim() || null : null,
+    branch: branch.code === 0 && !branch.timedOut ? branch.stdout.trim() || null : null,
   };
 }
 
-function archiveTreeish(commit: string, gitPath: string, sourceRoot: string): string {
-  if (!/^[0-9a-f]{7,64}$/i.test(commit) || basename(gitPath) !== ".git") {
+function archiveTreeish(commit: string, workTree: string, sourceRoot: string): string {
+  if (!/^[0-9a-f]{7,64}$/i.test(commit)) {
     throw new AppError(400, "invalid_repository", GIT_DIRECTORY_ERROR);
   }
-  const prefix = relative(dirname(gitPath), sourceRoot).replaceAll("\\", "/");
+  const prefix = relative(workTree, sourceRoot).replaceAll("\\", "/");
   if (prefix === "") return commit;
   const parts = prefix.split("/");
   if (
@@ -1185,17 +835,49 @@ function archiveTreeish(commit: string, gitPath: string, sourceRoot: string): st
   return `${commit}:${prefix}`;
 }
 
-async function discoverGitDirectory(sourceRoot: string, allowedRoots: string[]): Promise<PinnedGitDir | null> {
-  const discovered = await runCommand(
-    ["git", "-C", sourceRoot, "rev-parse", "--absolute-git-dir"],
-    { timeoutMs: 20_000, env: gitEnv() },
+// `git archive` runs smudge and process filters named by attributes, and
+// `export-subst` can execute gpg for a signed commit. Archive through a Git
+// directory we created and the object store already checked, with repository,
+// system, and global config replaced. The new directory uses the source object
+// format; a SHA-256 store is not readable from a SHA-1 Git directory.
+async function archivePinnedCommit(
+  git: PinnedGitDir,
+  treeish: string,
+  archivePath: string,
+  staging: string,
+): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> {
+  const archiveGit = join(staging, "archive.git");
+  const privateHome = join(staging, "home");
+  await mkdir(join(archiveGit, "objects"), { recursive: true, mode: 0o700 });
+  await mkdir(join(archiveGit, "refs"), { mode: 0o700 });
+  await mkdir(privateHome, { mode: 0o700 });
+  const globalConfig = join(staging, "gitconfig");
+  await writeFile(globalConfig, "", { mode: 0o600 });
+  const env = gitCommandEnv();
+  env.HOME = privateHome;
+  delete env.XDG_CONFIG_HOME;
+  env.GIT_CONFIG_NOSYSTEM = "1";
+  env.GIT_CONFIG_GLOBAL = globalConfig;
+  env.GIT_ATTR_NOSYSTEM = "1";
+  const format = await runPinnedGit(git, ["rev-parse", "--show-object-format"], 20_000);
+  if (format.timedOut) throw badRequest("Failed to read the git object format");
+  // Any other answer keeps the historical SHA-1 Git directory. A SHA-256
+  // repository then fails the archive instead of being read as SHA-1.
+  const repositoryConfig = format.code === 0 && format.stdout.trim() === "sha256"
+    ? "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectFormat = sha256\n"
+    : "[core]\n\trepositoryformatversion = 0\n";
+  await writeFile(join(archiveGit, "config"), repositoryConfig, { mode: 0o600 });
+  await writeFile(join(archiveGit, "HEAD"), "ref: refs/heads/argus\n", { mode: 0o600 });
+  // info/attributes outranks .gitattributes. -filter stops smudge and process
+  // filters. -export-subst stops %G? from executing gpg. Line-ending rules stay.
+  await mkdir(join(archiveGit, "info"), { mode: 0o700 });
+  await writeFile(join(archiveGit, "info", "attributes"), "* -filter\n* -export-subst\n", { mode: 0o600 });
+  env.GIT_DIR = archiveGit;
+  env.GIT_OBJECT_DIRECTORY = join(git.path, "objects");
+  return runCommand(
+    ["git", "--no-replace-objects", "-c", "core.excludesFile=/dev/null", "-c", "core.attributesFile=/dev/null", "archive", "--format=tar", "--output", archivePath, treeish],
+    { env, timeoutMs: 180_000 },
   );
-  if (discovered.code !== 0 || discovered.timedOut) return null;
-  const printed = discovered.stdout.trim();
-  if (!printed || printed.includes("\0") || printed.includes("\n")) {
-    throw new AppError(400, "invalid_repository", GIT_DIRECTORY_ERROR);
-  }
-  return openAuthorizedGitDirectory(printed.startsWith("/") ? printed : resolve(sourceRoot, printed), allowedRoots);
 }
 
 export async function importRepository(
@@ -1217,14 +899,9 @@ export async function importRepository(
   if (ref && !/^[A-Za-z0-9][A-Za-z0-9._/@^~:-]{0,199}$/.test(ref)) {
     throw badRequest("Invalid git ref");
   }
-  const gitDirectory = await assertLocalGitReadable(sourceRoot);
-  if (gitDirectory) await assertResolvedHeadProbes(gitDirectory);
-  if (ref && gitDirectory) await assertRequestedRevision(gitDirectory, ref);
-  if (gitDirectory) await assertGitLookups(gitDirectory, ref);
-  const refArchive = ref ? await prepareRefArchive(sourceRoot) : null;
-  const git = await gitInfo(sourceRoot);
-  const localGit = await openWorktreeGit(sourceRoot, deps.config.allowedRoots);
-  let pinnedGit: PinnedGitDir | null = localGit.kind === "pinned" ? localGit.git : null;
+  const direct = await openWorktreeGit(sourceRoot, deps.config.allowedRoots);
+  let pinnedGit: PinnedGitDir | null = direct.kind === "pinned" ? direct.git : null;
+  let gitWorkTree = sourceRoot;
   const scope = {
     include: parseJson<string[]>(project.scope_include, ["**/*"]),
     exclude: [...new Set([...DEFAULT_EXCLUDES, ...parseJson<string[]>(project.scope_exclude, [])])],
@@ -1240,26 +917,54 @@ export async function importRepository(
   );
   let staging: string | null = null;
   try {
-    if (localGit.kind === "pinned" && pinnedGit) {
+    if (direct.kind === "unsafe") {
+      const gitPath = join(sourceRoot, ".git");
+      let info: Awaited<ReturnType<typeof lstat>> | null = null;
+      try {
+        info = await lstat(gitPath);
+      } catch {
+        info = null;
+      }
+      if (info?.isFile()) {
+        const target = await assertGitFileTarget(gitPath);
+        if (!target) throw invalidGitMetadata();
+        await assertGitLookups(target, ref);
+        if (ref) {
+          if (!pathContains(sourceRoot, target)) throw new AppError(400, "invalid_repository", REAL_GIT_DIRECTORY_ERROR);
+          pinnedGit = await openAuthorizedGitDirectory(target, deps.config.allowedRoots, { requireGitName: false });
+          gitWorkTree = sourceRoot;
+        }
+      } else if (ref) {
+        throw new AppError(400, "invalid_repository", REAL_GIT_DIRECTORY_ERROR);
+      }
+    } else if (direct.kind === "missing") {
+      const found = await assertLocalGitReadable(sourceRoot);
+      if (found) {
+        await assertGitLookups(found.gitDir, ref);
+        if (ref) {
+          if (!pathContains(found.workTree, sourceRoot) || !pathContains(found.workTree, found.gitDir)) {
+            throw new AppError(400, "invalid_repository", REAL_GIT_DIRECTORY_ERROR);
+          }
+          pinnedGit = await openAuthorizedGitDirectory(found.gitDir, deps.config.allowedRoots, {
+            requireGitName: basename(found.gitDir) === ".git",
+          });
+          gitWorkTree = found.workTree;
+        }
+      }
+    } else if (pinnedGit) {
+      await assertGitDirectoryMetadata(pinnedGit.path);
+      await assertGitLookups(pinnedGit.path, ref);
+    }
+    if (pinnedGit && !ref) {
       const git = await pinnedGitInfo(pinnedGit);
       commit = git.commit;
       branch = git.branch;
-    } else if (localGit.kind === "missing" && !ref) {
+    } else if (!ref && direct.kind === "missing") {
       const git = await gitInfo(sourceRoot);
       commit = git.commit;
       branch = git.branch;
     }
     if (ref) {
-      if (!git.commit || !refArchive) throw badRequest("Git refs require a git repository");
-      const env = gitCommandEnv();
-      const resolved = await runCommand(
-        gitArgv(["-C", sourceRoot, "rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`]),
-        { env, timeoutMs: 20_000 },
-      if (localGit.kind === "unsafe") throw new AppError(400, "invalid_repository", GIT_METADATA_ERROR);
-      if (!/^[A-Za-z0-9][A-Za-z0-9._/@^~:-]{0,199}$/.test(ref)) {
-        throw badRequest("Invalid git ref");
-      }
-      if (!pinnedGit) pinnedGit = await discoverGitDirectory(sourceRoot, deps.config.allowedRoots);
       if (!pinnedGit) throw badRequest("Git refs require a git repository");
       const resolved = await runPinnedGit(
         pinnedGit,
@@ -1268,32 +973,18 @@ export async function importRepository(
       );
       if (resolved.code !== 0 || resolved.timedOut) throw badRequest(`Unknown git ref: ${ref}`);
       commit = resolved.stdout.trim();
-      const treeish = refArchive.subpath ? `${commit}:${refArchive.subpath}` : commit;
+      const treeish = archiveTreeish(commit, gitWorkTree, sourceRoot);
       staging = await mkdtemp(join(deps.config.dataDir, "repo-import-"));
       const archivePath = join(staging, "snapshot.tar");
       const extractedRoot = join(staging, "source");
       await mkdir(extractedRoot, { mode: 0o700 });
-      const archived = await archiveSanitizedCommit(
-        join(staging, "archive-repo"),
-        refArchive.gitDir,
-        treeish,
-        archivePath,
-        env,
-      const archived = await archivePinnedCommit(refArchive.gitDir, treeish, archivePath, staging);
-      const archived = await runCommand(
-        gitArgv(["-C", refArchive?.toplevel ?? sourceRoot, "archive", "--format=tar", "--output", archivePath, treeish]),
-        { env, timeoutMs: 180_000 },
-      const archived = await runPinnedGit(
-        pinnedGit,
-        ["archive", "--format=tar", "--output", archivePath, archiveTreeish(commit, pinnedGit.path, sourceRoot)],
-        180_000,
-      );
+      const archived = await archivePinnedCommit(pinnedGit, treeish, archivePath, staging);
       if (archived.code !== 0 || archived.timedOut) {
         throw badRequest(`Failed to archive ${ref}: ${archived.stderr.slice(0, 500)}`);
       }
       const extracted = await runCommand(["tar", "-xf", archivePath, "-C", extractedRoot], {
         timeoutMs: 180_000,
-        env: gitEnv(),
+        env: gitCommandEnv(),
       });
       if (extracted.code !== 0 || extracted.timedOut) {
         throw badRequest(`Failed to extract ${ref}: ${extracted.stderr.slice(0, 500)}`);
@@ -1364,3 +1055,4 @@ export async function importRepository(
   }>("SELECT * FROM repositories WHERE id = ?", id)!;
   return { ...stored, file_count: inventory.files.length };
 }
+

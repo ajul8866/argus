@@ -148,10 +148,10 @@ async function assertLooseRef(gitDir: string, refName: string, depth: number): P
     }
     if (!entry.isFile()) throw invalidGitMetadata();
   }
-  const text = await readSmallGitText(current);
-  const line = text?.split("\n", 1)[0] ?? "";
-  if (!line.startsWith("ref:")) return;
-  await assertLooseRef(gitDir, line.slice("ref:".length).trim(), depth + 1);
+  const text = await readSmallGitText(current, 4_096, { requireUtf8: true });
+  const target = looseSymrefTarget(text ?? "");
+  if (!target) return;
+  await assertLooseRef(gitDir, target, depth + 1);
 }
 
 // "name~3" and "name^2" select an ancestor. Git opens the loose ref for the
@@ -260,6 +260,43 @@ const SYMREF_READ_LIMIT = 5;
 
 type SymrefFollow = { name: string; depth: number };
 
+// C isspace(), not String.trim(). Git keeps a trailing Unicode space in the
+// symref target and opens that path.
+function isGitRefSpace(char: string): boolean {
+  return char === " " || char === "\t" || char === "\n" || char === "\r" || char === "\f" || char === "\v";
+}
+
+function looseSymrefTarget(text: string): string | null {
+  const line = text.split("\n", 1)[0] ?? "";
+  let end = line.length;
+  while (end > 0 && isGitRefSpace(line[end - 1] ?? "")) end -= 1;
+  const body = line.slice(0, end);
+  if (!body.startsWith("ref:")) return null;
+  let index = "ref:".length;
+  while (index < body.length && isGitRefSpace(body[index] ?? "")) index += 1;
+  const target = body.slice(index);
+  return target ? target : null;
+}
+
+// Pseudorefs and refs/bisect, refs/worktree, and refs/rewritten live in the
+// worktree git directory. Every other ref is read from the common directory.
+function isCurrentWorktreeRef(name: string): boolean {
+  if (
+    name.startsWith("refs/bisect/") ||
+    name.startsWith("refs/worktree/") ||
+    name.startsWith("refs/rewritten/")
+  ) {
+    return true;
+  }
+  if (!name) return false;
+  for (const char of name) {
+    if (char >= "A" && char <= "Z") continue;
+    if (char === "-" || char === "_") continue;
+    return false;
+  }
+  return true;
+}
+
 // Read one loose ref without following a symref. Missing files are resolved
 // from a linked worktree's common directory. A pipe or symlink is rejected.
 async function readLooseRefLine(gitDir: string, refName: string): Promise<string | null> {
@@ -283,17 +320,19 @@ async function readLooseRefLine(gitDir: string, refName: string): Promise<string
     }
     if (!entry.isFile()) throw invalidGitMetadata();
   }
-  const text = await readSmallGitText(current);
-  return text?.split("\n", 1)[0] ?? "";
+  const text = await readSmallGitText(current, 4_096, { requireUtf8: true });
+  return text ?? "";
 }
 
 // `--abbrev-ref HEAD` shortens the ref the symref chain resolves to and opens
-// that name's loose-ref candidates. Walk every link so the resolved name is
-// probed, including when a later link is only in the common directory.
+// that name's loose-ref candidates. A linked worktree reads shared refs from
+// its common directory, so a same-named file in the worktree git directory
+// must not end the chain.
 async function addSymrefAbbreviations(
   gitDir: string,
   names: Set<string>,
   follow: readonly SymrefFollow[],
+  sharedRefsElsewhere: boolean,
 ): Promise<SymrefFollow[]> {
   const carry: SymrefFollow[] = [];
   const pending = [...follow];
@@ -302,15 +341,18 @@ async function addSymrefAbbreviations(
     const item = pending.pop();
     if (!item || visited.has(item.name)) continue;
     visited.add(item.name);
+    if (sharedRefsElsewhere && !isCurrentWorktreeRef(item.name)) {
+      carry.push(item);
+      continue;
+    }
     const line = await readLooseRefLine(gitDir, item.name);
     if (line === null) {
       carry.push(item);
       continue;
     }
-    if (!line.startsWith("ref:")) continue;
-    if (item.depth >= SYMREF_READ_LIMIT - 1) continue;
-    const target = line.slice("ref:".length).trim();
+    const target = looseSymrefTarget(line);
     if (!target) continue;
+    if (item.depth >= SYMREF_READ_LIMIT - 1) continue;
     names.add(target);
     for (const shortName of gitShortRefNames(target)) names.add(shortName);
     pending.push({ name: target, depth: item.depth + 1 });
@@ -321,8 +363,8 @@ async function addSymrefAbbreviations(
 // Every import runs `rev-parse HEAD` and `--abbrev-ref HEAD` before the
 // requested revision is verified. Those commands open the same six candidates
 // for HEAD and for each branch named by the HEAD symref chain. A linked
-// worktree stores the branch refs in the common directory, so that directory
-// is probed too.
+// worktree stores shared refs in the common directory. A same-named file in
+// the worktree git directory is not the file Git opens.
 async function assertGitLookups(
   gitDir: string,
   ref: string | null,
@@ -345,10 +387,21 @@ async function assertGitLookups(
     const base = revisionRefName(ref);
     if (base) names.add(base);
   }
-  const carry = await addSymrefAbbreviations(gitDir, names, follow);
-  for (const name of names) await assertRequestedRevision(gitDir, name);
   const common = await linkedGitDirectory(gitDir);
+  const sharedRefsElsewhere = common !== null && await distinctGitDirectory(gitDir, common);
+  const carry = await addSymrefAbbreviations(gitDir, names, follow, sharedRefsElsewhere);
+  for (const name of names) await assertRequestedRevision(gitDir, name);
   if (common) await assertGitLookups(common, ref, [...names], seen, [{ name: "HEAD", depth: 0 }, ...carry]);
+}
+
+async function distinctGitDirectory(left: string, right: string): Promise<boolean> {
+  try {
+    const [here, there] = await Promise.all([lstat(left), lstat(right)]);
+    return here.dev !== there.dev || here.ino !== there.ino;
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw invalidGitMetadata();
+  }
 }
 
 // Git opens include.path while parsing config, before a command-line -c
@@ -592,9 +645,9 @@ async function assertGitDirectoryMetadata(gitDir: string, seen = new Set<string>
   await assertRealGitDirectory(join(gitDir, "refs"));
   await assertConfigHasNoInclude(join(gitDir, "config"));
   await assertConfigHasNoInclude(join(gitDir, "config.worktree"));
-  const head = await readSmallGitText(join(gitDir, "HEAD"));
-  const headLine = head?.split("\n", 1)[0] ?? "";
-  if (headLine.startsWith("ref:")) await assertLooseRef(gitDir, headLine.slice("ref:".length).trim(), 0);
+  const head = await readSmallGitText(join(gitDir, "HEAD"), 4_096, { requireUtf8: true });
+  const headTarget = looseSymrefTarget(head ?? "");
+  if (headTarget) await assertLooseRef(gitDir, headTarget, 0);
   const common = await linkedGitDirectory(gitDir);
   if (common) await assertGitDirectoryMetadata(common, seen);
 }

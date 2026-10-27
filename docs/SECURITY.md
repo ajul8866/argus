@@ -57,9 +57,11 @@ LLM agents. Use it only on repositories you are authorized to assess.
   `refs/remotes/<name>/HEAD`. A symref target of one of those files is checked
   the same way. `rev-parse HEAD` and `rev-parse --abbrev-ref HEAD` run for
   every import, including one that does not request a revision. The abbreviation
-  walks the symref chain from `HEAD`, including a later link read from a linked
-  worktree's common directory, and the short names of that chain are probed
-  before Git starts. A config `include` or
+  walks the symref chain from `HEAD`. A linked worktree reads each later shared
+  ref from its common directory, including when its own git directory has a
+  different file of that name. The target keeps Unicode spaces Git does not
+  treat as whitespace, and a symref that is not valid UTF-8 is rejected. The
+  short names of that chain are probed before Git starts. A config `include` or
   `includeIf` is rejected wherever Git would start that section, including
   after another section on the same line. The directory named by a gitfile or
   `commondir` is the path Git opens: trailing CR and LF are removed, spaces

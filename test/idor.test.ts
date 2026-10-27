@@ -1,5 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { Config } from "../src/config.ts";
+import { Store } from "../src/db/index.ts";
 import { evaluateRun, validatePoc, type PocManifest } from "../src/dynamic/poc.ts";
+import { RetestService, retestVerdict } from "../src/dynamic/retest.ts";
 
 const manifest: PocManifest = {
   language: "python",
@@ -87,5 +93,96 @@ describe("PoC evaluation", () => {
         negative: exchange(200),
       }).status,
     ).toBe("failed");
+  });
+});
+
+let dir = "";
+let store: Store;
+
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), "argus-retest-"));
+  store = new Store({ dataDir: dir } as Config);
+  store.run(
+    `INSERT INTO projects (id, name, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+     VALUES ('p1','Demo', ?, '**/*', '', 'Tester', 'AUTH', '2026-10-27T00:00:00.000Z', '2026-10-27T00:00:00.000Z')`,
+    dir,
+  );
+  store.run(
+    "INSERT INTO audits (id, project_id, repository_id, status, current_phase, config, mode, created_at) VALUES ('a1','p1',NULL,'completed',1,'{}','dynamic','2026-10-27T00:00:00.000Z')",
+  );
+  store.run(
+    `INSERT INTO findings
+     (id, code, audit_id, project_id, title, category, cwe, severity, status, repository_commit, files,
+      root_cause, preconditions, reproduction, expected, observed, impact, remediation, created_at, updated_at)
+     VALUES ('f1','F-1','a1','p1','Test','idor',NULL,'high','confirmed',NULL,'[]',
+      'root','none','steps','expected','observed','impact','fix','2026-10-27T00:00:00.000Z','2026-10-27T00:00:00.000Z')`,
+  );
+});
+
+afterEach(() => {
+  store.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+const retestInput = {
+  findingId: "f1",
+  auditId: "a1",
+  reason: "fix applied",
+  authorizationSnapshot: "{}",
+  environmentManifest: "{}",
+  commitSha: "abc",
+  buildRef: "build-1",
+};
+
+describe("RetestService", () => {
+  test("creates a queued retest and records a fixed verdict", async () => {
+    const service = new RetestService(store, async () => ({
+      positivePassed: true,
+      exploitPassed: false,
+      evidenceRefs: ["ev1"],
+    }));
+    const id = service.request({ ...retestInput, environmentMatch: true });
+    expect(store.get("SELECT status, verdict FROM retests WHERE id = ?", id)).toEqual({ status: "queued", verdict: null });
+
+    expect(await service.run(id)).toBe("fixed");
+    expect(store.get("SELECT status, verdict FROM retests WHERE id = ?", id)).toEqual({
+      status: "completed",
+      verdict: "fixed",
+    });
+  });
+
+  test("a failed positive control is cannot_confirm even when the exploit passes", async () => {
+    const service = new RetestService(store, async () => ({
+      positivePassed: false,
+      exploitPassed: true,
+      evidenceRefs: [],
+    }));
+    const id = service.request({ ...retestInput, environmentMatch: true });
+    expect(await service.run(id)).toBe("cannot_confirm");
+  });
+
+  test("a successful exploit is still_reproducible and an environment mismatch is cannot_confirm", async () => {
+    const service = new RetestService(store, async () => ({
+      positivePassed: true,
+      exploitPassed: true,
+      evidenceRefs: [],
+    }));
+    const reproducible = service.request({ ...retestInput, environmentMatch: true });
+    expect(await service.run(reproducible)).toBe("still_reproducible");
+
+    const mismatchService = new RetestService(store, async () => ({
+      positivePassed: true,
+      exploitPassed: false,
+      evidenceRefs: [],
+    }));
+    const mismatch = mismatchService.request({ ...retestInput, environmentMatch: false });
+    expect(await mismatchService.run(mismatch)).toBe("cannot_confirm");
+  });
+
+  test("the verdict table is strict", () => {
+    expect(retestVerdict(true, true, true)).toBe("still_reproducible");
+    expect(retestVerdict(false, false, true)).toBe("cannot_confirm");
+    expect(retestVerdict(true, false, true)).toBe("fixed");
+    expect(retestVerdict(true, false, false)).toBe("cannot_confirm");
   });
 });

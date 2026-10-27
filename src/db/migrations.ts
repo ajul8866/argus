@@ -594,4 +594,32 @@ CREATE TABLE anchors (
 CREATE INDEX idx_anchors_asset ON anchors(asset_id);
 `,
   },
+  {
+    version: 9,
+    name: "finding_retests",
+    sql: `
+CREATE TABLE retests (
+  id TEXT PRIMARY KEY,
+  finding_id TEXT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+  audit_id TEXT NOT NULL REFERENCES audits(id) ON DELETE CASCADE,
+  requested_by TEXT REFERENCES users(id),
+  reason TEXT NOT NULL,
+  fix_reference TEXT,
+  authorization_snapshot TEXT NOT NULL,
+  environment_manifest TEXT NOT NULL,
+  commit_sha TEXT,
+  build_ref TEXT,
+  environment_match INTEGER CHECK (environment_match IN (0,1)),
+  executed_by TEXT,
+  positive_check TEXT,
+  status TEXT NOT NULL CHECK (status IN ('queued','running','completed','failed')),
+  verdict TEXT CHECK (verdict IN ('still_reproducible','fixed','cannot_confirm')),
+  evidence_refs TEXT,
+  started_at TEXT,
+  ended_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_retests_finding ON retests(finding_id, created_at);
+`,
+  },
 ];

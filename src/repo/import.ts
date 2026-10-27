@@ -227,6 +227,72 @@ async function assertRequestedRevision(gitDir: string, ref: string): Promise<voi
   for (const probe of probes) await assertProbedRef(gitDir, probe);
 }
 
+// Git abbreviates a symref with these rules, then probes the short name. A
+// later rule is used when an earlier short name is ambiguous, so each match
+// can open a path outside refs/.
+function gitShortRefNames(fullRef: string): string[] {
+  const rules = [
+    ["refs/remotes/", "/HEAD"],
+    ["refs/remotes/", ""],
+    ["refs/heads/", ""],
+    ["refs/tags/", ""],
+    ["refs/", ""],
+  ] as const;
+  const names: string[] = [];
+  for (const [prefix, suffix] of rules) {
+    if (!fullRef.startsWith(prefix)) continue;
+    if (suffix) {
+      if (!fullRef.endsWith(suffix)) continue;
+      const shortName = fullRef.slice(prefix.length, fullRef.length - suffix.length);
+      if (!shortName || shortName.endsWith("/")) continue;
+      names.push(shortName);
+      continue;
+    }
+    const shortName = fullRef.slice(prefix.length);
+    if (shortName) names.push(shortName);
+  }
+  return names;
+}
+
+// Every import runs `rev-parse HEAD` and `--abbrev-ref HEAD` before the
+// requested revision is verified. Those commands open the same six candidates
+// for HEAD and for the current branch's short name. A linked worktree stores
+// the branch refs in the common directory, so that directory is probed too.
+async function assertGitLookups(
+  gitDir: string,
+  ref: string | null,
+  inherited: readonly string[] = [],
+  seen = new Set<string>(),
+): Promise<void> {
+  let identity;
+  try {
+    identity = await lstat(gitDir);
+  } catch {
+    throw invalidGitMetadata();
+  }
+  if (identity.isSymbolicLink() || !identity.isDirectory()) throw invalidGitMetadata();
+  const mark = `${identity.dev}:${identity.ino}`;
+  if (seen.has(mark)) return;
+  seen.add(mark);
+  const names = new Set<string>(["HEAD", ...inherited]);
+  if (ref) {
+    const base = revisionRefName(ref);
+    if (base) names.add(base);
+  }
+  const head = await readSmallGitText(join(gitDir, "HEAD"));
+  const headLine = head?.split("\n", 1)[0] ?? "";
+  if (headLine.startsWith("ref:")) {
+    const target = headLine.slice("ref:".length).trim();
+    if (target) {
+      names.add(target);
+      for (const shortName of gitShortRefNames(target)) names.add(shortName);
+    }
+  }
+  for (const name of names) await assertRequestedRevision(gitDir, name);
+  const common = await linkedGitDirectory(gitDir);
+  if (common) await assertGitLookups(common, ref, [...names], seen);
+}
+
 // Git opens include.path while parsing config, before a command-line -c
 // override exists. Section headers are recognized wherever the parser is
 // between values, including after another header on the same line. A comment
@@ -630,7 +696,7 @@ export async function importRepository(
     throw badRequest("Invalid git ref");
   }
   const gitDirectory = await assertLocalGitReadable(sourceRoot);
-  if (ref && gitDirectory) await assertRequestedRevision(gitDirectory, ref);
+  if (gitDirectory) await assertGitLookups(gitDirectory, ref);
   const refArchive = ref ? await prepareRefArchive(sourceRoot) : null;
   const git = await gitInfo(sourceRoot);
   const scope = {

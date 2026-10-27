@@ -49,12 +49,15 @@ LLM agents. Use it only on repositories you are authorized to assess.
   environment variables are rejected or ignored, so a ref import cannot copy
   commits stored outside that work tree. A pipe or symlink in the metadata Git
   reads before that archive, including the common directory, packed refs, the
-  loose refs probed for the requested revision, exclude or attribute files,
+  loose refs probed for `HEAD`, for the current branch, and for the requested
+  revision, exclude or attribute files,
   `config.worktree`, and sparse-checkout, is rejected before Git starts. Those
   probes are the git directory file of that name, that name under `refs`,
   `refs/tags`, `refs/heads`, and `refs/remotes`, and
-  `refs/remotes/<name>/HEAD`. A symref target of one of those files is checked
-  the same way. A config `include` or
+  `refs/remotes/<name>/HEAD`.   A symref target of one of those files is checked
+  the same way. `rev-parse HEAD` and `rev-parse --abbrev-ref HEAD` run for
+  every import, including one that does not request a revision, and a linked
+  worktree probes those names in its common directory too. A config `include` or
   `includeIf` is rejected wherever Git would start that section, including
   after another section on the same line. The directory named by a gitfile or
   `commondir` is the path Git opens: trailing CR and LF are removed, spaces

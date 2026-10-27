@@ -1483,6 +1483,90 @@ describe("repository import", () => {
     expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
   });
 
+  test("import does not wait on a pipe Git opens for the current branch", async () => {
+    const gitEnv = {
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      GIT_AUTHOR_NAME: "Tester",
+      GIT_AUTHOR_EMAIL: "tester@example.com",
+      GIT_COMMITTER_NAME: "Tester",
+      GIT_COMMITTER_EMAIL: "tester@example.com",
+    };
+    const git = (cwd: string, args: string[]): void => {
+      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+        env: gitEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+    };
+    const fifo = (path: string): void => {
+      mkdirSync(join(path, ".."), { recursive: true });
+      expect(Bun.spawnSync(["mkfifo", path]).exitCode).toBe(0);
+    };
+    const prepare = (name: string): string => {
+      const source = join(dir, name);
+      mkdirSync(source);
+      git(source, ["init", "-q", "-b", "master"]);
+      writeFileSync(join(source, "a.js"), "LOCAL_ONLY\n");
+      git(source, ["add", "a.js"]);
+      git(source, ["commit", "-qm", "local"]);
+      return source;
+    };
+    const insert = (id: string, source: string): void => {
+      store.run(
+        `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+         VALUES (?, ?, '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+        id, id, source, JSON.stringify(["**/*.js"]),
+      );
+    };
+    const projectFor = (id: string, source: string) => ({
+      id,
+      source_path: source,
+      scope_include: JSON.stringify(["**/*.js"]),
+      scope_exclude: "[]",
+    });
+    const attempt = async (id: string, source: string, ref: string | null): Promise<string> => {
+      return Promise.race([
+        importRepository({ config, store }, projectFor(id, source), ref, "tester")
+          .then(() => "imported")
+          .catch((error: { code?: string }) => error.code ?? "error"),
+        Bun.sleep(800).then(() => "blocked"),
+      ]);
+    };
+
+    const tagged = prepare("branch-tags");
+    fifo(join(tagged, ".git", "refs", "tags", "master"));
+    insert("p-branch-tags", tagged);
+    expect(await attempt("p-branch-tags", tagged, null)).toBe("invalid_repository");
+
+    const headImport = prepare("branch-head");
+    fifo(join(headImport, ".git", "refs", "tags", "master"));
+    insert("p-branch-head", headImport);
+    expect(await attempt("p-branch-head", headImport, "HEAD")).toBe("invalid_repository");
+
+    const topLevel = prepare("branch-top");
+    fifo(join(topLevel, ".git", "master"));
+    insert("p-branch-top", topLevel);
+    expect(await attempt("p-branch-top", topLevel, null)).toBe("invalid_repository");
+
+    const remoteHead = prepare("branch-remote");
+    fifo(join(remoteHead, ".git", "refs", "remotes", "master", "HEAD"));
+    insert("p-branch-remote", remoteHead);
+    expect(await attempt("p-branch-remote", remoteHead, null)).toBe("invalid_repository");
+
+    const main = prepare("branch-worktree-main");
+    const linked = join(dir, "branch-worktree");
+    git(main, ["worktree", "add", "-q", linked, "HEAD"]);
+    fifo(join(main, ".git", "refs", "tags", "master"));
+    insert("p-branch-worktree", linked);
+    expect(await attempt("p-branch-worktree", linked, null)).toBe("invalid_repository");
+
+    const healthy = prepare("branch-healthy");
+    insert("p-branch-healthy", healthy);
+    const imported = await importRepository({ config, store }, projectFor("p-branch-healthy", healthy), null, "tester");
+    expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+  });
+
   test("workspaces are read-only by default and owner-writable only on explicit request", async () => {
     const scope = { include: ["**/*.js", "**/*.json", "README.md"], exclude: ["src/routes/media.js"] };
     const inventory = await buildInventory(fixture, { scope, maxFiles: 100, maxFileBytes: 1_000_000 });

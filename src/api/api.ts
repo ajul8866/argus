@@ -41,6 +41,7 @@ import { sseResponse } from "./sse.ts";
 import { LocalCatalog } from "../local/catalog.ts";
 import { localResourceRoutes } from "./local-resources.ts";
 import { TargetService, type AuthorizedActions, type Restrictions } from "../dynamic/targets.ts";
+import { TokenService } from "../auth/tokens.ts";
 
 type ApiDeps = {
   config: Config;
@@ -59,6 +60,7 @@ type AuthUser = AuthContext["user"];
 export function createApi(deps: ApiDeps): (request: Request, peerAddress?: string) => Promise<Response> {
   const catalog = deps.catalog ?? new LocalCatalog(deps.store);
   const targets = new TargetService(deps.store);
+  const tokens = new TokenService(deps.store);
   return async (request: Request, peerAddress?: string): Promise<Response> => {
     const url = new URL(request.url);
     if (!url.pathname.startsWith("/api/")) return json({ error: "not_found" }, 404);
@@ -66,8 +68,13 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
       const path = url.pathname;
       const method = request.method.toUpperCase();
       const publicRoute = path === "/api/health" || (path === "/api/auth/login" && method === "POST");
-      const authContext = publicRoute ? null : deps.auth.authenticate(request);
-      if (!publicRoute && !authContext) {
+      const bearer = request.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() ?? null;
+      const tokenAuth = !publicRoute && bearer ? tokens.verify(bearer) : null;
+      if (!publicRoute && bearer && !tokenAuth) {
+        return json({ error: { code: "unauthorized", message: "Invalid or expired token" } }, 401);
+      }
+      const authContext = publicRoute || bearer ? null : deps.auth.authenticate(request);
+      if (!publicRoute && !authContext && !tokenAuth) {
         return json({ error: { code: "unauthorized", message: "Authentication required" } }, 401);
       }
       if (authContext && !["GET", "HEAD", "OPTIONS"].includes(method)) {
@@ -77,7 +84,17 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         }
       }
       const ip = clientIp(peerAddress);
-      const user = authContext?.user ?? null;
+      const tokenUser: AuthUser | null = tokenAuth
+        ? {
+            id: tokenAuth.user.id,
+            email: tokenAuth.user.email,
+            name: tokenAuth.user.name,
+            role: tokenAuth.user.role as User["role"],
+            disabled: 0,
+            created_at: "",
+          }
+        : null;
+      const user = tokenUser ?? authContext?.user ?? null;
       const requireUser = (): AuthUser => {
         if (!user) throw new AppError(401, "unauthorized", "Authentication required");
         return user;
@@ -86,6 +103,21 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         const current = requireUser();
         if (!roleAtLeast(current, role)) throw new AppError(403, "forbidden", `Requires ${role} role`);
         return current;
+      };
+      const requireScope = (scope: string): void => {
+        if (tokenAuth && !tokens.hasScope(tokenAuth.token, scope)) {
+          throw new AppError(403, "forbidden", `Token requires ${scope}`);
+        }
+      };
+      const requireProjectScope = (projectId: string): void => {
+        if (tokenAuth && !tokens.allowsProject(tokenAuth.token, projectId)) {
+          throw new AppError(403, "forbidden", "Token is scoped to another project");
+        }
+      };
+      const requireAuditScope = (auditId: string): void => {
+        if (tokenAuth && !tokens.allowsAudit(tokenAuth.token, auditId)) {
+          throw new AppError(403, "forbidden", "Token is scoped to another audit");
+        }
       };
 
       if (path === "/api/health" && method === "GET") {
@@ -622,6 +654,15 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
           throw badRequest("mode must be static, dynamic, or hybrid");
         }
         const targetId = optionalString(body, "target_id", 100);
+        requireScope(mode === "dynamic" || mode === "hybrid" ? "audit:launch_dynamic" : "audit:launch_static");
+        requireProjectScope(projectId);
+        if (targetId) {
+          const target = deps.store.get<{ project_id: string }>(
+            "SELECT project_id FROM project_targets WHERE id = ?",
+            targetId,
+          );
+          if (!target || target.project_id !== projectId) throw badRequest("target_id must belong to this project");
+        }
         const overrides = (body.overrides ?? {}) as Record<string, unknown>;
         if (overrides && typeof overrides !== "object") throw badRequest("overrides must be an object");
         const id = deps.engine.createAudit({
@@ -662,6 +703,14 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         }
         if (action === "start" && method === "POST") {
           const current = requireRole("auditor");
+          const audit = deps.store.get<{ mode: string; project_id: string }>(
+            "SELECT mode, project_id FROM audits WHERE id = ?",
+            auditId,
+          );
+          if (!audit) throw notFound("Audit not found");
+          requireScope(audit.mode === "static" ? "audit:launch_static" : "audit:launch_dynamic");
+          requireAuditScope(auditId);
+          requireProjectScope(audit.project_id);
           await deps.engine.startAudit(auditId, current.id);
           deps.auth.logAction(current.email, "audit.started", auditId, {}, ip);
           return json({ ok: true, audit: deps.store.get("SELECT * FROM audits WHERE id = ?", auditId) });
@@ -822,6 +871,15 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
           taskAction[1],
         );
         if (!task) throw notFound("Task not found");
+        if (tokenAuth) {
+          requireScope("task:control");
+          requireAuditScope(task.audit_id);
+          const project = deps.store.get<{ project_id: string }>(
+            "SELECT project_id FROM audits WHERE id = ?",
+            task.audit_id,
+          );
+          if (project) requireProjectScope(project.project_id);
+        }
         if (taskAction[2] === "retry") {
           await deps.engine.retryTask(task.id, current.email);
           deps.auth.logAction(current.email, "task.retried", task.id, {}, ip);

@@ -14,6 +14,8 @@ import { EvidenceStore } from "../src/orchestrator/evidence.ts";
 import { DEFAULT_EXCLUDES } from "../src/repo/inventory.ts";
 import { ReportService } from "../src/reports/generator.ts";
 import { getSetting, harnessConfig, saveHarnessConfig, seedDefaults, setSetting } from "../src/settings.ts";
+import { TokenService } from "../src/auth/tokens.ts";
+import { now } from "../src/util.ts";
 
 function config(dataDir: string): Config {
   return {
@@ -712,4 +714,116 @@ test("dynamic target, authorization, and identity routes enforce roles and hide 
   }));
   expect(forbiddenResponse.status).toBe(403);
   expect(store.all("SELECT action FROM audit_log WHERE action LIKE 'target.%' ORDER BY id")).toHaveLength(3);
+});
+
+test("token scopes gate dynamic launches independently of task:create", async () => {
+  const { api, headers, userId } = await projectClient();
+  const tokens = new TokenService(store);
+
+  const createProject = async (name: string): Promise<string> => {
+    const response = await api(new Request("http://localhost/api/projects", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name, source_path: dir, scope_include: ["**/*"] }),
+    }));
+    expect(response.status).toBe(201);
+    return (await response.json()).project.id;
+  };
+
+  const projectId = await createProject("Scoped project");
+  const otherProjectId = await createProject("Other project");
+  store.run(
+    `INSERT INTO repositories (id, project_id, path, commit_sha, branch, languages, frameworks, inventory, graph, file_count, total_bytes, imported_at)
+     VALUES ('repo_scoped', ?, ?, NULL, 'test', '[]', '[]', '[]', '{}', 0, 0, ?)`,
+    projectId,
+    dir,
+    now(),
+  );
+
+  const targetResponse = await api(new Request(`http://localhost/api/projects/${projectId}/targets`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      label: "Staging",
+      base_url: "https://app.example.test",
+      environment: "staging",
+      allowed_hosts: ["app.example.test"],
+      allowed_methods: ["GET"],
+    }),
+  }));
+  expect(targetResponse.status).toBe(201);
+  const targetId = (await targetResponse.json()).target.id;
+
+  const staticToken = tokens.create({
+    userId,
+    label: "static",
+    scopes: ["task:create", "audit:launch_static"],
+    projectId,
+  });
+  const staticHeaders = { authorization: `Bearer ${staticToken.raw}`, "content-type": "application/json" };
+
+  const dynamicWithStaticScope = await api(new Request("http://localhost/api/audits", {
+    method: "POST",
+    headers: staticHeaders,
+    body: JSON.stringify({ project_id: projectId, mode: "dynamic", target_id: targetId }),
+  }));
+  expect(dynamicWithStaticScope.status).toBe(403);
+
+  const staticAudit = await api(new Request("http://localhost/api/audits", {
+    method: "POST",
+    headers: staticHeaders,
+    body: JSON.stringify({ project_id: projectId, mode: "static" }),
+  }));
+  expect(staticAudit.status).toBe(201);
+
+  const dynamicToken = tokens.create({
+    userId,
+    label: "dynamic",
+    scopes: ["audit:launch_dynamic"],
+    projectId,
+  });
+  const dynamicHeaders = { authorization: `Bearer ${dynamicToken.raw}`, "content-type": "application/json" };
+  const dynamicAudit = await api(new Request("http://localhost/api/audits", {
+    method: "POST",
+    headers: dynamicHeaders,
+    body: JSON.stringify({ project_id: projectId, mode: "dynamic", target_id: targetId }),
+  }));
+  expect(dynamicAudit.status).toBe(201);
+
+  const otherToken = tokens.create({
+    userId,
+    label: "other",
+    scopes: ["audit:launch_dynamic"],
+    projectId: otherProjectId,
+  });
+  const otherHeaders = { authorization: `Bearer ${otherToken.raw}`, "content-type": "application/json" };
+  const crossProject = await api(new Request("http://localhost/api/audits", {
+    method: "POST",
+    headers: otherHeaders,
+    body: JSON.stringify({ project_id: projectId, mode: "dynamic", target_id: targetId }),
+  }));
+  expect(crossProject.status).toBe(403);
+
+  store.run(
+    "INSERT INTO audits (id, project_id, repository_id, status, current_phase, config, mode, created_at) VALUES ('a_task', ?, NULL, 'running', 1, '{}', 'static', ?)",
+    projectId,
+    now(),
+  );
+  store.run(
+    "INSERT INTO tasks (id, audit_id, phase, kind, task_key, title, status, payload, attempts, max_attempts, created_at) VALUES ('t1','a_task',1,'phase1.map','phase1:map','Map','failed','{}',1,2,?)",
+    now(),
+  );
+  const taskToken = tokens.create({
+    userId,
+    label: "task only",
+    scopes: ["task:create"],
+    projectId,
+  });
+  const taskHeaders = { authorization: `Bearer ${taskToken.raw}`, "content-type": "application/json" };
+  const deniedControl = await api(new Request("http://localhost/api/tasks/t1/retry", {
+    method: "POST",
+    headers: taskHeaders,
+    body: "{}",
+  }));
+  expect(deniedControl.status).toBe(403);
 });

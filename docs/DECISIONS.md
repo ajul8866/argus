@@ -65,7 +65,9 @@ hashes in the inventory. A ref archive reads a git directory opened without
 following a symlink. A git common directory that does not resolve to that git
 directory, an alternate object directory Git would resolve outside the allowed
 locations, and a symlink in an object store are rejected instead of being
-copied into the snapshot. Alternate paths follow a symlink before `..`.
+copied into the snapshot. Object-store directory entries are read as raw bytes,
+and each multi-pack-index pack name must be one file name in that store.
+Alternate paths follow a symlink before `..`.
 
 **Scope is a platform boundary.** The prompt tells the agent what it is doing,
 but the workspace, explorer, and evidence checker independently enforce scope.

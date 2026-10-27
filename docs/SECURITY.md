@@ -47,7 +47,9 @@ LLM agents. Use it only on repositories you are authorized to assess.
   must stay inside an allowed source location. A `.git` symlink or `gitdir:`
   file is not followed. The git common directory must resolve to that same git
   directory, following a symlink before `..`. A symlinked object store or a
-  symlink inside an object store is rejected. An alternate object directory is
+  symlink inside an object store is rejected, including a directory entry that
+  is not valid UTF-8. Each multi-pack-index pack name must be one file name in
+  that object store, with no path separator. An alternate object directory is
   resolved the way Git resolves it, including a raw byte in a symlink name, and
   that directory, its symlinks, and its nested alternates must stay inside an
   allowed location. When the source is a subdirectory of a repository, the

@@ -49,7 +49,9 @@ LLM agents. Use it only on repositories you are authorized to assess.
   including a pack or loose-object directory. An alternate object directory is
   resolved the way Git resolves it, following a symlink before `..` and keeping
   the raw path bytes. That directory, its symlinks, and its nested alternates
-  must stay inside an allowed location. A `commondir` file is rejected, as is an
+  must stay inside an allowed location. A path that enters `/proc` or `/dev/fd`
+  is rejected: those locations describe the checking process, not the git
+  process that reads the object store. A `commondir` file is rejected, as is an
   alternate path that contains quotes or backslashes. When the source is a
   subdirectory of a repository, the archive contains only that subdirectory.
 

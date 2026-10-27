@@ -438,3 +438,33 @@ describe("worker control plane routing", () => {
     expect(worker).toContain("no_proxy=argus");
   });
 });
+
+describe("dynamic e2e plan", () => {
+  test("a dynamic e2e plan names the target, audit mode, and worker scopes", async () => {
+    const { buildDynamicE2EPlan } = await import("../src/dynamic/e2e-plan.ts");
+    const plan = buildDynamicE2EPlan({
+      projectId: "p1",
+      targetId: "t1",
+      repositoryId: "r1",
+      baseUrl: "http://127.0.0.1:9911",
+    });
+    expect(plan.audit).toEqual({ project_id: "p1", repository_id: "r1", mode: "hybrid", target_id: "t1" });
+    expect(plan.workerScopes).toEqual(["audit:read", "audit:propose_candidate"]);
+    expect(plan.requiresDocker).toBe(true);
+    expect(plan.steps.map((step) => step.name)).toEqual([
+      "broker image",
+      "worker image",
+      "audit networks",
+      "broker handshake",
+      "worker proposal",
+      "independent confirmation",
+    ]);
+  });
+
+  test("a dynamic e2e plan without a repository is dynamic, not hybrid", async () => {
+    const { buildDynamicE2EPlan } = await import("../src/dynamic/e2e-plan.ts");
+    const plan = buildDynamicE2EPlan({ projectId: "p1", targetId: "t1", baseUrl: "http://127.0.0.1:9911" });
+    expect(plan.audit.mode).toBe("dynamic");
+    expect(plan.audit.repository_id).toBeUndefined();
+  });
+});

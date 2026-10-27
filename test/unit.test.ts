@@ -1554,6 +1554,13 @@ describe("repository import", () => {
     insert("p-branch-remote", remoteHead);
     expect(await attempt("p-branch-remote", remoteHead, null)).toBe("invalid_repository");
 
+    // A tag named master makes the short branch name ambiguous, so Git probes heads/master next.
+    const ambiguous = prepare("branch-ambiguous");
+    git(ambiguous, ["tag", "master"]);
+    fifo(join(ambiguous, ".git", "heads", "master"));
+    insert("p-branch-ambiguous", ambiguous);
+    expect(await attempt("p-branch-ambiguous", ambiguous, null)).toBe("invalid_repository");
+
     const main = prepare("branch-worktree-main");
     const linked = join(dir, "branch-worktree");
     git(main, ["worktree", "add", "-q", linked, "HEAD"]);

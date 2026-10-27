@@ -226,7 +226,7 @@ operation, preserving include/exclude short-circuit behavior.
    passed through. A pipe or symlink in metadata Git would read for that
    archive, including `config.worktree`, sparse-checkout, a config include
    wherever Git would start that section, and a pipe or symlink on a path Git
-   probes for the requested revision, is rejected before Git starts. The
+   probes for HEAD, the current branch, and the requested revision, is rejected before Git starts. The
   directory named by a gitfile or `commondir` is the path Git opens, with
   trailing breaks removed and `..` applied after each symlink is followed.
   The runtime `realpath` is not used for that walk. A pointer that is not

@@ -439,7 +439,8 @@ export class ReportService {
     const data = redactObject(rawData);
     const verified = data.findings.filter((finding) => this.isVerifiedFinding(data, finding));
     const unresolved = data.findings.filter((finding) =>
-      ["confirmed", "needs_correction", "unresolved"].includes(finding.status),
+      ["confirmed", "needs_correction", "unresolved"].includes(finding.status) &&
+      !this.isVerifiedFinding(data, finding),
     );
     const rejected = data.findings.filter((finding) => finding.status === "rejected");
     return `${JSON.stringify(
@@ -539,7 +540,10 @@ export class ReportService {
 
   private renderMarkdown(data: ReportData): string {
     const verified = data.findings.filter((finding) => this.isVerifiedFinding(data, finding));
-    const unresolved = data.findings.filter((finding) => ["confirmed", "needs_correction", "unresolved"].includes(finding.status));
+    const unresolved = data.findings.filter((finding) =>
+      ["confirmed", "needs_correction", "unresolved"].includes(finding.status) &&
+      !this.isVerifiedFinding(data, finding),
+    );
     const rejected = data.findings.filter((finding) => finding.status === "rejected");
     const severityOrder = { critical: 0, high: 1, medium: 2, low: 3, info: 4 } as const;
     verified.sort((a, b) => (severityOrder[a.severity as keyof typeof severityOrder] ?? 9) - (severityOrder[b.severity as keyof typeof severityOrder] ?? 9));
@@ -754,6 +758,56 @@ export class ReportService {
       lines.push(`- **${finding.code} — ${finding.title}** was rejected during independent reverification. Retained for transparency; not a confirmed vulnerability.`);
     }
     lines.push("");
+    const retests = this.store.all<{
+      finding_id: string;
+      status: string;
+      verdict: string | null;
+      reason: string;
+      environment_match: number | null;
+      commit_sha: string | null;
+      build_ref: string | null;
+      created_at: string;
+    }>("SELECT finding_id, status, verdict, reason, environment_match, commit_sha, build_ref, created_at FROM retests WHERE audit_id = ? ORDER BY created_at", data.audit.id);
+    lines.push("## Retest history");
+    lines.push("");
+    if (retests.length === 0) {
+      lines.push("_No post-audit retests were requested._");
+    } else {
+      lines.push("| Finding | Status | Verdict | Environment match | Commit | Reason |");
+      lines.push("| --- | --- | --- | --- | --- | --- |");
+      const codes = new Map(data.findings.map((finding) => [finding.id, finding.code]));
+      for (const retest of retests) {
+        lines.push(
+          `| ${escapeTable(codes.get(retest.finding_id) ?? retest.finding_id)} | ${retest.status} | ${retest.verdict ?? "pending"} | ${retest.environment_match === 1 ? "yes" : "no"} | ${escapeTable(retest.commit_sha ?? "n/a")} | ${escapeTable(retest.reason)} |`,
+        );
+      }
+    }
+    lines.push("");
+    lines.push("## Asset coverage");
+    lines.push("");
+    const assets = this.store.all<{ asset_key: string; kind: string; tested: number }>(
+      `SELECT a.asset_key, a.kind,
+         EXISTS(
+           SELECT 1 FROM anchors an JOIN exploration_nodes n ON n.id = an.node_id
+           WHERE an.asset_id = a.id AND n.audit_id = ? AND n.kind = 'fact' AND n.status = 'completed'
+             AND EXISTS (SELECT 1 FROM exploration_edges e WHERE e.to_node_id = n.id AND e.kind = 'yields')
+         ) AS tested
+       FROM assets a
+       WHERE a.project_id = (SELECT project_id FROM audits WHERE id = ?)
+       ORDER BY a.kind, a.asset_key`,
+      data.audit.id,
+      data.audit.id,
+    );
+    if (assets.length === 0) {
+      lines.push("_No dynamic assets were recorded._");
+    } else {
+      lines.push("| Asset | Kind | Tested |");
+      lines.push("| --- | --- | --- |");
+      for (const asset of assets) {
+        lines.push(`| ${escapeTable(asset.asset_key)} | ${asset.kind} | ${asset.tested === 1 ? "yes" : "no"} |`);
+      }
+    }
+    lines.push("");
     lines.push("## Execution and evidence");
     lines.push("");
     lines.push(`- Tasks: ${data.tasks.length} total, ${data.tasks.filter((task) => task.status === "completed").length} completed, ${data.tasks.filter((task) => task.status === "failed").length} failed.`);
@@ -783,7 +837,6 @@ export class ReportService {
   }
 
   private renderHtml(data: ReportData, markdown: string): string {
-    const verified = data.findings.filter((finding) => finding.status === "reverified");
     const body = markdownToHtml(markdown);
     return `<!doctype html>
 <html lang="en">

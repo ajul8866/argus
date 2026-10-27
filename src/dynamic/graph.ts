@@ -325,8 +325,12 @@ export class GraphStore {
              SELECT 1 FROM anchors an
              JOIN exploration_nodes n ON n.id = an.node_id
              WHERE an.asset_id = a.id AND n.audit_id = ?
-               AND n.kind IN ('intent','fact','finding')
-               AND n.status IN ('completed','running')
+               AND n.kind = 'fact'
+               AND n.status = 'completed'
+               AND EXISTS (
+                 SELECT 1 FROM exploration_edges e
+                 WHERE e.to_node_id = n.id AND e.kind = 'yields'
+               )
            ) AS tested
          FROM assets a
          WHERE a.project_id = (SELECT project_id FROM audits WHERE id = ?)

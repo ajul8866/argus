@@ -9,7 +9,6 @@ export type RetestExecutorResult = {
   evidenceRefs: string[];
   error?: string;
 };
-
 export type RetestExecutor = (input: {
   findingId: string;
   auditId: string;
@@ -53,6 +52,51 @@ type RetestRow = {
   created_at: string;
 };
 
+function assertAuthorizationSnapshot(value: string): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw badRequest("authorization_snapshot must be valid JSON");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw badRequest("authorization_snapshot must be an object");
+  }
+  const record = parsed as Record<string, unknown>;
+  const required = ["id", "authorized_by", "reference", "valid_from", "valid_until"];
+  for (const key of required) {
+    const entry = record[key];
+    if (typeof entry !== "string" || entry.trim().length === 0) {
+      throw badRequest(`authorization_snapshot.${key} is required`);
+    }
+  }
+  const from = Date.parse(String(record.valid_from));
+  const until = Date.parse(String(record.valid_until));
+  if (!Number.isFinite(from) || !Number.isFinite(until)) {
+    throw badRequest("authorization_snapshot timestamps must be ISO values");
+  }
+  if (until <= from) throw badRequest("authorization_snapshot valid_until must be after valid_from");
+  if (until <= Date.now()) {
+    throw badRequest("authorization_snapshot is expired; a retest needs a current authorization");
+  }
+}
+
+function assertEnvironmentManifest(value: string): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw badRequest("environment_manifest must be valid JSON");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw badRequest("environment_manifest must be an object");
+  }
+  const target = (parsed as Record<string, unknown>).target;
+  if (typeof target !== "string" || target.trim().length === 0) {
+    throw badRequest("environment_manifest.target is required");
+  }
+}
+
 export function retestVerdict(
   positivePassed: boolean,
   exploitPassed: boolean,
@@ -80,6 +124,13 @@ export class RetestService {
     if (!input.reason?.trim()) throw badRequest("reason is required");
     if (!input.authorizationSnapshot) throw badRequest("authorization_snapshot is required");
     if (!input.environmentManifest) throw badRequest("environment_manifest is required");
+    assertAuthorizationSnapshot(input.authorizationSnapshot);
+    assertEnvironmentManifest(input.environmentManifest);
+    // A retest can only return `fixed` when the caller states that the
+    // environment matches. An omitted flag is not evidence of a match.
+    if (typeof input.environmentMatch !== "boolean") {
+      throw badRequest("environment_match must be stated explicitly");
+    }
     const id = uid();
     this.store.run(
       `INSERT INTO retests
@@ -97,7 +148,7 @@ export class RetestService {
       input.environmentManifest,
       input.commitSha ?? null,
       input.buildRef ?? null,
-      input.environmentMatch === false ? 0 : 1,
+      input.environmentMatch ? 1 : 0,
       input.positiveCheck ?? null,
       now(),
     );
@@ -120,6 +171,17 @@ export class RetestService {
         environmentManifest: row.environment_manifest,
         positiveCheck: row.positive_check,
       });
+      // An executor error means the run did not establish anything; the
+      // exploit failing is then not evidence of a fix.
+      if (result.error) {
+        this.store.run(
+          `UPDATE retests SET status = 'failed', verdict = 'cannot_confirm', evidence_refs = ?, ended_at = ? WHERE id = ?`,
+          toJson({ error: result.error }),
+          now(),
+          retestId,
+        );
+        return "cannot_confirm";
+      }
       const verdict = retestVerdict(
         result.positivePassed,
         result.exploitPassed,

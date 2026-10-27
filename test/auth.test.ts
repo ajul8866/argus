@@ -922,18 +922,24 @@ test("exploration route returns assets, nodes, edges, anchors, and coverage", as
     status: "completed",
     payload: { title: "Read another identity invoice" },
   });
+  const fact = graph.createNode({ auditId: "a_graph", kind: "fact", status: "completed", payload: { status: 200 } });
   graph.anchor(goal.id, asset.id);
   graph.anchor(intent.id, asset.id);
+  graph.anchor(fact.id, asset.id);
   graph.linkNodes(goal.id, intent.id, "spawns");
+  graph.linkNodes(intent.id, fact.id, "yields");
 
   const response = await api(new Request("http://localhost/api/audits/a_graph/exploration", { headers }));
   expect(response.status).toBe(200);
   const body = await response.json();
   expect(body.assets).toHaveLength(1);
   expect(body.assets[0]).toMatchObject({ id: asset.id, assetKey: "https://graph.test" });
-  expect(body.nodes).toHaveLength(2);
-  expect(body.edges).toEqual([{ fromNodeId: goal.id, toNodeId: intent.id, kind: "spawns" }]);
-  expect(body.anchors).toHaveLength(2);
+  expect(body.nodes).toHaveLength(3);
+  expect(body.edges).toEqual([
+    { fromNodeId: goal.id, toNodeId: intent.id, kind: "spawns" },
+    { fromNodeId: intent.id, toNodeId: fact.id, kind: "yields" },
+  ]);
+  expect(body.anchors).toHaveLength(3);
   expect(body.coverage).toEqual([
     expect.objectContaining({ assetId: asset.id, assetKey: "https://graph.test", tested: true }),
   ]);

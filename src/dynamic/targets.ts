@@ -360,6 +360,8 @@ export class TargetService {
       throw badRequest("authorized_actions is required");
     }
     const id = uid();
+    // Store canonical UTC so the lexical comparison in activeAuthorization
+    // cannot be fooled by an offset such as +14:00.
     this.store.run(
       `INSERT INTO target_authorizations
        (id, target_id, authorized_by, authorization_ref, valid_from, valid_until, authorized_actions,
@@ -369,8 +371,8 @@ export class TargetService {
       input.targetId,
       input.authorizedBy.trim(),
       input.reference.trim(),
-      input.validFrom,
-      input.validUntil,
+      new Date(starts).toISOString(),
+      new Date(ends).toISOString(),
       toJson(input.authorizedActions),
       toJson(input.restrictions ?? {}),
       input.createdBy ?? null,

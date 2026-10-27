@@ -430,10 +430,14 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         if (!deps.store.get("SELECT id FROM projects WHERE id = ?", projectId)) throw notFound("Project not found");
         if (method === "GET") {
           requireUser();
+          requireScope("target:read");
+          requireProjectScope(projectId);
           return json({ targets: targets.listTargets(projectId) });
         }
         if (method === "POST") {
           const current = requireRole("auditor");
+          requireScope("target:manage");
+          requireProjectScope(projectId);
           const body = await readJson(request);
           const repositoryId = optionalString(body, "repository_id", 100);
           if (repositoryId && !deps.store.get("SELECT id FROM repositories WHERE id = ? AND project_id = ?", repositoryId, projectId)) {
@@ -461,12 +465,19 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
       if (targetAuthorizationsMatch) {
         const targetId = targetAuthorizationsMatch[1]!;
         if (!targets.getTarget(targetId)) throw notFound("Target not found");
+        const targetProject = deps.store.get<{ project_id: string }>(
+          "SELECT project_id FROM project_targets WHERE id = ?",
+          targetId,
+        );
+        if (targetProject) requireProjectScope(targetProject.project_id);
         if (method === "GET") {
           requireUser();
+          requireScope("target:read");
           return json({ authorizations: targets.listAuthorizations(targetId) });
         }
         if (method === "POST") {
           const current = requireRole("auditor");
+          requireScope("target:manage");
           const body = await readJson(request);
           const actions = body.authorized_actions;
           if (!actions || typeof actions !== "object" || Array.isArray(actions)) {
@@ -495,12 +506,19 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
       if (targetIdentitiesMatch) {
         const targetId = targetIdentitiesMatch[1]!;
         if (!targets.getTarget(targetId)) throw notFound("Target not found");
+        const identityProject = deps.store.get<{ project_id: string }>(
+          "SELECT project_id FROM project_targets WHERE id = ?",
+          targetId,
+        );
+        if (identityProject) requireProjectScope(identityProject.project_id);
         if (method === "GET") {
           requireUser();
+          requireScope("target:read");
           return json({ identities: targets.listIdentities(targetId) });
         }
         if (method === "POST") {
           const current = requireRole("auditor");
+          requireScope("target:manage");
           const body = await readJson(request);
           const authKind = requireString(body, "auth_kind", 20);
           if (!["none", "header", "cookie", "basic"].includes(authKind)) {
@@ -687,6 +705,13 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         if (!audit) throw notFound("Audit not found");
         if (method === "GET") {
           requireUser();
+          requireScope("audit:read");
+          requireAuditScope(auditId);
+          const auditProject = deps.store.get<{ project_id: string }>(
+            "SELECT project_id FROM audits WHERE id = ?",
+            auditId,
+          );
+          if (auditProject) requireProjectScope(auditProject.project_id);
           return json(await auditDetail(deps, auditId));
         }
         if (method === "POST") {
@@ -726,6 +751,8 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         }
         if (action === "sessions" && method === "GET") {
           requireUser();
+          requireScope("audit:read");
+          requireAuditScope(auditId);
           const sessions = deps.store.all(
             "SELECT id, task_id, role, harness, model, status, sandbox_mode, harness_session_ref, started_at, ended_at, usage, error FROM agent_sessions WHERE audit_id = ? ORDER BY started_at DESC",
             auditId,
@@ -734,6 +761,8 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         }
         if (action === "tasks" && method === "GET") {
           requireUser();
+          requireScope("audit:read");
+          requireAuditScope(auditId);
           const tasks = deps.store.all(
             `SELECT t.id, t.phase, t.kind, t.task_key, t.title, t.status, t.priority, t.error, t.failure_kind,
                     t.agent_role, t.harness, t.model, t.attempts, t.max_attempts, t.requires_approval,
@@ -787,6 +816,8 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         }
         if (action === "findings" && method === "GET") {
           requireUser();
+          requireScope("finding:read");
+          requireAuditScope(auditId);
           const findings = deps.store.all(
             `SELECT f.*, (SELECT COUNT(*) FROM verifications v WHERE v.finding_id = f.id) AS verification_count
              FROM findings f WHERE f.audit_id = ? ORDER BY f.code`,
@@ -801,6 +832,8 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         }
         if (action === "evidence" && method === "GET") {
           requireUser();
+          requireScope("audit:read");
+          requireAuditScope(auditId);
           const rows = deps.store.all<EvidenceRow>(
             "SELECT * FROM evidence WHERE audit_id = ? ORDER BY rowid",
             auditId,
@@ -812,6 +845,8 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         }
         if (action === "exploration" && method === "GET") {
           requireUser();
+          requireScope("audit:read");
+          requireAuditScope(auditId);
           const audit = deps.store.get<{ project_id: string }>(
             "SELECT project_id FROM audits WHERE id = ?",
             auditId,
@@ -1051,8 +1086,15 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
       const findingMatch = path.match(/^\/api\/findings\/([^/]+)$/);
       if (findingMatch && method === "GET") {
         requireUser();
+        requireScope("finding:read");
         const finding = deps.store.get<Record<string, unknown>>("SELECT * FROM findings WHERE id = ?", findingMatch[1]);
         if (!finding) throw notFound("Finding not found");
+        requireAuditScope(String(finding.audit_id ?? ""));
+        const findingProject = deps.store.get<{ project_id: string }>(
+          "SELECT project_id FROM audits WHERE id = ?",
+          String(finding.audit_id ?? ""),
+        );
+        if (findingProject) requireProjectScope(findingProject.project_id);
         const candidate = finding.candidate_id
           ? deps.store.get("SELECT * FROM candidates WHERE id = ?", String(finding.candidate_id))
           : null;

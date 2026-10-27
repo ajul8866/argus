@@ -446,7 +446,13 @@ describe("dynamic IDOR proof", () => {
       findingId: finding.id,
       auditId: "a1",
       reason: "ownership check added",
-      authorizationSnapshot: JSON.stringify(snapshot),
+      authorizationSnapshot: JSON.stringify({
+        id: snapshot.authorization.id,
+        authorized_by: snapshot.authorization.authorized_by,
+        reference: snapshot.authorization.reference,
+        valid_from: snapshot.authorization.valid_from,
+        valid_until: snapshot.authorization.valid_until,
+      }),
       environmentManifest: JSON.stringify({ target: baseUrl, commit_sha: "abc123" }),
       environmentMatch: true,
     });

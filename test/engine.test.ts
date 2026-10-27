@@ -1408,7 +1408,9 @@ describe("audit modes", () => {
 
     await expect(engine.proveGoal(id, goal.id, "")).rejects.toThrow(/coverage|rationale/i);
 
+    const intent = graph.createNode({ auditId: id, kind: "intent", status: "completed", payload: {} });
     const fact = graph.createNode({ auditId: id, kind: "fact", status: "completed", payload: {} });
+    graph.linkNodes(intent.id, fact.id, "yields");
     graph.anchor(fact.id, asset.id);
     graph.upsertAsset({ projectId: "p2", kind: "endpoint", assetKey: "GET /admin" });
     await expect(engine.proveGoal(id, goal.id, "")).rejects.toThrow(/coverage|rationale/i);
@@ -1523,5 +1525,73 @@ describe("audit modes", () => {
     } finally {
       setSystemTime();
     }
+  });
+});
+
+describe("authorization and goal guards", () => {
+  function insertRepositorylessProject(): void {
+    store.run(
+      `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+       VALUES ('p2','No repo','', ?, '[]', '[]', 'Tester','AUTH-2', ?, ?)`,
+      dir,
+      now(),
+      now(),
+    );
+  }
+
+  function dynamicTarget(validUntil = "2099-01-01T00:00:00.000Z") {
+    const targets = new TargetService(store);
+    const target = targets.createTarget({
+      projectId: "p2",
+      label: "Staging",
+      baseUrl: "https://app.example.test",
+      environment: "staging",
+      allowedHosts: ["app.example.test"],
+      allowedMethods: ["GET"],
+    });
+    targets.createAuthorization({
+      targetId: target.id,
+      authorizedBy: "Tester",
+      reference: "AUTH-2",
+      validFrom: "2020-01-01T00:00:00.000Z",
+      validUntil,
+      authorizedActions: { methods: ["GET"] },
+      restrictions: {},
+    });
+    return { targets, target };
+  }
+
+  test("a revoked authorization stops exploration before the next intent", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget();
+    const authorization = targets.listAuthorizations(target.id)[0]!;
+    targets.createIdentity({ targetId: target.id, label: "anon", role: "user", authKind: "none" });
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+    await engine.startAudit(id, "u1");
+
+    store.run("UPDATE target_authorizations SET status = 'revoked' WHERE id = ?", authorization.id);
+    await engine.runExplorationStep(id);
+
+    expect(
+      store.get<{ exploration_status: string; stop_reason: string | null }>(
+        "SELECT exploration_status, stop_reason FROM audits WHERE id = ?",
+        id,
+      ),
+    ).toEqual({ exploration_status: "closed", stop_reason: "authorization_expired" });
+  });
+
+  test("prove_goal refuses while an intent is still open", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget();
+    targets.createIdentity({ targetId: target.id, label: "anon", role: "user", authKind: "none" });
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+    await engine.startAudit(id, "u1");
+    const graph = new GraphStore(store);
+    const goal = graph.listGoal(id)!;
+    graph.createNode({ auditId: id, kind: "intent", status: "approved", payload: { title: "open" } });
+
+    await expect(
+      engine.proveGoal(id, goal.id, "the remaining endpoint is unreachable from the test network"),
+    ).rejects.toThrow(/intent/i);
   });
 });

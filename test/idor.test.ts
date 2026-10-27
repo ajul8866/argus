@@ -128,8 +128,14 @@ const retestInput = {
   findingId: "f1",
   auditId: "a1",
   reason: "fix applied",
-  authorizationSnapshot: "{}",
-  environmentManifest: "{}",
+  authorizationSnapshot: JSON.stringify({
+    id: "auth-1",
+    authorized_by: "Tester",
+    reference: "AUTH-1",
+    valid_from: "2026-01-01T00:00:00.000Z",
+    valid_until: "2099-01-01T00:00:00.000Z",
+  }),
+  environmentManifest: JSON.stringify({ target: "https://app.example.test" }),
   commitSha: "abc",
   buildRef: "build-1",
 };
@@ -184,5 +190,55 @@ describe("RetestService", () => {
     expect(retestVerdict(false, false, true)).toBe("cannot_confirm");
     expect(retestVerdict(true, false, true)).toBe("fixed");
     expect(retestVerdict(true, false, false)).toBe("cannot_confirm");
+  });
+});
+
+describe("RetestService strictness", () => {
+  test("an omitted environment_match is rejected instead of assumed", () => {
+    const service = new RetestService(store, async () => ({
+      positivePassed: true,
+      exploitPassed: false,
+      evidenceRefs: [],
+    }));
+    expect(() => service.request({ ...retestInput, environmentMatch: undefined as never })).toThrow(/environment_match/i);
+  });
+
+  test("an expired or malformed authorization snapshot is rejected", () => {
+    const service = new RetestService(store, async () => ({
+      positivePassed: true,
+      exploitPassed: false,
+      evidenceRefs: [],
+    }));
+    expect(() =>
+      service.request({
+        ...retestInput,
+        environmentMatch: true,
+        authorizationSnapshot: JSON.stringify({
+          id: "a",
+          authorized_by: "x",
+          reference: "r",
+          valid_from: "2020-01-01T00:00:00.000Z",
+          valid_until: "2020-02-01T00:00:00.000Z",
+        }),
+      }),
+    ).toThrow(/expired/i);
+    expect(() =>
+      service.request({ ...retestInput, environmentMatch: true, authorizationSnapshot: "{}" }),
+    ).toThrow(/authorization_snapshot\./i);
+    expect(() =>
+      service.request({ ...retestInput, environmentMatch: true, environmentManifest: "[]" }),
+    ).toThrow(/environment_manifest/i);
+  });
+
+  test("an executor error is cannot_confirm even when the exploit fails", async () => {
+    const service = new RetestService(store, async () => ({
+      positivePassed: true,
+      exploitPassed: false,
+      evidenceRefs: [],
+      error: "target unreachable",
+    }));
+    const id = service.request({ ...retestInput, environmentMatch: true });
+    expect(await service.run(id)).toBe("cannot_confirm");
+    expect(store.get<{ status: string }>("SELECT status FROM retests WHERE id = ?", id)).toEqual({ status: "failed" });
   });
 });

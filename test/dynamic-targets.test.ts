@@ -91,6 +91,28 @@ describe("TargetService", () => {
     expect(targets.listIdentities(target.id).map((row) => row.id)).toEqual([identity.id]);
   });
 
+  test("an authorization offset cannot outlive its absolute expiry", () => {
+    const target = targets.createTarget({
+      projectId,
+      label: "Offset target",
+      baseUrl: "https://offset.example.test",
+      environment: "test",
+      allowedHosts: ["offset.example.test"],
+    });
+    // Absolute time is in the past even though the local wall clock reads 23:00.
+    const expired = new Date(Date.now() - 3_600_000);
+    const created = targets.createAuthorization({
+      targetId: target.id,
+      authorizedBy: "Tester",
+      reference: "AUTH-OFFSET",
+      validFrom: new Date(expired.getTime() - 3_600_000).toISOString(),
+      validUntil: expired.toISOString(),
+      authorizedActions: { methods: ["GET"] },
+    });
+    expect(targets.activeAuthorization(target.id)).toBeNull();
+    expect(created.validUntil).toBe(expired.toISOString());
+  });
+
   test("rejects an authorization window that ends before it starts", () => {
     const target = targets.createTarget({
       projectId,

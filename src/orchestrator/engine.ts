@@ -921,17 +921,32 @@ export class AuditEngine {
     if (node.kind !== "goal" && node.kind !== "intent") {
       throw new AppError(400, "invalid_exploration_node", "Only a goal or intent can be proven");
     }
+    const openIntents = this.store.get<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM exploration_nodes
+       WHERE audit_id = ? AND kind = 'intent' AND status IN ('proposed','approved','claimed','running')`,
+      auditId,
+    )?.count ?? 0;
+    if (openIntents > 0) {
+      throw new AppError(
+        409,
+        "goal_not_proven",
+        `${openIntents} intent(s) are still open; let them finish or close exploration instead`,
+      );
+    }
     const untested = this.graph.coverage(auditId).filter((asset) => !asset.tested);
     const hasRationale = typeof rationale === "string" && rationale.trim().length >= 10;
     const supportingFact = this.store.get(
-      "SELECT id FROM exploration_nodes WHERE audit_id = ? AND kind = 'fact' LIMIT 1",
+      `SELECT id FROM exploration_nodes n
+       WHERE n.audit_id = ? AND n.kind = 'fact' AND n.status = 'completed'
+         AND EXISTS (SELECT 1 FROM exploration_edges e WHERE e.to_node_id = n.id AND e.kind = 'yields')
+       LIMIT 1`,
       auditId,
     );
     if (untested.length > 0 && !(hasRationale && supportingFact)) {
       throw new AppError(
         409,
         "goal_not_proven",
-        "Goal needs full asset coverage or an unreachable rationale backed by a fact",
+        "Goal needs full asset coverage or an unreachable rationale backed by a recorded fact",
       );
     }
     this.graph.updateNodeStatus(nodeId, "completed");
@@ -953,7 +968,7 @@ export class AuditEngine {
     if (!snapshotRow) return;
     const snapshot = snapshotRow.snapshot;
 
-    if (Date.parse(snapshot.authorization.valid_until) <= Date.now()) {
+    if (Date.parse(snapshot.authorization.valid_until) <= Date.now() || !this.authorizationStillActive(snapshot)) {
       this.store.run(
         "UPDATE audits SET exploration_status = 'closed', stop_reason = 'authorization_expired' WHERE id = ?",
         auditId,
@@ -3157,6 +3172,21 @@ export class AuditEngine {
   /** Test seam: run one scheduler pass for a single audit. */
   async reconcileForTest(auditId: string): Promise<void> {
     await this.reconcile(auditId);
+  }
+
+  /**
+   * The snapshot is immutable, but the authorization it captured can be
+   * revoked or expire at any time. Every execution re-checks the live record.
+   */
+  private authorizationStillActive(snapshot: AuditScopeSnapshot): boolean {
+    const live = this.targets.getAuthorization(snapshot.authorization.id);
+    if (!live) return false;
+    if (live.targetId !== snapshot.target.id) return false;
+    if (live.status !== "active") return false;
+    const nowMs = Date.now();
+    if (Date.parse(live.validFrom) > nowMs) return false;
+    if (Date.parse(live.validUntil) <= nowMs) return false;
+    return true;
   }
 
   private async reconcile(auditId: string): Promise<void> {

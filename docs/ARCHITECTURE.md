@@ -221,8 +221,9 @@ operation, preserving include/exclude short-circuit behavior.
    directory descriptor opened without following a symlink. A `.git` symlink,
    a `gitdir:` file, a symlink under the object store, a `commondir` file, and
    an alternate object directory outside the allowed locations are rejected.
-   Nested alternates are checked the same way. A subdirectory import
-   archives only that subdirectory. A symlink, a repository directory or
+   The alternate path is the directory Git opens after following a symlink and
+   applying `..`, and nested alternates are checked the same way. A subdirectory
+   import archives only that subdirectory. A symlink, a repository directory or
    ancestor replaced by a symlink, a path that escapes the source, or bytes
    that no longer match the inventory are not copied. The inventory is then
    rebuilt from the snapshot.

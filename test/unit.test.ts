@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
@@ -1113,6 +1113,66 @@ describe("repository import", () => {
     }
   });
 
+  test("a git ref import rejects an alternate that escapes through a symlink", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "argus-git-dotdot-"));
+    try {
+      initRepo(outside, { "secret.js": "SECRET_LINK_DOTDOT_SENTINEL" });
+      const outsideSha = gitExec(outside, ["rev-parse", "HEAD"]);
+      mkdirSync(join(outside, "target"), { recursive: true });
+      cpSync(join(outside, ".git/objects"), join(outside, "decoy-objects"), { recursive: true });
+      cpSync(join(outside, ".git/objects"), join(outside, "secret-objects"), { recursive: true });
+      // Lexical normalization of `link/..` stays on this in-root directory.
+      mkdirSync(join(dir, "decoy-objects"), { recursive: true });
+      mkdirSync(join(dir, "secret-objects"), { recursive: true });
+      symlinkSync(join(outside, "target"), join(dir, "escape-link"));
+      const limited = { ...config, allowedRoots: [dir] };
+      const importRef = async (source: string) => importRepository({
+        config: limited,
+        store,
+      }, {
+        ...project,
+        source_path: source,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      }, "HEAD", "tester");
+
+      const absoluteRepo = join(dir, "absolute-dotdot");
+      initRepo(absoluteRepo, { "a.js": "INSIDE_CONTENT" });
+      pointBranch(absoluteRepo, outsideSha);
+      mkdirSync(join(absoluteRepo, ".git/objects/info"), { recursive: true });
+      writeFileSync(join(absoluteRepo, ".git/objects/info/alternates"), `${dir}/escape-link/../decoy-objects\n`);
+      await expect(importRef(absoluteRepo)).rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+
+      const relativeRepo = join(dir, "relative-dotdot");
+      initRepo(relativeRepo, { "a.js": "INSIDE_CONTENT" });
+      pointBranch(relativeRepo, outsideSha);
+      mkdirSync(join(relativeRepo, ".git/objects/info"), { recursive: true });
+      writeFileSync(join(relativeRepo, ".git/objects/info/alternates"), "../../../escape-link/../decoy-objects\n");
+      await expect(importRef(relativeRepo)).rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+
+      const byteRepo = join(dir, "byte-dotdot");
+      initRepo(byteRepo, { "a.js": "INSIDE_CONTENT" });
+      pointBranch(byteRepo, outsideSha);
+      symlinkSync(Buffer.from(join(outside, "target")), Buffer.concat([Buffer.from(join(dir, "link")), Buffer.from([0xff])]));
+      mkdirSync(Buffer.concat([Buffer.from(join(dir, "link")), Buffer.from([0xc3, 0xbf])]));
+      mkdirSync(join(byteRepo, ".git/objects/info"), { recursive: true });
+      writeFileSync(
+        join(byteRepo, ".git/objects/info/alternates"),
+        Buffer.concat([
+          Buffer.from(`${dir}/link`),
+          Buffer.from([0xff]),
+          Buffer.from("/../secret-objects\n"),
+        ]),
+      );
+      await expect(importRef(byteRepo)).rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+      expect(existsSync(join(dir, "repos"))).toBe(false);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   test("a git ref import accepts an alternate object store inside the allowed root", async () => {
     const shared = join(dir, "shared-repo");
     const consumer = join(dir, "consumer-repo");
@@ -1135,6 +1195,24 @@ describe("repository import", () => {
     }, "HEAD", "tester");
     expect(await Bun.file(join(imported.path, "shared.js")).text()).toBe("SHARED_INSIDE_OBJECT");
     expect(existsSync(join(imported.path, "secret.js"))).toBe(false);
+
+    const relativeConsumer = join(dir, "relative-consumer");
+    initRepo(relativeConsumer, { "a.js": "INSIDE_CONTENT" });
+    pointBranch(relativeConsumer, gitExec(shared, ["rev-parse", "HEAD"]));
+    const relativeAlternate = relative(join(relativeConsumer, ".git/objects"), realpathSync(join(shared, ".git/objects")));
+    expect(relativeAlternate.split("/").includes("..")).toBe(true);
+    mkdirSync(join(relativeConsumer, ".git/objects/info"), { recursive: true });
+    writeFileSync(join(relativeConsumer, ".git/objects/info/alternates"), `${relativeAlternate}\n`);
+    const relativeImport = await importRepository({
+      config: { ...config, allowedRoots: [dir] },
+      store,
+    }, {
+      ...project,
+      source_path: relativeConsumer,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    }, "HEAD", "tester");
+    expect(await Bun.file(join(relativeImport.path, "shared.js")).text()).toBe("SHARED_INSIDE_OBJECT");
   });
 
   test("a pinned git directory ignores a symlink that replaces .git", async () => {

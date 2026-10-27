@@ -1,4 +1,4 @@
-import { constants, fstatSync } from "node:fs";
+import { constants, fstatSync, lstatSync, readlinkSync } from "node:fs";
 import { chmod, lstat, mkdir, open, readlink, readdir, realpath, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { AppError, createScopeMatcher, matchesScope, normalizePath, safeJoin, sha256 } from "../util.ts";
@@ -492,7 +492,8 @@ function retainGitDir(handle: OpenedFile, path: string): PinnedGitDir {
 // `git --git-dir` follows a symlink. Hold the directory descriptor and make git
 // use that inode. Reject an object store that can name bytes outside the
 // allowed roots: a symlink under `objects`, a `commondir` file, or an alternate
-// object directory (including one reached through another alternate).
+// object directory Git can resolve, including one reached through another
+// alternate or a symlink followed before `..`.
 export async function openAuthorizedGitDirectory(path: string, allowedRoots: string[]): Promise<PinnedGitDir> {
   const flags = noFollowFlags();
   let authorized: string;
@@ -705,11 +706,13 @@ async function scanObjectEntry(
 // Git unquotes an alternates line that starts with `"`. Checking the raw line
 // can authorize a different directory from the one git then reads. Reject the
 // characters that select that parser instead of guessing the decoded path.
-function assertPlainAlternateLine(line: string): void {
-  if (/["\\\u0000-\u001f\u007f]/.test(line)) throw gitObjectsError();
+function assertPlainAlternateLine(line: Buffer): void {
+  for (const byte of line) {
+    if (byte === 0x22 || byte === 0x5c || byte <= 0x1f || byte === 0x7f) throw gitObjectsError();
+  }
 }
 
-async function alternateLines(objects: OpenedFile): Promise<string[]> {
+async function alternateLines(objects: OpenedFile): Promise<Buffer[]> {
   let handle: OpenedFile | null;
   try {
     handle = await openAt(objects.fd, ["info", "alternates"], noFollowFlags().file);
@@ -730,13 +733,110 @@ async function alternateLines(objects: OpenedFile): Promise<string[]> {
       if (bytesRead === 0) throw gitObjectsError();
       offset += bytesRead;
     }
-    const text = buffer.toString("latin1");
-    const lines = text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0);
-    if (lines.length > 100) throw gitObjectsError();
-    return lines;
+    const entries: Buffer[] = [];
+    let start = 0;
+    for (let index = 0; index <= buffer.length; index += 1) {
+      if (index !== buffer.length && buffer[index] !== 0x0a) continue;
+      const piece = buffer.subarray(start, index);
+      start = index + 1;
+      if (piece.length === 0) continue;
+      // Git treats a line whose first byte is "#" as a comment.
+      if (piece[0] === 0x23) continue;
+      if (entries.length >= 100) throw gitObjectsError();
+      entries.push(Buffer.from(piece));
+    }
+    return entries;
   } finally {
     await handle.close().catch(() => undefined);
   }
+}
+
+// Node and Bun `realpath` collapse `..` before following a symlink, and they
+// re-encode a byte path as UTF-8. Git's resolver follows the symlink first and
+// keeps the raw bytes, so those routines authorize a different directory from
+// the one `git archive` reads. Walk the bytes the way Git does.
+function splitGitComponents(path: Buffer): Buffer[] {
+  const parts: Buffer[] = [];
+  let start = 0;
+  for (let index = 0; index <= path.length; index += 1) {
+    if (index !== path.length && path[index] !== 0x2f) continue;
+    if (index > start) parts.push(Buffer.from(path.subarray(start, index)));
+    start = index + 1;
+  }
+  return parts;
+}
+
+function gitPathBuffer(parts: readonly Buffer[]): Buffer {
+  if (parts.length === 0) return Buffer.from("/");
+  const chunks: Buffer[] = [];
+  for (const part of parts) chunks.push(Buffer.from("/"), part);
+  const path = Buffer.concat(chunks);
+  if (path.length > 4096) throw gitObjectsError();
+  return path;
+}
+
+function resolveGitPath(path: Buffer): Buffer {
+  if (path.length === 0 || path.length > 4096 || path[0] !== 0x2f) throw gitObjectsError();
+  let pending = splitGitComponents(path);
+  const resolved: Buffer[] = [];
+  let index = 0;
+  let symlinks = 0;
+  let steps = 0;
+  while (index < pending.length) {
+    if (++steps > 8192) throw gitObjectsError();
+    const part = pending[index];
+    index += 1;
+    if (!part || part.length === 0 || (part.length === 1 && part[0] === 0x2e)) continue;
+    if (part.length === 2 && part[0] === 0x2e && part[1] === 0x2e) {
+      resolved.pop();
+      continue;
+    }
+    const candidate = gitPathBuffer([...resolved, part]);
+    let info;
+    try {
+      info = lstatSync(candidate);
+    } catch {
+      throw gitObjectsError();
+    }
+    if (!info.isSymbolicLink()) {
+      resolved.push(part);
+      continue;
+    }
+    if (++symlinks > 32) throw gitObjectsError();
+    let target: Buffer;
+    try {
+      const linked = readlinkSync(candidate, { encoding: "buffer" });
+      if (!Buffer.isBuffer(linked) || linked.length === 0 || linked.length > 4096) throw gitObjectsError();
+      target = linked;
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      throw gitObjectsError();
+    }
+    if (target[0] === 0x2f) resolved.length = 0;
+    pending = [...splitGitComponents(target), ...pending.slice(index)];
+    index = 0;
+  }
+  return gitPathBuffer(resolved);
+}
+
+function decodeGitPath(path: Buffer): string {
+  if (path.length === 0 || path[0] !== 0x2f) throw gitObjectsError();
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(path);
+  } catch {
+    throw gitObjectsError();
+  }
+  const parts = text.split("/");
+  if (parts.some((part) => part === "." || part === "..")) throw gitObjectsError();
+  return text;
+}
+
+function resolveGitAlternate(objectsPath: string, line: Buffer): string {
+  if (!objectsPath.startsWith("/") || line.length === 0) throw gitObjectsError();
+  const base = resolveGitPath(Buffer.from(objectsPath));
+  const raw = line[0] === 0x2f ? line : Buffer.concat([base, Buffer.from("/"), line]);
+  return decodeGitPath(resolveGitPath(raw));
 }
 
 async function assertSafeObjectDirectory(
@@ -756,7 +856,7 @@ async function assertSafeObjectDirectory(
     assertPlainAlternateLine(line);
     let authorized: string;
     try {
-      authorized = await assertAuthorizedRoot(resolve(objectsPath, line), allowedRoots);
+      authorized = await assertAuthorizedRoot(resolveGitAlternate(objectsPath, line), allowedRoots);
     } catch {
       throw gitObjectsError();
     }

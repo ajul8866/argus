@@ -182,7 +182,35 @@ export async function verifyQuote(
   };
 }
 
-export async function assertAuthorizedRoot(path: string, allowedRoots: string[]): Promise<string> {
+/**
+ * Reject any repository root that lives inside the Argus data directory.
+ * The data directory holds the credential-vault master key, the SQLite
+ * database with credential ciphertext and password hashes, evidence files,
+ * and the first-run bootstrap administrator password. Importing it as a
+ * "repository" would turn an auditor-scoped project into a full read of the
+ * platform's secrets, so the boundary is enforced for every caller.
+ *
+ * `<dataDir>/repos` is the immutable snapshot store and stays readable: that
+ * is where import writes the copies that later reads and excerpt checks use.
+ */
+function insideDataDir(resolved: string, dataDir?: string, allowedRoots: string[] = []): boolean {
+  if (!dataDir) return false;
+  const normalizedData = dataDir.endsWith("/") ? dataDir : `${dataDir}/`;
+  if (resolved !== dataDir && !resolved.startsWith(normalizedData)) return false;
+  // The immutable snapshot store is the one part of the data directory that is
+  // legitimately a repository root.
+  const snapshotRoot = `${normalizedData}repos`;
+  if (resolved === snapshotRoot || resolved.startsWith(`${snapshotRoot}/`)) return false;
+  // An operator that lists the data directory itself as an explicit repository
+  // root has opted in deliberately; respect that configuration.
+  return !allowedRoots.includes(dataDir);
+}
+
+export async function assertAuthorizedRoot(
+  path: string,
+  allowedRoots: string[],
+  dataDir?: string,
+): Promise<string> {
   const { realpath } = await import("node:fs/promises");
   let resolved: string;
   try {
@@ -192,6 +220,13 @@ export async function assertAuthorizedRoot(path: string, allowedRoots: string[])
   }
   const stats = await stat(resolved);
   if (!stats.isDirectory()) throw new AppError(400, "invalid_repository", "Repository path must be a directory");
+  if (insideDataDir(resolved, dataDir, allowedRoots)) {
+    throw new AppError(
+      403,
+      "repository_not_authorized",
+      "The Argus data directory is not a valid repository location.",
+    );
+  }
   const allowed = allowedRoots.some((root) => {
     const normalizedRoot = root.endsWith("/") ? root : `${root}/`;
     return resolved === root || resolved.startsWith(normalizedRoot);

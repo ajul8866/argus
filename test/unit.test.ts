@@ -1561,10 +1561,59 @@ describe("repository import", () => {
     insert("p-branch-worktree", linked);
     expect(await attempt("p-branch-worktree", linked, null)).toBe("invalid_repository");
 
+    const chain = prepare("branch-chain");
+    writeFileSync(join(chain, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
+    writeFileSync(join(chain, ".git", "HEAD"), "ref: refs/heads/alias\n");
+    fifo(join(chain, ".git", "refs", "tags", "master"));
+    insert("p-branch-chain", chain);
+    expect(await attempt("p-branch-chain", chain, null)).toBe("invalid_repository");
+
+    const chainRef = prepare("branch-chain-ref");
+    writeFileSync(join(chainRef, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
+    writeFileSync(join(chainRef, ".git", "HEAD"), "ref: refs/heads/alias\n");
+    git(chainRef, ["tag", "v1"]);
+    fifo(join(chainRef, ".git", "master"));
+    insert("p-branch-chain-ref", chainRef);
+    expect(await attempt("p-branch-chain-ref", chainRef, "v1")).toBe("invalid_repository");
+
+    const ambiguous = prepare("branch-chain-ambiguous");
+    writeFileSync(join(ambiguous, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
+    writeFileSync(join(ambiguous, ".git", "HEAD"), "ref: refs/heads/alias\n");
+    writeFileSync(join(ambiguous, ".git", "refs", "tags", "master"), readFileSync(join(ambiguous, ".git", "refs", "heads", "master")));
+    fifo(join(ambiguous, ".git", "heads", "master"));
+    insert("p-branch-chain-ambiguous", ambiguous);
+    expect(await attempt("p-branch-chain-ambiguous", ambiguous, null)).toBe("invalid_repository");
+
+    const chainMain = prepare("branch-chain-worktree-main");
+    git(chainMain, ["branch", "feature"]);
+    writeFileSync(join(chainMain, ".git", "refs", "heads", "alias"), "ref: refs/heads/feature\n");
+    const chainLinked = join(dir, "branch-chain-worktree");
+    git(chainMain, ["worktree", "add", "-q", chainLinked, "feature"]);
+    const gitdirLine = readFileSync(join(chainLinked, ".git"), "utf8").trim();
+    const declaredGitDir = gitdirLine.startsWith("gitdir: ") ? gitdirLine.slice("gitdir: ".length).trim() : "";
+    const worktreeGit = declaredGitDir.startsWith("/") ? declaredGitDir : join(chainLinked, declaredGitDir);
+    writeFileSync(join(worktreeGit, "HEAD"), "ref: refs/heads/alias\n");
+    fifo(join(chainMain, ".git", "refs", "tags", "feature"));
+    insert("p-branch-chain-worktree", chainLinked);
+    expect(await attempt("p-branch-chain-worktree", chainLinked, null)).toBe("invalid_repository");
+
     const healthy = prepare("branch-healthy");
     insert("p-branch-healthy", healthy);
     const imported = await importRepository({ config, store }, projectFor("p-branch-healthy", healthy), null, "tester");
     expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const healthyChain = prepare("branch-chain-healthy");
+    writeFileSync(join(healthyChain, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
+    writeFileSync(join(healthyChain, ".git", "HEAD"), "ref: refs/heads/alias\n");
+    insert("p-branch-chain-healthy", healthyChain);
+    const chainImported = await importRepository({ config, store }, projectFor("p-branch-chain-healthy", healthyChain), null, "tester");
+    expect(await Bun.file(join(chainImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const healthyAmbiguous = prepare("branch-ambiguous-healthy");
+    writeFileSync(join(healthyAmbiguous, ".git", "refs", "tags", "master"), readFileSync(join(healthyAmbiguous, ".git", "refs", "heads", "master")));
+    insert("p-branch-ambiguous-healthy", healthyAmbiguous);
+    const ambiguousImported = await importRepository({ config, store }, projectFor("p-branch-ambiguous-healthy", healthyAmbiguous), null, "tester");
+    expect(await Bun.file(join(ambiguousImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
   });
 
   test("workspaces are read-only by default and owner-writable only on explicit request", async () => {

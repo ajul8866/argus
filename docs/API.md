@@ -38,7 +38,7 @@ change the throttle bucket.
 | `GET` | `/api/projects/:id` | any | Project + snapshots + audits |
 | `PUT` | `/api/projects/:id` | auditor | Update metadata/scope/status |
 | `DELETE` | `/api/projects/:id` | admin | Delete only if no audits |
-| `POST` | `/api/projects/:id/import` | auditor | Import current worktree or `{ref}`. A ref import rejects Git metadata that points outside the selected work tree, including a different common directory. A pipe, config include, or gitfile or `commondir` target Git would read is rejected before Git starts, including one reached through a symlink and `..` or named with bytes that are not UTF-8. A pipe or symlink on a path Git probes for that revision, including a symref target, is rejected before Git starts. Configured exclude or attribute paths are not opened |
+| `POST` | `/api/projects/:id/import` | auditor | Import current worktree or `{ref}`. A ref import rejects Git metadata that points outside the selected work tree, including a different common directory. A pipe, config include, or gitfile or `commondir` target Git would read is rejected before Git starts, including one reached through a symlink and `..` or named with bytes that are not UTF-8. A pipe or symlink on a path Git probes for that revision, including a symref target, is rejected before Git starts. The probed name drops a trailing `~` or `^` suffix, keeps the revision before a `:`, and includes each side of `..` or `...`. Configured exclude or attribute paths are not opened |
 | `GET` | `/api/repository-folders?path=&search=&offset=` | auditor | Browse existing host folders, with Git markers and pages of 100 |
 | `GET` | `/api/repositories` | any | All snapshots |
 | `GET` | `/api/repositories/:id` | any | Snapshot + inventory + architecture map |

@@ -1458,6 +1458,7 @@ describe("repository import", () => {
     writeFileSync(join(symref, ".git", "refs", "heads", "alias"), "ref: root.fifo\n");
     insert("p-ref-symref", symref);
     expect(await attempt("p-ref-symref", symref, "alias")).toBe("invalid_repository");
+    expect(await attempt("p-ref-symref", symref, "alias:a.js")).toBe("invalid_repository");
 
     const linkedRef = prepare("ref-symlink");
     fifo(join(dir, "feature.fifo"));
@@ -1474,13 +1475,34 @@ describe("repository import", () => {
     insert("p-ref-child", join(parent, "child"));
     expect(await attempt("p-ref-child", join(parent, "child"), "HEAD")).toBe("invalid_repository");
 
+    const syntax = prepare("ref-syntax");
+    git(syntax, ["branch", "other"]);
+    fifo(join(syntax, ".git", "refs", "tags", "master"));
+    insert("p-ref-syntax", syntax);
+    expect(await attempt("p-ref-syntax", syntax, "master:a.js")).toBe("invalid_repository");
+    expect(await attempt("p-ref-syntax", syntax, "master~1:a.js")).toBe("invalid_repository");
+    expect(await attempt("p-ref-syntax", syntax, "master..other")).toBe("invalid_repository");
+    expect(await attempt("p-ref-syntax", syntax, "master...other")).toBe("invalid_repository");
+    expect(await attempt("p-ref-syntax", syntax, "other..master")).toBe("invalid_repository");
+
+    const qualified = prepare("ref-qualified");
+    const qualifiedFifo = join(qualified, ".git", "refs", "tags", "refs", "heads");
+    mkdirSync(qualifiedFifo, { recursive: true });
+    fifo(join(qualifiedFifo, "master"));
+    insert("p-ref-qualified", qualified);
+    expect(await attempt("p-ref-qualified", qualified, "refs/heads/master:a.js")).toBe("invalid_repository");
+
     const healthy = prepare("ref-healthy");
     git(healthy, ["tag", "v1"]);
+    git(healthy, ["tag", "v1.2"]);
+    git(healthy, ["branch", "other"]);
     git(healthy, ["update-ref", "refs/remotes/origin/master", "HEAD"]);
     git(healthy, ["update-ref", "refs/remotes/master/HEAD", "HEAD"]);
     insert("p-ref-healthy", healthy);
-    const imported = await importRepository({ config, store }, project("p-ref-healthy", healthy), "master", "tester");
+    const imported = await importRepository({ config, store }, project("p-ref-healthy", healthy), "v1.2", "tester");
     expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+    expect(await attempt("p-ref-healthy", healthy, "master:a.js")).toBe("bad_request");
+    expect(await attempt("p-ref-healthy", healthy, "master..other")).toBe("bad_request");
   });
 
   test("workspaces are read-only by default and owner-writable only on explicit request", async () => {

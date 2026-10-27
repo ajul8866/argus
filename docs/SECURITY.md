@@ -53,7 +53,10 @@ LLM agents. Use it only on repositories you are authorized to assess.
   `config.worktree`, and sparse-checkout, is rejected before Git starts. Those
   probes are the git directory file of that name, that name under `refs`,
   `refs/tags`, `refs/heads`, and `refs/remotes`, and
-  `refs/remotes/<name>/HEAD`. A symref target of one of those files is checked
+  `refs/remotes/<name>/HEAD`. That name is the revision Git opens for
+  `rev-parse --verify <ref>^{commit}`: a trailing `~` or `^` ancestor suffix
+  is removed, a `:` path keeps the revision before the colon, and each side
+  of `..` or `...` is checked. A symref target of one of those files is checked
   the same way. A config `include` or
   `includeIf` is rejected wherever Git would start that section, including
   after another section on the same line. The directory named by a gitfile or

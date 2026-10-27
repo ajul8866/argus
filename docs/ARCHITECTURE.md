@@ -223,8 +223,10 @@ operation, preserving include/exclude short-circuit behavior.
    only Git metadata for that work tree: a `.git` symlink or gitfile, a Git
    common directory other than that Git directory, an alternate object store,
    or a symlink in the object store is rejected, and `GIT_*` variables are not
-   passed through. A subdirectory archives only its own tree. The inventory is
-   then rebuilt from the snapshot.
+   passed through. The archive itself runs from a separate repository that
+   unsets the `filter` attribute, so a configured smudge or process filter
+   cannot read or rewrite the snapshot. A subdirectory archives only its own
+   tree. The inventory is then rebuilt from the snapshot.
 4. Each task gets a fresh read-only copy under
    `$ARGUS_DATA_DIR/workspaces/<audit>/<session>`.
 5. If Bubblewrap is available, the harness runs with a new session, new PID/IPC/

@@ -64,7 +64,9 @@ and branch are recorded; uncommitted worktree state is represented by the file
 hashes in the inventory. A ref archive uses the Git directory discovered for
 that work tree and ignores `GIT_*` overrides. Metadata that points at another
 object store, including a different Git common directory, is rejected instead
-of being copied into the snapshot.
+of being copied into the snapshot. The archive command runs in a separate
+repository with the `filter` attribute unset, so Git config cannot turn a
+smudge or process filter into a read of files outside the commit.
 
 **Scope is a platform boundary.** The prompt tells the agent what it is doing,
 but the workspace, explorer, and evidence checker independently enforce scope.

@@ -885,6 +885,101 @@ describe("repository import", () => {
     }
   });
 
+  test("a git ref import archives the committed blob without running a smudge filter", async () => {
+    const outside = join(dir, "outside-filter");
+    mkdirSync(outside);
+    const secret = join(outside, "secret.txt");
+    writeFileSync(secret, "SECRET_OUTSIDE_SENTINEL\n");
+    const git = (cwd: string, args: string[]): string => {
+      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          GIT_AUTHOR_NAME: "Tester",
+          GIT_AUTHOR_EMAIL: "tester@example.com",
+          GIT_COMMITTER_NAME: "Tester",
+          GIT_COMMITTER_EMAIL: "tester@example.com",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+      return result.stdout.toString().trim();
+    };
+    const insert = (id: string, source: string): void => {
+      store.run(
+        `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+         VALUES (?, ?, '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+        id, id, source, JSON.stringify(["**/*.js"]),
+      );
+    };
+    const projectFor = (id: string) => {
+      const row = store.get<{ source_path: string; scope_include: string; scope_exclude: string }>(
+        "SELECT source_path, scope_include, scope_exclude FROM projects WHERE id = ?",
+        id,
+      )!;
+      return {
+        id,
+        source_path: row.source_path,
+        scope_include: row.scope_include,
+        scope_exclude: row.scope_exclude,
+      };
+    };
+    const prepare = (id: string, path: string, objectFormat?: "sha256"): void => {
+      mkdirSync(join(path, "src"), { recursive: true });
+      writeFileSync(join(path, "src", "a.js"), "COMMITTED_BLOB\n");
+      if (objectFormat !== "sha256") writeFileSync(join(path, ".gitattributes"), "*.js filter=leak\n");
+      git(path, objectFormat === "sha256" ? ["init", "-q", "--object-format=sha256"] : ["init", "-q"]);
+      git(path, ["add", "src/a.js", ...(objectFormat === "sha256" ? [] : [".gitattributes"])]);
+      git(path, ["commit", "-qm", "blob"]);
+      writeFileSync(join(path, "src", "a.js"), "WORKTREE_ONLY\n");
+      insert(id, path);
+    };
+    const previousHome = process.env.HOME;
+    try {
+      const local = join(dir, "smudge-local");
+      prepare("p-smudge", local);
+      const marker = join(dir, "smudge-marker");
+      const processMarker = join(dir, "process-marker");
+      git(local, ["config", "filter.leak.smudge", `touch ${marker}; cat ${secret}`]);
+      git(local, ["config", "filter.leak.process", `touch ${processMarker}; printf 'status=error\\n'`]);
+
+      const included = join(dir, "smudge-include");
+      prepare("p-include", included);
+      const includeMarker = join(dir, "include-marker");
+      const includeConfig = join(dir, "leak.config");
+      writeFileSync(includeConfig, `[filter "leak"]\n\tsmudge = touch ${includeMarker}; cat ${secret}\n`);
+      git(included, ["config", "include.path", includeConfig]);
+
+      const shaRepo = join(dir, "sha256-repo");
+      prepare("p-sha256", shaRepo, "sha256");
+
+      const globalRepo = join(dir, "smudge-global");
+      prepare("p-global", globalRepo);
+      const globalHome = join(dir, "filter-home");
+      const globalMarker = join(dir, "global-marker");
+      mkdirSync(globalHome);
+      writeFileSync(join(globalHome, ".gitconfig"), `[filter "leak"]\n\tsmudge = touch ${globalMarker}; cat ${secret}\n`);
+
+      const expectBlob = async (id: string): Promise<void> => {
+        const imported = await importRepository({ config, store }, projectFor(id), "HEAD", "tester");
+        expect(await Bun.file(join(imported.path, "src/a.js")).text()).toBe("COMMITTED_BLOB\n");
+        expect(existsSync(join(imported.path, "secret.txt"))).toBe(false);
+      };
+      await expectBlob("p-smudge");
+      expect(existsSync(marker)).toBe(false);
+      expect(existsSync(processMarker)).toBe(false);
+      await expectBlob("p-include");
+      expect(existsSync(includeMarker)).toBe(false);
+      await expectBlob("p-sha256");
+      process.env.HOME = globalHome;
+      await expectBlob("p-global");
+      expect(existsSync(globalMarker)).toBe(false);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
   test("import does not wait when git HEAD is a pipe", async () => {
     const source = join(dir, "fifo-head");
     mkdirSync(join(source, ".git"), { recursive: true });

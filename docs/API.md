@@ -38,7 +38,7 @@ change the throttle bucket.
 | `GET` | `/api/projects/:id` | any | Project + snapshots + audits |
 | `PUT` | `/api/projects/:id` | auditor | Update metadata/scope/status |
 | `DELETE` | `/api/projects/:id` | admin | Delete only if no audits |
-| `POST` | `/api/projects/:id/import` | auditor | Import current worktree or `{ref}`. A ref import rejects Git metadata that points outside the selected work tree, including a different common directory. A pipe, config include, or gitfile target Git would read is rejected before Git starts, and configured exclude or attribute paths are not opened |
+| `POST` | `/api/projects/:id/import` | auditor | Import current worktree or `{ref}`. A ref import rejects Git metadata that points outside the selected work tree, including a different common directory. A pipe, config include, or gitfile or `commondir` target Git would read is rejected before Git starts, and configured exclude or attribute paths are not opened |
 | `GET` | `/api/repository-folders?path=&search=&offset=` | auditor | Browse existing host folders, with Git markers and pages of 100 |
 | `GET` | `/api/repositories` | any | All snapshots |
 | `GET` | `/api/repositories/:id` | any | Snapshot + inventory + architecture map |

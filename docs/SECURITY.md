@@ -51,8 +51,11 @@ LLM agents. Use it only on repositories you are authorized to assess.
   reads before that archive, including the common directory, packed refs, the
   current ref, exclude or attribute files, `config.worktree`, and
   sparse-checkout, is rejected before Git starts. A config `include` or
-  `includeIf`, including one reached through `commondir` or a gitfile, is
-  rejected the same way. `core.excludesFile` and `core.attributesFile` are
+  `includeIf` is rejected wherever Git would start that section, including
+  after another section on the same line. The directory named by a gitfile or
+  `commondir` is the path Git opens: trailing CR and LF are removed, spaces
+  and embedded newlines stay, and `..` is resolved after symlinks. That
+  directory is checked the same way. `core.excludesFile` and `core.attributesFile` are
   forced to `/dev/null` for these Git commands. A `.git` symlink discovered
   while walking parent directories is rejected. A subdirectory of a repository
   archives only that subdirectory.

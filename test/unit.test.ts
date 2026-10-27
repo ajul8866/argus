@@ -1115,7 +1115,7 @@ describe("repository import", () => {
     insert("p-wt-excludes", excludes);
 
     const commented = prepare("include-comment");
-    await appendConfig(join(commented, ".git"), "# [include]\n; [includeIf \"gitdir:**\"]\n[core]\n\tnote = [include]\n");
+    await appendConfig(join(commented, ".git"), "# [include]\n; [includeIf \"gitdir:**\"]\n[core] # [include]\n\tnote = [include]\n");
     insert("p-include-comment", commented);
 
     const includeHeaders = [
@@ -1123,6 +1123,10 @@ describe("repository import", () => {
       ["include-upper", "[INCLUDE]\n\tpath = FIFO\n"],
       ["include-if", "[includeIf \"gitdir:**\"]\n\tpath = FIFO\n"],
       ["include-indent", "  [include]\n    path = FIFO\n"],
+      ["include-same", "[core][include]\n\tpath = FIFO\n"],
+      ["include-cr", "[core]\r[include]\r\tpath = FIFO\n"],
+      ["include-tab", "[core]\t[includeIf \"gitdir:**\"]\n\tpath = FIFO\n"],
+      ["include-after-branch", "[branch \"master\"]\n\tremote = .\n[core][include]\n\tpath = FIFO\n"],
     ] as const;
     for (const [name, header] of includeHeaders) {
       const source = prepare(name);
@@ -1178,6 +1182,63 @@ describe("repository import", () => {
     insert("p-gitfile-child", join(gitfileParent, "child"));
     expect(await attempt("p-gitfile-child", join(gitfileParent, "child"), "HEAD")).toBe("invalid_repository");
 
+    const spacedParent = prepare("gitfile-space");
+    mkdirSync(join(spacedParent, "child"));
+    writeFileSync(join(spacedParent, "child", "a.js"), "LOCAL_CHILD\n");
+    git(spacedParent, ["add", "child/a.js"]);
+    git(spacedParent, ["commit", "-qm", "child"]);
+    renameSync(join(spacedParent, ".git"), join(spacedParent, "gitdir"));
+    const spacedGit = `${join(spacedParent, "gitdir")} `;
+    expect(Bun.spawnSync(["cp", "-a", join(spacedParent, "gitdir"), spacedGit]).exitCode).toBe(0);
+    fifo(join(spacedGit, "info", "exclude"));
+    writeFileSync(join(spacedParent, ".git"), `gitdir: ${join(spacedParent, "gitdir")} \n`);
+    insert("p-gitfile-space", join(spacedParent, "child"));
+    expect(await attempt("p-gitfile-space", join(spacedParent, "child"), "HEAD")).toBe("invalid_repository");
+
+    const newlineParent = prepare("gitfile-newline");
+    mkdirSync(join(newlineParent, "child"));
+    writeFileSync(join(newlineParent, "child", "a.js"), "LOCAL_CHILD\n");
+    git(newlineParent, ["add", "child/a.js"]);
+    git(newlineParent, ["commit", "-qm", "child"]);
+    const newlineGit = join(newlineParent, "evil\nname");
+    renameSync(join(newlineParent, ".git"), join(newlineParent, "plain"));
+    expect(Bun.spawnSync(["cp", "-a", join(newlineParent, "plain"), newlineGit]).exitCode).toBe(0);
+    const newlineFifo = join(dir, "newline-include.fifo");
+    fifo(newlineFifo);
+    await appendConfig(newlineGit, `[include]\n\tpath = ${newlineFifo}\n`);
+    writeFileSync(join(newlineParent, ".git"), "gitdir: evil\nname\n");
+    insert("p-gitfile-newline", join(newlineParent, "child"));
+    expect(await attempt("p-gitfile-newline", join(newlineParent, "child"), "HEAD")).toBe("invalid_repository");
+
+    const spacedCommon = prepare("common-space");
+    const spacedCommonGit = join(dir, "spaced-common ");
+    expect(Bun.spawnSync(["cp", "-a", join(spacedCommon, ".git"), spacedCommonGit]).exitCode).toBe(0);
+    const spacedCommonFifo = join(dir, "spaced-common.fifo");
+    fifo(spacedCommonFifo);
+    await appendConfig(spacedCommonGit, `[include]\n\tpath = ${spacedCommonFifo}\n`);
+    writeFileSync(join(spacedCommon, ".git", "commondir"), `${spacedCommonGit}\n`);
+    insert("p-common-space", spacedCommon);
+    expect(await attempt("p-common-space", spacedCommon, "HEAD")).toBe("invalid_repository");
+
+    const linkedCommon = prepare("common-link");
+    const pivot = join(dir, "common-pivot", "inside");
+    mkdirSync(pivot, { recursive: true });
+    symlinkSync(pivot, join(linkedCommon, ".git", "link"));
+    const linkedEvil = join(dir, "linked-evil-git");
+    expect(Bun.spawnSync(["cp", "-a", join(linkedCommon, ".git"), linkedEvil]).exitCode).toBe(0);
+    const commonLinkFifo = join(dir, "linked-common.fifo");
+    fifo(commonLinkFifo);
+    await appendConfig(linkedEvil, `[include]\n\tpath = ${commonLinkFifo}\n`);
+    writeFileSync(join(linkedCommon, ".git", "commondir"), "link/../../linked-evil-git\n");
+    insert("p-common-link", linkedCommon);
+    expect(await attempt("p-common-link", linkedCommon, "HEAD")).toBe("invalid_repository");
+
+    const continued = prepare("include-continued");
+    const continuedFifo = join(dir, "continued.fifo");
+    fifo(continuedFifo);
+    await appendConfig(join(continued, ".git"), `[core]\n\tx = bar\\\n[include]\n\tpath = ${continuedFifo}\n`);
+    insert("p-include-continued", continued);
+
     const healthy = prepare("gitfile-ok");
     mkdirSync(join(healthy, "child"));
     writeFileSync(join(healthy, "child", "a.js"), "LOCAL_CHILD\n");
@@ -1198,6 +1259,7 @@ describe("repository import", () => {
       ["p-attr-file", attributes],
       ["p-wt-excludes", excludes],
       ["p-include-comment", commented],
+      ["p-include-continued", continued],
     ] as const) {
       const outcome = await Promise.race([
         importRepository({ config, store }, project(id, source), "HEAD", "tester")

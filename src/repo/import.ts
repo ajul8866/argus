@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, readdir, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readdir, realpath, rm } from "node:fs/promises";
 import { dirname, join, relative, sep } from "node:path";
 import type { Config } from "../config.ts";
 import type { Store } from "../db/index.ts";
@@ -146,16 +146,120 @@ async function assertLooseRef(gitDir: string, refName: string, depth: number): P
   await assertLooseRef(gitDir, line.slice("ref:".length).trim(), depth + 1);
 }
 
-// Git accepts "[include]" and "[includeIf ...]" with any capitalization and
-// leading whitespace. It opens include.path while parsing config, before a
-// command-line -c override exists. A comment or a value that merely contains
-// the word does not.
+// Git opens include.path while parsing config, before a command-line -c
+// override exists. Section headers are recognized wherever the parser is
+// between values, including after another header on the same line. A comment
+// or a value that merely contains the word does not start a section.
+function isGitSpace(char: string): boolean {
+  return char === " " || char === "\t" || char === "\r" || char === "\f" || char === "\v";
+}
+
+function isGitAlpha(char: string): boolean {
+  return (char >= "A" && char <= "Z") || (char >= "a" && char <= "z");
+}
+
+function isGitKeyChar(char: string): boolean {
+  return char === "-" || (char >= "0" && char <= "9") || isGitAlpha(char);
+}
+
 function gitConfigIncludesFile(text: string): boolean {
   const source = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
-  for (const raw of source.split("\n")) {
-    const line = raw.trim();
-    if (!line || line.startsWith("#") || line.startsWith(";")) continue;
-    if (/^\[include(?:if)?(?:\s|\])/i.test(line)) return true;
+  let index = 0;
+  let sawEof = false;
+  let comment = false;
+  const read = (): string => {
+    if (sawEof) return "\n";
+    if (index >= source.length) {
+      sawEof = true;
+      return "\n";
+    }
+    const char = source[index] ?? "";
+    index += 1;
+    if (char === "\r" && source[index] === "\n") {
+      index += 1;
+      return "\n";
+    }
+    return char;
+  };
+  const skipExtended = (first: string): boolean => {
+    let current = first;
+    do {
+      if (current === "\n" || sawEof) return false;
+      current = read();
+    } while (isGitSpace(current));
+    if (current !== "\"") return false;
+    while (true) {
+      current = read();
+      if (current === "\n" || sawEof) return false;
+      if (current === "\"") break;
+      if (current === "\\") {
+        current = read();
+        if (current === "\n" || sawEof) return false;
+      }
+    }
+    return read() === "]";
+  };
+  const skipEntry = (first: string): boolean => {
+    let current = first;
+    while (isGitKeyChar(current)) current = read();
+    while (current === " " || current === "\t") current = read();
+    if (current === "\n") return true;
+    if (current !== "=") return false;
+    let quote = false;
+    let inComment = false;
+    while (true) {
+      current = read();
+      if (current === "\n") return !quote;
+      if (inComment) continue;
+      if (!quote && isGitSpace(current)) continue;
+      if (!quote && (current === "#" || current === ";")) {
+        inComment = true;
+        continue;
+      }
+      if (current === "\\") {
+        read();
+        if (sawEof) return !quote;
+        continue;
+      }
+      if (current === "\"") quote = !quote;
+    }
+  };
+
+  while (!sawEof) {
+    const current = read();
+    if (current === "\n") {
+      if (sawEof) return false;
+      comment = false;
+      continue;
+    }
+    if (comment) continue;
+    if (isGitSpace(current)) continue;
+    if (current === "#" || current === ";") {
+      comment = true;
+      continue;
+    }
+    if (current === "[") {
+      let name = "";
+      let closed = false;
+      while (!closed) {
+        const next = read();
+        if (next === "]") {
+          if (name === "include" || name === "includeif") return true;
+          closed = true;
+          break;
+        }
+        if (isGitSpace(next) || next === "\n") {
+          if (name === "include" || name === "includeif") return true;
+          if (next === "\n" || sawEof || !skipExtended(next)) return false;
+          closed = true;
+          break;
+        }
+        if (sawEof || (!isGitKeyChar(next) && next !== ".")) return false;
+        name += next.toLowerCase();
+      }
+      continue;
+    }
+    if (!isGitAlpha(current) || !skipEntry(current)) return false;
   }
   return false;
 }
@@ -165,15 +269,17 @@ async function assertConfigHasNoInclude(path: string): Promise<void> {
   if (text && gitConfigIncludesFile(text)) throw invalidGitMetadata();
 }
 
-// commondir is a path relative to this git directory, or an absolute path.
-// Git reads config and exclude files from that other directory before the
-// later equality check can reject it.
-async function linkedGitDirectory(gitDir: string): Promise<string | null> {
-  const text = await readSmallGitText(join(gitDir, "commondir"));
-  if (text === null) return null;
-  const raw = text.split("\n", 1)[0]?.trim() ?? "";
+// Git strips only trailing CR and LF from a gitfile or commondir. Spaces and
+// embedded newlines stay in the path, and ".." is resolved after symlinks.
+function gitPointerTarget(gitDir: string, text: string): string {
+  let end = text.length;
+  while (end > 0 && (text[end - 1] === "\n" || text[end - 1] === "\r")) end -= 1;
+  const raw = text.slice(0, end);
   if (!raw || raw.includes("\0")) throw invalidGitMetadata();
-  const target = raw.startsWith("/") ? raw : join(gitDir, raw);
+  return raw.startsWith("/") ? raw : `${gitDir}/${raw}`;
+}
+
+async function resolveExistingGitDirectory(target: string): Promise<string | null> {
   let info;
   try {
     info = await lstat(target);
@@ -181,7 +287,20 @@ async function linkedGitDirectory(gitDir: string): Promise<string | null> {
     return null;
   }
   if (info.isSymbolicLink() || !info.isDirectory()) throw invalidGitMetadata();
-  return target;
+  try {
+    return await realpath(target);
+  } catch {
+    throw invalidGitMetadata();
+  }
+}
+
+// commondir is a path relative to this git directory, or an absolute path.
+// Git reads config and exclude files from that other directory before the
+// later equality check can reject it.
+async function linkedGitDirectory(gitDir: string): Promise<string | null> {
+  const text = await readSmallGitText(join(gitDir, "commondir"));
+  if (text === null) return null;
+  return resolveExistingGitDirectory(gitPointerTarget(gitDir, text));
 }
 
 async function assertGitDirectoryMetadata(gitDir: string, seen = new Set<string>()): Promise<void> {
@@ -219,19 +338,9 @@ async function assertGitDirectoryMetadata(gitDir: string, seen = new Set<string>
 // Git follows it and then opens metadata in that directory.
 async function assertGitFileTarget(gitFilePath: string): Promise<void> {
   const text = await readSmallGitText(gitFilePath);
-  const line = text?.split("\n", 1)[0] ?? "";
-  if (!line.startsWith("gitdir: ")) return;
-  const raw = line.slice("gitdir: ".length).trim();
-  if (!raw || raw.includes("\0")) throw invalidGitMetadata();
-  const target = raw.startsWith("/") ? raw : join(dirname(gitFilePath), raw);
-  let info;
-  try {
-    info = await lstat(target);
-  } catch {
-    return;
-  }
-  if (info.isSymbolicLink() || !info.isDirectory()) throw invalidGitMetadata();
-  await assertGitDirectoryMetadata(target);
+  if (text === null || !text.startsWith("gitdir: ")) return;
+  const resolved = await resolveExistingGitDirectory(gitPointerTarget(dirname(gitFilePath), text.slice("gitdir: ".length)));
+  if (resolved) await assertGitDirectoryMetadata(resolved);
 }
 
 // A pipe or symlink named .git would block or escape before git runs. A gitfile

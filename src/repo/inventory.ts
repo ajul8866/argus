@@ -151,7 +151,13 @@ export async function gitInfo(path: string): Promise<{ commit: string | null; br
     try {
       const result = await runCommand(gitArgv(args), {
         cwd: path,
-        env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          // A promisor remote can download the commit while its name is being
+          // read. Refuse that fetch here too, so a later archive cannot see
+          // an object this command just stored.
+          GIT_NO_LAZY_FETCH: "1",
+        },
         timeoutMs: 15_000,
       });
       if (result.timedOut || result.code !== 0) return null;

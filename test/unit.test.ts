@@ -802,6 +802,128 @@ describe("repository import", () => {
     }
   });
 
+  test("a git ref import does not fetch commits or blobs from a promisor remote", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "argus-outside-promisor-"));
+    const previousLazy = process.env.GIT_NO_LAZY_FETCH;
+    const git = (cwd: string, args: string[]): string => {
+      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          GIT_AUTHOR_NAME: "Tester",
+          GIT_AUTHOR_EMAIL: "tester@example.com",
+          GIT_COMMITTER_NAME: "Tester",
+          GIT_COMMITTER_EMAIL: "tester@example.com",
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_CONFIG_NOSYSTEM: "1",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+      return result.stdout.toString().trim();
+    };
+    const insert = (id: string, source: string): void => {
+      store.run(
+        `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+         VALUES (?, ?, '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+        id, id, source, JSON.stringify(["**/*.js"]),
+      );
+    };
+    const projectFor = (id: string) => {
+      const row = store.get<{ source_path: string; scope_include: string; scope_exclude: string }>(
+        "SELECT source_path, scope_include, scope_exclude FROM projects WHERE id = ?",
+        id,
+      )!;
+      return {
+        id,
+        source_path: row.source_path,
+        scope_include: row.scope_include,
+        scope_exclude: row.scope_exclude,
+      };
+    };
+    const objectMissing = (repo: string, oid: string): void => {
+      const result = Bun.spawnSync(["git", "-C", repo, "cat-file", "-e", oid], {
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          GIT_NO_LAZY_FETCH: "1",
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_CONFIG_NOSYSTEM: "1",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(result.exitCode).not.toBe(0);
+    };
+    try {
+      git(outside, ["init", "-q"]);
+      writeFileSync(join(outside, "secret.js"), "SECRET_OUTSIDE_SENTINEL\n");
+      git(outside, ["add", "secret.js"]);
+      git(outside, ["commit", "-qm", "secret"]);
+      const outsideSha = git(outside, ["rev-parse", "HEAD"]);
+      const outsideBlob = git(outside, ["rev-parse", "HEAD:secret.js"]);
+
+      const promisor = join(dir, "promisor-commit");
+      mkdirSync(promisor);
+      git(promisor, ["init", "-q"]);
+      writeFileSync(join(promisor, "a.js"), "LOCAL_ONLY\n");
+      git(promisor, ["add", "a.js"]);
+      git(promisor, ["commit", "-qm", "local"]);
+      git(promisor, ["config", "remote.origin.url", outside]);
+      git(promisor, ["config", "remote.origin.promisor", "true"]);
+      const head = readFileSync(join(promisor, ".git", "HEAD"), "utf8").trim();
+      expect(head.startsWith("ref: refs/heads/")).toBe(true);
+      writeFileSync(join(promisor, ".git", head.slice("ref: ".length)), `${outsideSha}\n`);
+      insert("p-promisor-commit", promisor);
+
+      const missing = join(dir, "promisor-blob");
+      mkdirSync(missing);
+      git(missing, ["init", "-q"]);
+      writeFileSync(join(missing, "a.js"), "LOCAL_ONLY\n");
+      writeFileSync(join(missing, "secret.js"), "SECRET_OUTSIDE_SENTINEL\n");
+      git(missing, ["add", "a.js", "secret.js"]);
+      git(missing, ["commit", "-qm", "both"]);
+      const blob = git(missing, ["rev-parse", "HEAD:secret.js"]);
+      expect(blob).toBe(outsideBlob);
+      git(missing, ["config", "extensions.partialClone", "origin"]);
+      git(missing, ["config", "remote.origin.url", outside]);
+      git(missing, ["config", "remote.origin.promisor", "true"]);
+      rmSync(join(missing, ".git", "objects", blob.slice(0, 2), blob.slice(2)));
+      insert("p-promisor-blob", missing);
+      objectMissing(missing, blob);
+
+      const complete = join(dir, "promisor-complete");
+      mkdirSync(complete);
+      git(complete, ["init", "-q"]);
+      writeFileSync(join(complete, "a.js"), "LOCAL_ONLY\n");
+      git(complete, ["add", "a.js"]);
+      git(complete, ["commit", "-qm", "local"]);
+      const localSha = git(complete, ["rev-parse", "HEAD"]);
+      git(complete, ["config", "extensions.partialClone", "origin"]);
+      git(complete, ["config", "remote.origin.url", outside]);
+      git(complete, ["config", "remote.origin.promisor", "true"]);
+      insert("p-promisor-complete", complete);
+
+      process.env.GIT_NO_LAZY_FETCH = "0";
+      await expect(importRepository({ config, store }, projectFor("p-promisor-commit"), "HEAD", "tester"))
+        .rejects.toMatchObject({ code: "bad_request", message: expect.stringContaining("Unknown git ref") });
+      objectMissing(promisor, outsideSha);
+      await expect(importRepository({ config, store }, projectFor("p-promisor-blob"), "HEAD", "tester"))
+        .rejects.toMatchObject({ code: "bad_request", message: expect.stringContaining("Failed to archive") });
+      objectMissing(missing, blob);
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+
+      const imported = await importRepository({ config, store }, projectFor("p-promisor-complete"), "HEAD", "tester");
+      expect(imported.commit_sha).toBe(localSha);
+      expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+      expect(existsSync(join(imported.path, "secret.js"))).toBe(false);
+      objectMissing(complete, outsideSha);
+    } finally {
+      if (previousLazy === undefined) delete process.env.GIT_NO_LAZY_FETCH;
+      else process.env.GIT_NO_LAZY_FETCH = previousLazy;
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   test("a git ref import rejects a common directory that points at another repository", async () => {
     const outside = mkdtempSync(join(tmpdir(), "argus-outside-common-"));
     const git = (cwd: string, args: string[]): string => {

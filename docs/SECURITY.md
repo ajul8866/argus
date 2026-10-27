@@ -45,9 +45,11 @@ LLM agents. Use it only on repositories you are authorized to assess.
   oversized files, and symlinks are not retained in the snapshot. The archive
   reads only a Git directory that belongs to the selected work tree. A `.git`
   symlink or gitfile, a Git common directory other than that Git directory, an
-  alternate object database, a symlink inside the object store, and `GIT_*`
-  environment variables are rejected or ignored, so a ref import cannot copy
-  commits stored outside that work tree. A pipe or symlink in the metadata Git
+  alternate object database, and a symlink inside the object store are rejected.
+  Inherited `GIT_*` environment variables are not passed through. Import sets
+  `GIT_NO_LAZY_FETCH`, so a promisor remote cannot fetch a missing commit or
+  blob from another repository or URL during `rev-parse` or `git archive`. A
+  ref import therefore cannot copy commits stored outside that work tree. A pipe or symlink in the metadata Git
   reads before that archive, including the common directory, packed refs, the
   current ref, exclude or attribute files, `config.worktree`, and
   sparse-checkout, is rejected before Git starts. A config `include` or

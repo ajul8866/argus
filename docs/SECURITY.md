@@ -159,6 +159,9 @@ absence of vulnerabilities. Human review is required.
 - Evidence appends are serialized per audit and hash-chained.
 - UPDATE/DELETE triggers protect evidence and verification rows.
 - Finding provenance fields are immutable.
+- A finding location stores the repository-relative path and its line numbers
+  as separate JSON fields. Duplicate detection and reverification use that
+  path, including when the file name contains `:`.
 - `GET /api/audits/:id/evidence` recomputes the chain and reports the first
   broken record. Reports include the integrity result.
 - `GET /api/evidence/:id`, retest prompts, and report excerpts re-read the sidecar

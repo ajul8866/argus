@@ -1392,6 +1392,97 @@ describe("repository import", () => {
     expect(await attempt("p-linked-worktree-ref", linkedWorktree, "HEAD")).toBe("invalid_repository");
   });
 
+  test("import does not wait on a loose ref pipe Git probes for that revision", async () => {
+    const gitEnv = {
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      GIT_AUTHOR_NAME: "Tester",
+      GIT_AUTHOR_EMAIL: "tester@example.com",
+      GIT_COMMITTER_NAME: "Tester",
+      GIT_COMMITTER_EMAIL: "tester@example.com",
+    };
+    const git = (cwd: string, args: string[]): void => {
+      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+        env: gitEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+    };
+    const fifo = (path: string): void => {
+      expect(Bun.spawnSync(["mkfifo", path]).exitCode).toBe(0);
+    };
+    const prepare = (name: string): string => {
+      const source = join(dir, name);
+      mkdirSync(source, { recursive: true });
+      git(source, ["init", "-q", "-b", "master"]);
+      writeFileSync(join(source, "a.js"), "LOCAL_ONLY\n");
+      git(source, ["add", "a.js"]);
+      git(source, ["commit", "-qm", "local"]);
+      return source;
+    };
+    const project = (id: string, source: string) => ({
+      id,
+      source_path: source,
+      scope_include: JSON.stringify(["**/*.js"]),
+      scope_exclude: "[]",
+    });
+    const insert = (id: string, source: string): void => {
+      store.run(
+        `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+         VALUES (?, ?, '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+        id, id, source, JSON.stringify(["**/*.js"]),
+      );
+    };
+    const attempt = async (id: string, source: string, ref: string): Promise<string> => {
+      return Promise.race([
+        importRepository({ config, store }, project(id, source), ref, "tester")
+          .then(() => "imported")
+          .catch((error: { code?: string }) => error.code ?? "error"),
+        Bun.sleep(800).then(() => "blocked"),
+      ]);
+    };
+
+    const tagged = prepare("ref-tags");
+    fifo(join(tagged, ".git", "refs", "tags", "master"));
+    insert("p-ref-tags", tagged);
+    expect(await attempt("p-ref-tags", tagged, "master")).toBe("invalid_repository");
+
+    const rootFile = prepare("ref-root");
+    fifo(join(rootFile, ".git", "master"));
+    insert("p-ref-root", rootFile);
+    expect(await attempt("p-ref-root", rootFile, "master")).toBe("invalid_repository");
+    expect(await attempt("p-ref-root-suffix", rootFile, "master~1")).toBe("invalid_repository");
+
+    const symref = prepare("ref-symref");
+    fifo(join(symref, ".git", "root.fifo"));
+    writeFileSync(join(symref, ".git", "refs", "heads", "alias"), "ref: root.fifo\n");
+    insert("p-ref-symref", symref);
+    expect(await attempt("p-ref-symref", symref, "alias")).toBe("invalid_repository");
+
+    const linkedRef = prepare("ref-symlink");
+    fifo(join(dir, "feature.fifo"));
+    symlinkSync(join(dir, "feature.fifo"), join(linkedRef, ".git", "refs", "heads", "feature"));
+    insert("p-ref-symlink", linkedRef);
+    expect(await attempt("p-ref-symlink", linkedRef, "feature")).toBe("invalid_repository");
+
+    const parent = prepare("ref-parent");
+    mkdirSync(join(parent, "child"));
+    writeFileSync(join(parent, "child", "a.js"), "LOCAL_CHILD\n");
+    git(parent, ["add", "child/a.js"]);
+    git(parent, ["commit", "-qm", "child"]);
+    fifo(join(parent, ".git", "refs", "tags", "HEAD"));
+    insert("p-ref-child", join(parent, "child"));
+    expect(await attempt("p-ref-child", join(parent, "child"), "HEAD")).toBe("invalid_repository");
+
+    const healthy = prepare("ref-healthy");
+    git(healthy, ["tag", "v1"]);
+    git(healthy, ["update-ref", "refs/remotes/origin/master", "HEAD"]);
+    git(healthy, ["update-ref", "refs/remotes/master/HEAD", "HEAD"]);
+    insert("p-ref-healthy", healthy);
+    const imported = await importRepository({ config, store }, project("p-ref-healthy", healthy), "master", "tester");
+    expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+  });
+
   test("workspaces are read-only by default and owner-writable only on explicit request", async () => {
     const scope = { include: ["**/*.js", "**/*.json", "README.md"], exclude: ["src/routes/media.js"] };
     const inventory = await buildInventory(fixture, { scope, maxFiles: 100, maxFileBytes: 1_000_000 });

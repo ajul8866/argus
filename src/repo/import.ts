@@ -124,8 +124,8 @@ function gitRefParts(refName: string): string[] {
 }
 
 // Follow a symref chain without opening a pipe or a symlink. Git opens the
-// same path while resolving HEAD, and a fifo there waits until another process
-// connects a writer.
+// same path while resolving HEAD and while resolving the requested revision,
+// and a fifo there waits until another process connects a writer.
 async function assertLooseRef(gitDir: string, refName: string, depth: number): Promise<void> {
   if (depth > 8) throw invalidGitMetadata();
   const parts = gitRefParts(refName);
@@ -152,6 +152,79 @@ async function assertLooseRef(gitDir: string, refName: string, depth: number): P
   const line = text?.split("\n", 1)[0] ?? "";
   if (!line.startsWith("ref:")) return;
   await assertLooseRef(gitDir, line.slice("ref:".length).trim(), depth + 1);
+}
+
+// "name~3" and "name^2" select an ancestor. Git opens the loose ref for the
+// prefix, not for the suffix. A "~" or "^" earlier in the name is part of the
+// ref. Braced peels are not accepted in a requested ref.
+function ancestorPrefix(name: string): string | null {
+  let index = name.length - 1;
+  while (index >= 0) {
+    const char = name[index] ?? "";
+    if (char < "0" || char > "9") break;
+    index -= 1;
+  }
+  if (index < 0) return null;
+  const mark = name[index];
+  if (mark !== "~" && mark !== "^") return null;
+  return name.slice(0, index);
+}
+
+function revisionRefName(ref: string): string {
+  let name = ref;
+  while (name.length > 0) {
+    const ancestor = ancestorPrefix(name);
+    if (ancestor === null) break;
+    name = ancestor;
+  }
+  return name;
+}
+
+// A directory is a dwim miss, not a pipe. A file or fifo in the middle of a
+// longer probe cannot be opened as a directory, so that one probe stops.
+// A symlink can be followed into a pipe, and the final file can be a symref
+// to a pipe outside refs/.
+async function assertProbedRef(gitDir: string, refName: string): Promise<void> {
+  if (!refName) return;
+  const parts = gitRefParts(refName);
+  let current = gitDir;
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (!part) throw invalidGitMetadata();
+    current = join(current, part);
+    let entry;
+    try {
+      entry = await lstat(current);
+    } catch {
+      return;
+    }
+    if (entry.isSymbolicLink()) throw invalidGitMetadata();
+    const last = index === parts.length - 1;
+    if (!last) {
+      if (!entry.isDirectory()) return;
+      continue;
+    }
+    if (entry.isDirectory()) return;
+    if (!entry.isFile()) throw invalidGitMetadata();
+  }
+  await assertLooseRef(gitDir, refName, 0);
+}
+
+// repo_dwim_ref tries these six shapes and, when ambiguous-ref warnings are
+// on, opens every one of them. A pipe at refs/tags/<name> blocks verification
+// of the branch <name> before Git reaches refs/heads/<name>.
+async function assertRequestedRevision(gitDir: string, ref: string): Promise<void> {
+  const name = revisionRefName(ref);
+  if (!name) return;
+  const probes = [
+    name,
+    `refs/${name}`,
+    `refs/tags/${name}`,
+    `refs/heads/${name}`,
+    `refs/remotes/${name}`,
+    `refs/remotes/${name}/HEAD`,
+  ];
+  for (const probe of probes) await assertProbedRef(gitDir, probe);
 }
 
 // Git opens include.path while parsing config, before a command-line -c
@@ -404,18 +477,19 @@ async function assertGitDirectoryMetadata(gitDir: string, seen = new Set<string>
 
 // A gitfile is "gitdir: <path>". The path is relative to the file's directory.
 // Git follows it and then opens metadata in that directory.
-async function assertGitFileTarget(gitFilePath: string): Promise<void> {
+async function assertGitFileTarget(gitFilePath: string): Promise<string | null> {
   const text = await readSmallGitText(gitFilePath, 4_096, { requireUtf8: true });
-  if (text === null || !text.startsWith("gitdir: ")) return;
+  if (text === null || !text.startsWith("gitdir: ")) return null;
   const resolved = await resolveExistingGitDirectory(gitPointerTarget(dirname(gitFilePath), text.slice("gitdir: ".length)));
   if (resolved) await assertGitDirectoryMetadata(resolved);
+  return resolved;
 }
 
 // A pipe or symlink named .git would block or escape before git runs. A gitfile
 // is a regular file; ref imports reject it separately so worktree snapshots can
 // still copy the selected files. The directory a gitfile names, including one
 // found by walking parents, is checked before Git starts.
-async function assertLocalGitReadable(sourceRoot: string): Promise<void> {
+async function assertLocalGitReadable(sourceRoot: string): Promise<string | null> {
   let current = sourceRoot;
   while (true) {
     const gitPath = join(current, ".git");
@@ -424,17 +498,16 @@ async function assertLocalGitReadable(sourceRoot: string): Promise<void> {
       info = await lstat(gitPath);
     } catch {
       const parent = dirname(current);
-      if (parent === current) return;
+      if (parent === current) return null;
       current = parent;
       continue;
     }
     if (info.isDirectory()) {
       await assertGitDirectoryMetadata(gitPath);
-      return;
+      return gitPath;
     }
     if (!info.isFile()) throw invalidGitMetadata();
-    await assertGitFileTarget(gitPath);
-    return;
+    return assertGitFileTarget(gitPath);
   }
 }
 
@@ -556,7 +629,8 @@ export async function importRepository(
   if (ref && !/^[A-Za-z0-9][A-Za-z0-9._/@^~:-]{0,199}$/.test(ref)) {
     throw badRequest("Invalid git ref");
   }
-  await assertLocalGitReadable(sourceRoot);
+  const gitDirectory = await assertLocalGitReadable(sourceRoot);
+  if (ref && gitDirectory) await assertRequestedRevision(gitDirectory, ref);
   const refArchive = ref ? await prepareRefArchive(sourceRoot) : null;
   const git = await gitInfo(sourceRoot);
   const scope = {

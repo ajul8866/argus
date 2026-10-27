@@ -2268,11 +2268,19 @@ export class AuditEngine {
     if (verifiedChecks.length === 0) {
       throw new Error("Cannot persist a finding without platform-verified code evidence on an affected file");
     }
-    const files = [...new Set(verifiedChecks.map((check) => `${check.path}:${check.line_start ?? 1}:${check.line_end ?? check.line_start ?? 1}`))]
-      .map((entry) => {
-        const [path, start, end] = entry.split(":");
-        return { path: path!, start_line: Number(start), end_line: Number(end) };
-      });
+    // Copy the verified path and line range. Encoding them as one colon-separated
+    // string and splitting it again drops the rest of a path such as
+    // "src/foo:bar.js", and the line numbers shift into the wrong fields.
+    const files: Array<{ path: string; start_line: number; end_line: number }> = [];
+    const seenLocations = new Set<string>();
+    for (const check of verifiedChecks) {
+      const startLine = check.line_start ?? 1;
+      const endLine = check.line_end ?? startLine;
+      const locationKey = JSON.stringify([check.path, startLine, endLine]);
+      if (seenLocations.has(locationKey)) continue;
+      seenLocations.add(locationKey);
+      files.push({ path: check.path, start_line: startLine, end_line: endLine });
+    }
     const existing = this.store.get<FindingRow>(
       `SELECT * FROM findings WHERE audit_id = ? AND (title = ? OR (category = ? AND files = ?)) LIMIT 1`,
       task.audit_id,

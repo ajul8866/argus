@@ -24,6 +24,16 @@ function pathInside(candidate: string, root: string): boolean {
   return candidate === root || candidate.startsWith(normalizedRoot);
 }
 
+// `git rev-parse --git-common-dir` prints an absolute path, or a path relative
+// to the source directory. A quoted or multi-line path is not used.
+function resolveReportedGitPath(sourceRoot: string, printed: string): string {
+  const trimmed = printed.trim();
+  if (!trimmed || trimmed.includes("\0") || trimmed.includes("\n") || trimmed.startsWith("\"")) {
+    throw invalidGitMetadata();
+  }
+  return trimmed.startsWith("/") ? trimmed : join(sourceRoot, trimmed);
+}
+
 function invalidGitMetadata(): AppError {
   return new AppError(400, "invalid_repository", GIT_METADATA_ERROR);
 }
@@ -128,6 +138,21 @@ async function prepareRefArchive(sourceRoot: string): Promise<{ toplevel: string
     throw invalidGitMetadata();
   }
   if (!pathInside(sourceRoot, pinnedTop) || !pathInside(pinnedGit, pinnedTop)) throw invalidGitMetadata();
+  // A commondir file leaves this git directory inside the work tree while
+  // archive reads objects from another repository. The common directory Git
+  // will use has to be the git directory checked above.
+  const commonResult = await runCommand(
+    ["git", "-C", sourceRoot, "rev-parse", "--git-common-dir"],
+    { env, timeoutMs: 20_000 },
+  );
+  if (commonResult.code !== 0 || commonResult.timedOut) throw invalidGitMetadata();
+  let pinnedCommon: string;
+  try {
+    pinnedCommon = await canonicalDirectory(resolveReportedGitPath(sourceRoot, commonResult.stdout));
+  } catch {
+    throw invalidGitMetadata();
+  }
+  if (pinnedCommon !== pinnedGit) throw invalidGitMetadata();
   await assertContainedObjectStore(pinnedGit);
   const relativePath = relative(pinnedTop, sourceRoot);
   if (!relativePath) return { toplevel: pinnedTop, subpath: null };

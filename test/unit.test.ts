@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import type { Config } from "../src/config.ts";
 import { loadConfig, PHASE_NAMES } from "../src/config.ts";
 import { KeyedSerialQueue } from "../src/concurrency.ts";
@@ -798,6 +798,89 @@ describe("repository import", () => {
     } finally {
       if (previous === undefined) delete process.env.GIT_DIR;
       else process.env.GIT_DIR = previous;
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a git ref import rejects a common directory that points at another repository", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "argus-outside-common-"));
+    const git = (cwd: string, args: string[]): string => {
+      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          GIT_AUTHOR_NAME: "Tester",
+          GIT_AUTHOR_EMAIL: "tester@example.com",
+          GIT_COMMITTER_NAME: "Tester",
+          GIT_COMMITTER_EMAIL: "tester@example.com",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+      return result.stdout.toString().trim();
+    };
+    const insert = (id: string, source: string): void => {
+      store.run(
+        `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+         VALUES (?, ?, '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+        id, id, source, JSON.stringify(["**/*.js"]),
+      );
+    };
+    const projectFor = (id: string) => {
+      const row = store.get<{ source_path: string; scope_include: string; scope_exclude: string }>(
+        "SELECT source_path, scope_include, scope_exclude FROM projects WHERE id = ?",
+        id,
+      )!;
+      return {
+        id,
+        source_path: row.source_path,
+        scope_include: row.scope_include,
+        scope_exclude: row.scope_exclude,
+      };
+    };
+    try {
+      mkdirSync(join(outside, "child"), { recursive: true });
+      writeFileSync(join(outside, "secret.js"), "SECRET_COMMONDIR_SENTINEL\n");
+      writeFileSync(join(outside, "child", "secret.js"), "SECRET_CHILD_COMMONDIR_SENTINEL\n");
+      git(outside, ["init", "-q"]);
+      git(outside, ["add", "secret.js", "child/secret.js"]);
+      git(outside, ["commit", "-qm", "secret"]);
+
+      const decoy = join(dir, "commondir-decoy");
+      mkdirSync(decoy);
+      git(decoy, ["init", "-q"]);
+      writeFileSync(join(decoy, "local.js"), "LOCAL_ONLY\n");
+      git(decoy, ["add", "local.js"]);
+      git(decoy, ["commit", "-qm", "local"]);
+      writeFileSync(join(decoy, ".git", "commondir"), `${join(outside, ".git")}\n`);
+      insert("p-commondir", decoy);
+
+      const relativeDecoy = join(dir, "commondir-relative");
+      mkdirSync(relativeDecoy);
+      git(relativeDecoy, ["init", "-q"]);
+      writeFileSync(join(relativeDecoy, "local.js"), "LOCAL_ONLY\n");
+      git(relativeDecoy, ["add", "local.js"]);
+      git(relativeDecoy, ["commit", "-qm", "local"]);
+      const relativeCommon = relative(join(relativeDecoy, ".git"), join(outside, ".git"));
+      writeFileSync(join(relativeDecoy, ".git", "commondir"), `${relativeCommon}\n`);
+      insert("p-commondir-relative", relativeDecoy);
+
+      const parent = join(dir, "commondir-parent");
+      const child = join(parent, "child");
+      mkdirSync(child, { recursive: true });
+      writeFileSync(join(child, "a.js"), "LOCAL_CHILD\n");
+      git(parent, ["init", "-q"]);
+      writeFileSync(join(parent, ".git", "commondir"), `${join(outside, ".git")}\n`);
+      insert("p-common-child", child);
+
+      for (const id of ["p-commondir", "p-commondir-relative", "p-common-child"]) {
+        await expect(importRepository({ config, store }, projectFor(id), "HEAD", "tester")).rejects.toMatchObject({
+          code: "invalid_repository",
+        });
+      }
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+      expect(existsSync(join(dir, "repos"))).toBe(false);
+    } finally {
       rmSync(outside, { recursive: true, force: true });
     }
   });

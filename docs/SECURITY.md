@@ -61,9 +61,11 @@ LLM agents. Use it only on repositories you are authorized to assess.
   ref from its common directory, including when its own git directory has a
   different file of that name. A later pseudoref or `refs/bisect`,
   `refs/worktree`, or `refs/rewritten` ref is still read from the worktree that
-  owns `HEAD`. A `main-worktree/` prefix is removed only when
+  owns `HEAD`.   A `main-worktree/` prefix is removed only when
   the remainder is a pseudoref or a `refs/bisect`, `refs/worktree`, or
   `refs/rewritten` ref, and that file is read from the common directory. The
+  same directory choice applies when a probed symref uses that prefix, and the
+  next private ref is still the copy next to the worktree `HEAD`. The
   target keeps Unicode spaces Git does not treat as whitespace. Whitespace
   after `ref:` includes newlines, and a break inside the target is not a ref.
   A symref that is not valid UTF-8 is rejected. The

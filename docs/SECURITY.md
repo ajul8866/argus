@@ -59,11 +59,14 @@ LLM agents. Use it only on repositories you are authorized to assess.
   every import, including one that does not request a revision. The abbreviation
   walks the symref chain from `HEAD`. A linked worktree reads each later shared
   ref from its common directory, including when its own git directory has a
-  different file of that name. A `main-worktree/` prefix is removed only when
+  different file of that name. Git reads `commondir` only from the git directory
+  the command started in, so a `commondir` file inside that common directory is
+  not a second link. A `main-worktree/` prefix is removed only when
   the remainder is a pseudoref or a `refs/bisect`, `refs/worktree`, or
   `refs/rewritten` ref, and that file is read from the common directory. The
-  target keeps Unicode spaces Git does not treat as whitespace, and a symref
-  that is not valid UTF-8 is rejected. The
+  target keeps Unicode spaces Git does not treat as whitespace. ASCII
+  whitespace after `ref:`, including a line break, is skipped the way Git skips
+  it. A symref that is not valid UTF-8 is rejected. The
   short names of that chain are probed before Git starts. A config `include` or
   `includeIf` is rejected wherever Git would start that section, including
   after another section on the same line. The directory named by a gitfile or

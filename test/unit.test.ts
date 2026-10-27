@@ -1788,6 +1788,51 @@ describe("repository import", () => {
       "tester",
     );
     expect(await Bun.file(join(mainWorktreeLinkedImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    // Git skips every isspace byte after "ref:", including a newline.
+    const newlineRef = prepare("branch-newline");
+    writeFileSync(join(newlineRef, ".git", "HEAD"), "ref:\n refs/heads/master\n");
+    fifo(join(newlineRef, ".git", "refs", "tags", "master"));
+    insert("p-branch-newline", newlineRef);
+    expect(await attempt("p-branch-newline", newlineRef, null)).toBe("invalid_repository");
+
+    const newlineCrlf = prepare("branch-newline-crlf");
+    writeFileSync(join(newlineCrlf, ".git", "HEAD"), "ref:\r\n refs/heads/master\r\n");
+    fifo(join(newlineCrlf, ".git", "refs", "tags", "master"));
+    insert("p-branch-newline-crlf", newlineCrlf);
+    expect(await attempt("p-branch-newline-crlf", newlineCrlf, null)).toBe("invalid_repository");
+
+    const newlineHealthy = prepare("branch-newline-healthy");
+    writeFileSync(join(newlineHealthy, ".git", "HEAD"), "ref:\n refs/heads/master\n");
+    insert("p-branch-newline-healthy", newlineHealthy);
+    const newlineImported = await importRepository({ config, store }, projectFor("p-branch-newline-healthy", newlineHealthy), null, "tester");
+    expect(await Bun.file(join(newlineImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    // A commondir file inside the common directory is not a link Git follows.
+    const nestedMain = prepare("branch-nested-commondir-main");
+    git(nestedMain, ["branch", "real"]);
+    git(nestedMain, ["symbolic-ref", "refs/heads/link", "refs/heads/real"]);
+    const nestedLinked = join(dir, "branch-nested-commondir");
+    git(nestedMain, ["worktree", "add", "-q", nestedLinked, "link"]);
+    writeFileSync(join(nestedMain, ".git", "commondir"), "objects\n");
+    fifo(join(nestedMain, ".git", "refs", "tags", "real"));
+    insert("p-branch-nested-commondir", nestedLinked);
+    expect(await attempt("p-branch-nested-commondir", nestedLinked, null)).toBe("invalid_repository");
+
+    const nestedHealthyMain = prepare("branch-nested-commondir-healthy-main");
+    git(nestedHealthyMain, ["branch", "real"]);
+    git(nestedHealthyMain, ["symbolic-ref", "refs/heads/link", "refs/heads/real"]);
+    const nestedHealthyLinked = join(dir, "branch-nested-commondir-healthy");
+    git(nestedHealthyMain, ["worktree", "add", "-q", nestedHealthyLinked, "link"]);
+    writeFileSync(join(nestedHealthyMain, ".git", "commondir"), "objects\n");
+    insert("p-branch-nested-commondir-healthy", nestedHealthyLinked);
+    const nestedImported = await importRepository(
+      { config, store },
+      projectFor("p-branch-nested-commondir-healthy", nestedHealthyLinked),
+      null,
+      "tester",
+    );
+    expect(await Bun.file(join(nestedImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
   });
 
   test("workspaces are read-only by default and owner-writable only on explicit request", async () => {

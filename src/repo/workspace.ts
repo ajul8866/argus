@@ -493,7 +493,8 @@ function retainGitDir(handle: OpenedFile, path: string): PinnedGitDir {
 // use that inode. Reject an object store that can name bytes outside the
 // allowed roots: a symlink under `objects`, a `commondir` file, or an alternate
 // object directory Git can resolve, including one reached through another
-// alternate or a symlink followed before `..`.
+// alternate, a symlink followed before `..`, or a process-local `/proc` or
+// `/dev/fd` path.
 export async function openAuthorizedGitDirectory(path: string, allowedRoots: string[]): Promise<PinnedGitDir> {
   const flags = noFollowFlags();
   let authorized: string;
@@ -755,6 +756,25 @@ async function alternateLines(objects: OpenedFile): Promise<Buffer[]> {
 // re-encode a byte path as UTF-8. Git's resolver follows the symlink first and
 // keeps the raw bytes, so those routines authorize a different directory from
 // the one `git archive` reads. Walk the bytes the way Git does.
+//
+// `/proc/self` and `/dev/fd` belong to whichever process calls `lstat`. This
+// check runs in the server, while `git --git-dir=/proc/self/fd/3` sees fd 3 as
+// the git directory and `/proc/self/exe` as the git binary. Authorizing the
+// server's resolution would accept a different directory from the one git reads.
+function isProcessLocalGitPath(candidate: Buffer): boolean {
+  for (const prefix of ["/proc", "/dev/fd"]) {
+    const marker = Buffer.from(prefix);
+    if (candidate.equals(marker)) return true;
+    if (
+      candidate.length > marker.length &&
+      candidate.subarray(0, marker.length).equals(marker) &&
+      candidate[marker.length] === 0x2f
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
 function splitGitComponents(path: Buffer): Buffer[] {
   const parts: Buffer[] = [];
   let start = 0;
@@ -792,6 +812,7 @@ function resolveGitPath(path: Buffer): Buffer {
       continue;
     }
     const candidate = gitPathBuffer([...resolved, part]);
+    if (isProcessLocalGitPath(candidate)) throw gitObjectsError();
     let info;
     try {
       info = lstatSync(candidate);

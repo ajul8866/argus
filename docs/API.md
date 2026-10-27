@@ -38,7 +38,7 @@ change the throttle bucket.
 | `GET` | `/api/projects/:id` | any | Project + snapshots + audits |
 | `PUT` | `/api/projects/:id` | auditor | Update metadata/scope/status |
 | `DELETE` | `/api/projects/:id` | admin | Delete only if no audits |
-| `POST` | `/api/projects/:id/import` | auditor | Import current worktree or `{ref}`. A ref archive does not follow a `.git` symlink or gitfile. It rejects a `commondir` file, a symlink in the object store, and an alternate object directory Git would resolve outside the allowed roots |
+| `POST` | `/api/projects/:id/import` | auditor | Import current worktree or `{ref}`. A ref archive does not follow a `.git` symlink or gitfile. It rejects a `commondir` file, a symlink in the object store, and an alternate object directory Git would resolve outside the allowed roots. Alternates that enter `/proc` or `/dev/fd` are rejected |
 | `GET` | `/api/repository-folders?path=&search=&offset=` | auditor | Browse existing host folders, with Git markers and pages of 100 |
 | `GET` | `/api/repositories` | any | All snapshots |
 | `GET` | `/api/repositories/:id` | any | Snapshot + inventory + architecture map |

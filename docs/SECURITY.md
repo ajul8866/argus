@@ -15,25 +15,132 @@ LLM agents. Use it only on repositories you are authorized to assess.
   locations, temporary directory, and mounted volumes. Administrators may
   restrict them by setting `ARGUS_ALLOWED_ROOTS`. Imported snapshots under
   `<dataDir>/repos` remain included in either mode.
-- The source path is canonicalized with `realpath` and checked against the
-  effective source locations on folder browsing and create/import, and again
-  when a workspace/evidence file is opened. Folder browsing requires the
+- Folder browsing, project creation, import, workspace copies, and evidence
+  reads pin the source path by walking each component without following a
+  symlink. The pinned path must sit under an allowed source location.
+  Configured locations are canonicalized when they are detected. The source
+  path is not passed through `realpath`, because that would follow a symlink
+  and authorize its target. A repository symlink is rejected even when that
+  target remains inside an allowed location. Folder browsing requires the
   auditor role, returns directory metadata only, and omits hidden folders,
   `node_modules`, and symlinks.
 - Scope globs are enforced before file copy, in inventory, in explorer/file
   APIs, and in excerpt verification. Prompt text is never the authorization
   boundary.
 - Only regular files are imported; symlinks are skipped. Files larger than the
-  cap are skipped and recorded. Inventory reads and snapshot copies open the
+  cap are skipped and recorded. Inventory reads and snapshot copies walk each
+  component of the repository path without following a symlink, then open the
   file without following a symlink and without waiting on a pipe. The opened
-  descriptor must still name that in-scope path. The read stops at the size
-  checked there, and a file whose bytes no longer match the inventory is not
-  copied.
+  descriptor must still be that in-scope path. Replacing the repository
+  directory, or an ancestor directory, with a symlink is rejected. The
+  filesystem-root directories `/tmp`, `/var`, and `/etc` are followed only when
+  they are symlinks to `private/<name>`, which is the macOS layout for those
+  directories. A symlink of any other name, or with any other target, is
+  rejected. The read stops at the size checked there, and a file whose bytes no
+  longer match the inventory is not copied.
 - An immutable snapshot is created at import, so later edits to the original
   worktree cannot change what the evidence refers to.
 - Git-ref imports resolve the ref once, archive that immutable commit, and copy
   only in-scope regular files into a read-only snapshot. Excluded files,
-  oversized files, and symlinks are not retained in the snapshot.
+  oversized files, and symlinks are not retained in the snapshot. The archive
+  reads only a Git directory that belongs to the selected work tree. A `.git`
+  symlink or gitfile, a Git common directory other than that Git directory, an
+  alternate object database, a symlink inside the object store, and `GIT_*`
+  environment variables are rejected or ignored, so a ref import cannot copy
+  commits stored outside that work tree. The archive uses a separate Git
+  repository that can read that object store but not the source repository's
+  config, and it unsets the `filter` attribute, so a smudge or process filter
+  cannot read or rewrite the snapshot. A subdirectory of a repository
+  commits stored outside that work tree. The archive is produced from that
+  object store through a new Git directory. That directory uses the pinned
+  repository's object format, including SHA-256, and replaces repository,
+  system, and global Git configuration, so a smudge or process filter cannot
+  run during import. Settings such as `core.autocrlf` are not applied. System
+  and global attribute files are not read. Committed `export-subst` attributes
+  are disabled, so a signature placeholder cannot run `gpg`. Committed
+  attributes can still request line-ending conversion. A subdirectory of a
+  repository archives only that subdirectory.
+  alternate object database, and a symlink inside the object store are rejected.
+  Inherited `GIT_*` environment variables are not passed through. Import sets
+  `GIT_NO_LAZY_FETCH`, so a promisor remote cannot fetch a missing commit or
+  blob from another repository or URL during `rev-parse` or `git archive`. A
+  ref import therefore cannot copy commits stored outside that work tree. A pipe or symlink in the metadata Git
+  reads before that archive, including the common directory, packed refs, the
+  loose refs probed for HEAD, the current branch, and the requested revision,
+  exclude or attribute files,
+  `config.worktree`, and sparse-checkout, is rejected before Git starts. Those
+  probes are the git directory file of that name, that name under `refs`,
+  `refs/tags`, `refs/heads`, and `refs/remotes`, and
+  `refs/remotes/<name>/HEAD`. Those probes run for a worktree import as well as
+  a ref import, and again in a linked common directory. A symref target of one
+  of those files is checked
+  loose refs probed for `HEAD`, for the current branch, and for the requested
+  revision, exclude or attribute files,
+  `config.worktree`, and sparse-checkout, is rejected before Git starts. Those
+  probes are the git directory file of that name, that name under `refs`,
+  `refs/tags`, `refs/heads`, and `refs/remotes`, and
+  `refs/remotes/<name>/HEAD`. A symref target of one of those files is checked
+  the same way. `rev-parse HEAD` and `rev-parse --abbrev-ref HEAD` run for
+  every import, including one that does not request a revision. The abbreviation
+  walks the symref chain from `HEAD`. A linked worktree reads each later shared
+  ref from its common directory, including when its own git directory has a
+  different file of that name. A `main-worktree/` prefix is removed only when
+  the remainder is a pseudoref or a `refs/bisect`, `refs/worktree`, or
+  `refs/rewritten` ref, and that file is read from the common directory. The
+  target keeps Unicode spaces Git does not treat as whitespace, and a symref
+  that is not valid UTF-8 is rejected. The
+  short names of that chain are probed before Git starts. A config `include` or
+  the same way. `rev-parse --abbrev-ref HEAD` follows the HEAD symref chain and
+  probes each abbreviation of the final ref, including the longer name used when
+  a shorter one is ambiguous. Those probes run for every import, including one
+  that does not request a revision, and a linked worktree probes them in its
+  common directory too. A private ref in that chain, such as `refs/bisect/`, is read
+  from the worktree git directory rather than the common directory. The same private
+  name prefixed with `main-worktree/` is the main worktree's copy and is read from
+  the common directory under the bare name. A config `include` or
+  `refs/remotes/<name>/HEAD`. That name is the revision Git opens for
+  `rev-parse --verify <ref>^{commit}`: a trailing `~` or `^` ancestor suffix
+  is removed, a `:` path keeps the revision before the colon, and each side
+  of `..` or `...` is checked. A symref target of one of those files is checked
+  the same way. A config `include` or
+  current ref, any other loose ref, worktree metadata, a pseudoref such as
+  `FETCH_HEAD`, exclude or attribute files, `config.worktree`, and
+  sparse-checkout, is rejected before Git starts. These commands pass
+  `--no-replace-objects`, so a replacement ref cannot change the archived
+  bytes or the commit id that is recorded. A config `include` or
+  `includeIf` is rejected wherever Git would start that section, including
+  after another section on the same line. The directory named by a gitfile or
+  `commondir` is the path Git opens: trailing CR and LF are removed, spaces
+  and embedded newlines stay, and `..` is applied after each symlink is
+  followed. The runtime `realpath` is not used there, because it cancels `..`
+  against the symlink name and would check a different directory. A pointer
+  whose bytes are not valid UTF-8 is rejected, because Git would use those
+  bytes as the path. That directory is checked the same way. `core.excludesFile` and `core.attributesFile` are
+  forced to `/dev/null` for these Git commands. A `.git` symlink discovered
+  while walking parent directories is rejected. A subdirectory of a repository
+  archives only that subdirectory.
+  reads a git directory opened without following a symlink, and that directory
+  must stay inside an allowed source location. A `.git` symlink or `gitdir:`
+  file is not followed. A symlink anywhere under the object store is rejected,
+  including a pack or loose-object directory. An alternate object directory is
+  resolved the way Git resolves it, following a symlink before `..` and keeping
+  the raw path bytes. That directory, its symlinks, and its nested alternates
+  must stay inside an allowed location. A path that enters `/proc` or `/dev/fd`
+  is rejected: those locations describe the checking process, not the git
+  process that reads the object store. A `commondir` file is rejected, as is an
+  alternate path that contains quotes or backslashes. When the source is a
+  subdirectory of a repository, the archive contains only that subdirectory.
+  file is not followed. The git common directory must resolve to that same git
+  directory, following a symlink before `..`. A symlinked object store or a
+  symlink inside an object store is rejected, including a directory entry that
+  is not valid UTF-8. Each multi-pack-index pack name must be one file name in
+  that object store, with no path separator. An alternate object directory is
+  resolved the way Git resolves it, including a raw byte in a symlink name, and
+  that directory, its symlinks, and its nested alternates must stay inside an
+  allowed location. A path that enters `/proc` or `/dev/fd` is rejected: those
+  locations describe the checking process, not the git process that reads the
+  object store. When the source is a subdirectory of a repository, the
+  archive contains only that subdirectory.
 
 ## Execution isolation
 
@@ -117,8 +224,9 @@ local MCP executable available.
 - A discovery session cannot validate its own candidate; a retest session cannot
   be either prior session. This is checked in code, not just prompts.
 - `CONFIRMED`/`REVERIFIED` requires at least one exact excerpt on an affected
-  file, verified against the snapshot. That read rejects a symlink or pipe and
-  stops at the size checked on the opened file. LLM agreement alone is insufficient.
+  file, verified against the snapshot. That read rejects a symlink, a pipe, or
+  a repository path whose directory or ancestor was replaced by a symlink, and
+  it stops at the size checked on the opened file. LLM agreement alone is insufficient.
 
 Residual prompt-injection risk remains: a model could be manipulated into
 reporting a false positive or missing an issue. The platform gates reduce the

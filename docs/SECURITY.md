@@ -161,10 +161,13 @@ absence of vulnerabilities. Human review is required.
 - Finding provenance fields are immutable.
 - `GET /api/audits/:id/evidence` recomputes the chain and reports the first
   broken record. Reports include the integrity result.
-- `GET /api/evidence/:id` and retest prompts re-read the sidecar only when it
-  is a regular file whose metadata, size, and content hash match the database
-  record. A mismatch fails closed instead of returning or quoting the file.
-  Report downloads recompute the stored SHA-256 the same way.
+- `GET /api/evidence/:id`, retest prompts, and report excerpts re-read the sidecar
+  only when it is a regular file whose metadata, byte length, and content hash
+  match the database record. A mismatch fails closed instead of returning or
+  quoting the file. The open does not follow a symlink and does not wait when
+  the path is a pipe. The sidecar is JSON, so the file may be larger than the
+  recorded content; the reader allows for that escaping and rejects anything
+  larger. Report downloads recompute the stored SHA-256 of the report file.
 - Database-level protection assumes the attacker does not have write access to
   the SQLite file itself. Full-disk tampering is detectable by the chain only if
   the attacker does not rewrite both content and chain metadata; the chain is

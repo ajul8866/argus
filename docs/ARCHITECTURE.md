@@ -146,8 +146,10 @@ chain_hash = SHA-256(prev_hash + ":" + sha256 + ":" + kind + ":" + title)
 ```
 
 The content file is written mode 0600; DB rows are append-only via triggers.
-Content reads for the evidence API and retest prompts verify that sidecar
-against the database record and fail closed when it does not match.
+Content reads for the evidence API, retest prompts, and report excerpts verify
+that sidecar against the database record and fail closed when it does not match.
+Replacing the sidecar with a symlink or a pipe fails closed. The read does not
+follow the symlink or wait for a pipe writer.
 Verification rows are also append-only. Finding provenance columns are
 immutable; retest session can be set once, never changed.
 

@@ -51,8 +51,48 @@ LLM agents. Use it only on repositories you are authorized to assess.
   blob from another repository or URL during `rev-parse` or `git archive`. A
   ref import therefore cannot copy commits stored outside that work tree. A pipe or symlink in the metadata Git
   reads before that archive, including the common directory, packed refs, the
-  current ref, exclude or attribute files, `config.worktree`, and
-  sparse-checkout, is rejected before Git starts. A config `include` or
+  loose refs probed for HEAD, the current branch, and the requested revision,
+  exclude or attribute files,
+  `config.worktree`, and sparse-checkout, is rejected before Git starts. Those
+  probes are the git directory file of that name, that name under `refs`,
+  `refs/tags`, `refs/heads`, and `refs/remotes`, and
+  `refs/remotes/<name>/HEAD`. Those probes run for a worktree import as well as
+  a ref import, and again in a linked common directory. A symref target of one
+  of those files is checked
+  loose refs probed for `HEAD`, for the current branch, and for the requested
+  revision, exclude or attribute files,
+  `config.worktree`, and sparse-checkout, is rejected before Git starts. Those
+  probes are the git directory file of that name, that name under `refs`,
+  `refs/tags`, `refs/heads`, and `refs/remotes`, and
+  `refs/remotes/<name>/HEAD`. A symref target of one of those files is checked
+  the same way. `rev-parse HEAD` and `rev-parse --abbrev-ref HEAD` run for
+  every import, including one that does not request a revision. The abbreviation
+  walks the symref chain from `HEAD`. A linked worktree reads each later shared
+  ref from its common directory, including when its own git directory has a
+  different file of that name. A `main-worktree/` prefix is removed only when
+  the remainder is a pseudoref or a `refs/bisect`, `refs/worktree`, or
+  `refs/rewritten` ref, and that file is read from the common directory. The
+  target keeps Unicode spaces Git does not treat as whitespace, and a symref
+  that is not valid UTF-8 is rejected. The
+  short names of that chain are probed before Git starts. A config `include` or
+  the same way. `rev-parse --abbrev-ref HEAD` follows the HEAD symref chain and
+  probes each abbreviation of the final ref, including the longer name used when
+  a shorter one is ambiguous. Those probes run for every import, including one
+  that does not request a revision, and a linked worktree probes them in its
+  common directory too. A private ref in that chain, such as `refs/bisect/`, is read
+  from the worktree git directory rather than the common directory. The same private
+  name prefixed with `main-worktree/` is the main worktree's copy and is read from
+  the common directory under the bare name. A config `include` or
+  `refs/remotes/<name>/HEAD`. That name is the revision Git opens for
+  `rev-parse --verify <ref>^{commit}`: a trailing `~` or `^` ancestor suffix
+  is removed, a `:` path keeps the revision before the colon, and each side
+  of `..` or `...` is checked. A symref target of one of those files is checked
+  the same way. A config `include` or
+  current ref, any other loose ref, worktree metadata, a pseudoref such as
+  `FETCH_HEAD`, exclude or attribute files, `config.worktree`, and
+  sparse-checkout, is rejected before Git starts. These commands pass
+  `--no-replace-objects`, so a replacement ref cannot change the archived
+  bytes or the commit id that is recorded. A config `include` or
   `includeIf` is rejected wherever Git would start that section, including
   after another section on the same line. The directory named by a gitfile or
   `commondir` is the path Git opens: trailing CR and LF are removed, spaces

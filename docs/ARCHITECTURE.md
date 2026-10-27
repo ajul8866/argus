@@ -227,6 +227,19 @@ operation, preserving include/exclude short-circuit behavior.
    remote cannot fetch missing commits or blobs from another repository or URL. A pipe or symlink in metadata Git would read for that
    archive, including `config.worktree`, sparse-checkout, and a config include
    wherever Git would start that section, is rejected before Git starts. The
+   or a symlink in the object store is rejected, and `GIT_*` variables are not
+   passed through. A pipe or symlink in metadata Git would read for that
+   archive, including `config.worktree`, sparse-checkout, a config include
+   wherever Git would start that section, and a pipe or symlink on a path Git
+   probes for HEAD, the current branch, and the requested revision, is rejected before Git starts. The
+   probes for `HEAD`, each branch named by the HEAD symref chain, and the requested revision, is rejected before Git starts. A linked worktree resolves later shared refs on that chain in its common directory, not in a same-named file under its own git directory. A `main-worktree/` prefix is followed only for a pseudoref or per-worktree ref, from that common directory. The
+   probes for the requested revision, is rejected before Git starts. A trailing
+   `~` or `^` suffix, the revision before `:`, and each side of `..` or `...`
+   select those paths. The
+   archive, including a loose ref other than `HEAD`, worktree metadata, a
+   pseudoref, `config.worktree`, sparse-checkout, and a config include
+   wherever Git would start that section, is rejected before Git starts.
+   Replacement refs are not applied. The
   directory named by a gitfile or `commondir` is the path Git opens, with
   trailing breaks removed and `..` applied after each symlink is followed.
   The runtime `realpath` is not used for that walk. A pointer that is not

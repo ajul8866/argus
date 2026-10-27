@@ -1,13 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { open, stat } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
-import { join, relative } from "node:path";
-import { closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { open, stat } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
-import { closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
@@ -2988,14 +2980,6 @@ describe("repository import", () => {
     }, "HEAD", "tester")).rejects.toMatchObject({ code: "invalid_repository", message: GIT_DIRECTORY_ERROR });
   });
 
-  function pointBranch(repo: string, sha: string): void {
-    const head = readFileSync(join(repo, ".git/HEAD"), "utf8").trim();
-    if (!head.startsWith("ref: ")) throw new Error(`unexpected HEAD ${head}`);
-    const ref = head.slice("ref: ".length);
-    if (!ref || ref.startsWith("/") || ref.split("/").includes("..")) throw new Error(`unexpected ref ${ref}`);
-    writeFileSync(join(repo, ".git", ref), `${sha}\n`);
-  }
-
   test("a git ref import rejects a symlinked pack, a commondir, and an alternate that escapes", async () => {
     const outside = mkdtempSync(join(tmpdir(), "argus-git-escape-"));
     try {
@@ -3024,7 +3008,7 @@ describe("repository import", () => {
       initRepo(commonRepo, { "a.js": "INSIDE_CONTENT" });
       pointBranch(commonRepo, outsideSha);
       writeFileSync(join(commonRepo, ".git/commondir"), `${realpathSync(join(outside, ".git"))}\n`);
-      await expect(importRef(commonRepo)).rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+      await expect(importRef(commonRepo)).rejects.toMatchObject({ code: "invalid_repository", message: GIT_COMMON_DIR_ERROR });
 
       const chainRepo = join(dir, "chain-repo");
       initRepo(chainRepo, { "a.js": "INSIDE_CONTENT" });

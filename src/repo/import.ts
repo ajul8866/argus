@@ -27,15 +27,21 @@ function pinnedGitDirFlag(): string {
 }
 
 // Git reads this descriptor, not the path. Replacing `.git` with a symlink
-// after the open does not change the inode git archives.
+// after the open does not change the inode git archives. GIT_COMMON_DIR is the
+// same descriptor, so a commondir file written after the metadata check cannot
+// redirect object reads.
 export async function runPinnedGit(
   git: PinnedGitDir,
   args: string[],
   timeoutMs: number,
 ): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> {
-  return runCommand(["git", pinnedGitDirFlag(), ...args], {
+  const flag = pinnedGitDirFlag();
+  return runCommand(["git", flag, ...args], {
     timeoutMs,
-    env: gitEnv(),
+    env: {
+      ...gitEnv(),
+      GIT_COMMON_DIR: flag.slice("--git-dir=".length),
+    },
     extraFd: git.fd,
   });
 }

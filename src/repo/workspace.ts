@@ -1,5 +1,5 @@
 import { constants, fstatSync } from "node:fs";
-import { chmod, lstat, mkdir, open, readlink, realpath, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readdir, readlink, realpath, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { AppError, createScopeMatcher, matchesScope, normalizePath, safeJoin, sha256 } from "../util.ts";
 import type { Scope } from "../util.ts";
@@ -449,6 +449,7 @@ export async function assertAuthorizedRoot(path: string, allowedRoots: string[])
 export const GIT_METADATA_ERROR = "Repository git metadata must be a real .git directory";
 export const GIT_DIRECTORY_ERROR = "Repository git directory must stay inside an allowed source location";
 export const GIT_OBJECTS_ERROR = "Repository git objects must stay inside an allowed source location";
+export const GIT_COMMON_DIR_ERROR = "Repository git common directory must be the selected git directory";
 
 export type PinnedGitDir = {
   fd: number;
@@ -490,9 +491,8 @@ function retainGitDir(handle: OpenedFile, path: string): PinnedGitDir {
 }
 
 // `git --git-dir` follows a symlink. Hold the directory descriptor and make git
-// use that inode. Also reject an object store that points outside the allowed
-// roots: `objects` itself can be a symlink, and `objects/info/alternates` can
-// name another repository's objects.
+// use that inode. `commondir`, an alternate object directory, or a symlink in
+// the object store can still make `git archive` read another repository.
 export async function openAuthorizedGitDirectory(path: string, allowedRoots: string[]): Promise<PinnedGitDir> {
   const flags = noFollowFlags();
   let authorized: string;
@@ -521,7 +521,7 @@ export async function openAuthorizedGitDirectory(path: string, allowedRoots: str
     const pinned = retainGitDir(handle, authorized);
     handedOff = true;
     try {
-      await assertAuthorizedGitAlternates(pinned, allowedRoots);
+      await assertPinnedGitMetadata(pinned, allowedRoots);
     } catch (error) {
       await pinned.close().catch(() => undefined);
       throw error;
@@ -568,7 +568,7 @@ export async function openWorktreeGit(
     const pinned = retainGitDir(handle, opened);
     handedOff = true;
     try {
-      await assertAuthorizedGitAlternates(pinned, allowedRoots);
+      await assertPinnedGitMetadata(pinned, allowedRoots);
     } catch (error) {
       await pinned.close().catch(() => undefined);
       throw error;
@@ -580,21 +580,26 @@ export async function openWorktreeGit(
   }
 }
 
-async function openAt(rootFd: number, parts: string[], flags: number): Promise<OpenedFile | null> {
+async function openAt(
+  rootFd: number,
+  parts: string[],
+  flags: number,
+  errorMessage = GIT_OBJECTS_ERROR,
+): Promise<OpenedFile | null> {
   const directoryFlags = noFollowFlags().directory;
   const prefix = await descriptorPrefix(rootFd);
   let current: OpenedFile | undefined = await open(`${prefix}/${rootFd}`, constants.O_RDONLY | constants.O_DIRECTORY);
   try {
     for (let index = 0; index < parts.length; index += 1) {
       const name = parts[index];
-      if (!name) throw new AppError(400, "invalid_repository", GIT_OBJECTS_ERROR);
+      if (!name) throw new AppError(400, "invalid_repository", errorMessage);
       let next: OpenedFile;
       try {
         next = await openChild(prefix, current, name, index === parts.length - 1 ? flags : directoryFlags);
       } catch (error) {
         const code = systemErrorCode(error);
         if (code === "ENOENT") return null;
-        if (code === "ELOOP" || code === "ENOTDIR") throw new AppError(400, "invalid_repository", GIT_OBJECTS_ERROR);
+        if (code === "ELOOP" || code === "ENOTDIR") throw new AppError(400, "invalid_repository", errorMessage);
         throw error;
       }
       await current.close();
@@ -646,4 +651,118 @@ export async function assertAuthorizedGitAlternates(git: PinnedGitDir, allowedRo
   } finally {
     await handle.close().catch(() => undefined);
   }
+}
+
+// A symlink or pipe under objects/ is invisible to the alternates file check.
+// `git archive` follows the symlink and blocks on a pipe, so the pinned
+// directory is walked without following either.
+async function assertPlainGitObjectStore(git: PinnedGitDir): Promise<void> {
+  const flags = noFollowFlags();
+  let root: OpenedFile | null;
+  try {
+    root = await openAt(git.fd, ["objects"], flags.directory);
+  } catch (error) {
+    if (error instanceof AppError && error.code === "out_of_scope") {
+      throw new AppError(400, "invalid_repository", GIT_OBJECTS_ERROR);
+    }
+    throw error;
+  }
+  if (!root) return;
+  let prefix: string;
+  try {
+    prefix = await descriptorPrefix(root.fd);
+  } catch (error) {
+    await root.close().catch(() => undefined);
+    throw error;
+  }
+  const pending: Array<{ handle: OpenedFile; depth: number }> = [{ handle: root, depth: 0 }];
+  try {
+    while (pending.length > 0) {
+      const current = pending.pop();
+      if (!current) break;
+      try {
+        if (current.depth > 8) throw new AppError(400, "invalid_repository", GIT_OBJECTS_ERROR);
+        const names = await readdir(`${prefix}/${current.handle.fd}`);
+        for (const name of names) {
+          if (name === "." || name === "..") continue;
+          let info: Awaited<ReturnType<typeof lstat>>;
+          try {
+            info = await lstat(`${prefix}/${current.handle.fd}/${name}`);
+          } catch {
+            throw new AppError(400, "invalid_repository", GIT_OBJECTS_ERROR);
+          }
+          if (info.isSymbolicLink() || (!info.isDirectory() && !info.isFile())) {
+            throw new AppError(400, "invalid_repository", GIT_OBJECTS_ERROR);
+          }
+          if (!info.isDirectory()) continue;
+          let child: OpenedFile;
+          try {
+            child = await openChild(prefix, current.handle, name, flags.directory);
+          } catch (error) {
+            const code = systemErrorCode(error);
+            if (code === "ELOOP" || code === "ENOTDIR") {
+              throw new AppError(400, "invalid_repository", GIT_OBJECTS_ERROR);
+            }
+            throw error;
+          }
+          pending.push({ handle: child, depth: current.depth + 1 });
+        }
+      } finally {
+        await current.handle.close().catch(() => undefined);
+      }
+    }
+  } catch (error) {
+    await Promise.all(pending.map((item) => item.handle.close().catch(() => undefined)));
+    throw error;
+  }
+}
+
+function commonDirectoryText(bytes: Buffer): string {
+  let text = bytes.toString("latin1");
+  if (text.includes("\0")) throw new AppError(400, "invalid_repository", GIT_COMMON_DIR_ERROR);
+  if (text.endsWith("\n")) {
+    text = text.slice(0, -1);
+    if (text.endsWith("\r")) text = text.slice(0, -1);
+  }
+  if (!text || text.includes("\n") || text.includes("\r")) {
+    throw new AppError(400, "invalid_repository", GIT_COMMON_DIR_ERROR);
+  }
+  return text;
+}
+
+// A commondir file keeps this git directory inside the work tree while archive
+// reads objects from the named directory. Missing means this directory is its
+// own common directory. A path git would accept for this same directory, such
+// as "." or its absolute path, stays allowed.
+async function assertGitCommonDirectory(git: PinnedGitDir): Promise<void> {
+  const handle = await openAt(git.fd, ["commondir"], noFollowFlags().file, GIT_COMMON_DIR_ERROR);
+  if (!handle) return;
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || !Number.isSafeInteger(info.size) || info.size <= 0 || info.size > 4_096) {
+      throw new AppError(400, "invalid_repository", GIT_COMMON_DIR_ERROR);
+    }
+    const buffer = Buffer.alloc(info.size);
+    let offset = 0;
+    while (offset < info.size) {
+      const { bytesRead } = await handle.read(buffer, offset, info.size - offset, offset);
+      if (bytesRead === 0) throw new AppError(400, "invalid_repository", GIT_COMMON_DIR_ERROR);
+      offset += bytesRead;
+    }
+    let pinned: string;
+    try {
+      pinned = await canonicalDirectory(resolve(git.path, commonDirectoryText(buffer)));
+    } catch {
+      throw new AppError(400, "invalid_repository", GIT_COMMON_DIR_ERROR);
+    }
+    if (pinned !== git.path) throw new AppError(400, "invalid_repository", GIT_COMMON_DIR_ERROR);
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+async function assertPinnedGitMetadata(git: PinnedGitDir, allowedRoots: string[]): Promise<void> {
+  await assertAuthorizedGitAlternates(git, allowedRoots);
+  await assertPlainGitObjectStore(git);
+  await assertGitCommonDirectory(git);
 }

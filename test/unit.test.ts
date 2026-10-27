@@ -1568,10 +1568,51 @@ describe("repository import", () => {
     insert("p-branch-worktree", linked);
     expect(await attempt("p-branch-worktree", linked, null)).toBe("invalid_repository");
 
+    // abbrev-ref shortens the resolved ref, not the first symref in the chain.
+    const chained = prepare("branch-chain");
+    git(chained, ["symbolic-ref", "refs/heads/link", "refs/heads/master"]);
+    git(chained, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    fifo(join(chained, ".git", "refs", "tags", "master"));
+    insert("p-branch-chain", chained);
+    expect(await attempt("p-branch-chain", chained, null)).toBe("invalid_repository");
+
+    const chainedAmbiguous = prepare("branch-chain-ambiguous");
+    git(chainedAmbiguous, ["symbolic-ref", "refs/heads/link", "refs/heads/master"]);
+    git(chainedAmbiguous, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    git(chainedAmbiguous, ["tag", "master"]);
+    fifo(join(chainedAmbiguous, ".git", "heads", "master"));
+    insert("p-branch-chain-ambiguous", chainedAmbiguous);
+    expect(await attempt("p-branch-chain-ambiguous", chainedAmbiguous, null)).toBe("invalid_repository");
+
+    const chainMain = prepare("branch-chain-worktree-main");
+    git(chainMain, ["branch", "real"]);
+    git(chainMain, ["symbolic-ref", "refs/heads/link", "refs/heads/real"]);
+    const chainLinked = join(dir, "branch-chain-worktree");
+    git(chainMain, ["worktree", "add", "-q", chainLinked, "link"]);
+    fifo(join(chainMain, ".git", "refs", "tags", "real"));
+    insert("p-branch-chain-worktree", chainLinked);
+    expect(await attempt("p-branch-chain-worktree", chainLinked, null)).toBe("invalid_repository");
+
     const healthy = prepare("branch-healthy");
     insert("p-branch-healthy", healthy);
     const imported = await importRepository({ config, store }, projectFor("p-branch-healthy", healthy), null, "tester");
     expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const healthyChain = prepare("branch-chain-healthy");
+    git(healthyChain, ["symbolic-ref", "refs/heads/link", "refs/heads/master"]);
+    git(healthyChain, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    insert("p-branch-chain-healthy", healthyChain);
+    const chainImported = await importRepository({ config, store }, projectFor("p-branch-chain-healthy", healthyChain), null, "tester");
+    expect(await Bun.file(join(chainImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const healthyWork = prepare("branch-chain-worktree-healthy-main");
+    git(healthyWork, ["branch", "real"]);
+    git(healthyWork, ["symbolic-ref", "refs/heads/link", "refs/heads/real"]);
+    const healthyLinked = join(dir, "branch-chain-worktree-healthy");
+    git(healthyWork, ["worktree", "add", "-q", healthyLinked, "link"]);
+    insert("p-branch-chain-worktree-healthy", healthyLinked);
+    const workImported = await importRepository({ config, store }, projectFor("p-branch-chain-worktree-healthy", healthyLinked), null, "tester");
+    expect(await Bun.file(join(workImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
   });
 
   test("workspaces are read-only by default and owner-writable only on explicit request", async () => {

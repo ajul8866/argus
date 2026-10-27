@@ -254,15 +254,81 @@ function gitShortRefNames(fullRef: string): string[] {
   return names;
 }
 
+// Git reads at most five files while resolving one symref chain. The fifth
+// file is the resolved name when it is not another symref.
+const SYMREF_READ_LIMIT = 5;
+
+type SymrefFollow = { name: string; depth: number };
+
+// Read one loose ref without following a symref. Missing files are resolved
+// from a linked worktree's common directory. A pipe or symlink is rejected.
+async function readLooseRefLine(gitDir: string, refName: string): Promise<string | null> {
+  const parts = gitRefParts(refName);
+  let current = gitDir;
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (!part) throw invalidGitMetadata();
+    current = join(current, part);
+    let entry;
+    try {
+      entry = await lstat(current);
+    } catch {
+      return null;
+    }
+    if (entry.isSymbolicLink()) throw invalidGitMetadata();
+    const last = index === parts.length - 1;
+    if (!last) {
+      if (!entry.isDirectory()) throw invalidGitMetadata();
+      continue;
+    }
+    if (!entry.isFile()) throw invalidGitMetadata();
+  }
+  const text = await readSmallGitText(current);
+  return text?.split("\n", 1)[0] ?? "";
+}
+
+// `--abbrev-ref HEAD` shortens the ref the symref chain resolves to and opens
+// that name's loose-ref candidates. Walk every link so the resolved name is
+// probed, including when a later link is only in the common directory.
+async function addSymrefAbbreviations(
+  gitDir: string,
+  names: Set<string>,
+  follow: readonly SymrefFollow[],
+): Promise<SymrefFollow[]> {
+  const carry: SymrefFollow[] = [];
+  const pending = [...follow];
+  const visited = new Set<string>();
+  while (pending.length > 0) {
+    const item = pending.pop();
+    if (!item || visited.has(item.name)) continue;
+    visited.add(item.name);
+    const line = await readLooseRefLine(gitDir, item.name);
+    if (line === null) {
+      carry.push(item);
+      continue;
+    }
+    if (!line.startsWith("ref:")) continue;
+    if (item.depth >= SYMREF_READ_LIMIT - 1) continue;
+    const target = line.slice("ref:".length).trim();
+    if (!target) continue;
+    names.add(target);
+    for (const shortName of gitShortRefNames(target)) names.add(shortName);
+    pending.push({ name: target, depth: item.depth + 1 });
+  }
+  return carry;
+}
+
 // Every import runs `rev-parse HEAD` and `--abbrev-ref HEAD` before the
 // requested revision is verified. Those commands open the same six candidates
-// for HEAD and for the current branch's short name. A linked worktree stores
-// the branch refs in the common directory, so that directory is probed too.
+// for HEAD and for each branch named by the HEAD symref chain. A linked
+// worktree stores the branch refs in the common directory, so that directory
+// is probed too.
 async function assertGitLookups(
   gitDir: string,
   ref: string | null,
   inherited: readonly string[] = [],
   seen = new Set<string>(),
+  follow: readonly SymrefFollow[] = [{ name: "HEAD", depth: 0 }],
 ): Promise<void> {
   let identity;
   try {
@@ -279,18 +345,10 @@ async function assertGitLookups(
     const base = revisionRefName(ref);
     if (base) names.add(base);
   }
-  const head = await readSmallGitText(join(gitDir, "HEAD"));
-  const headLine = head?.split("\n", 1)[0] ?? "";
-  if (headLine.startsWith("ref:")) {
-    const target = headLine.slice("ref:".length).trim();
-    if (target) {
-      names.add(target);
-      for (const shortName of gitShortRefNames(target)) names.add(shortName);
-    }
-  }
+  const carry = await addSymrefAbbreviations(gitDir, names, follow);
   for (const name of names) await assertRequestedRevision(gitDir, name);
   const common = await linkedGitDirectory(gitDir);
-  if (common) await assertGitLookups(common, ref, [...names], seen);
+  if (common) await assertGitLookups(common, ref, [...names], seen, [{ name: "HEAD", depth: 0 }, ...carry]);
 }
 
 // Git opens include.path while parsing config, before a command-line -c

@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createServer, request as httpRequest, type Server } from "node:http";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
+import { createHmac } from "node:crypto";
+import { Database } from "bun:sqlite";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AddressInfo } from "node:net";
 import type { Config } from "../src/config.ts";
 import { Store } from "../src/db/index.ts";
 import { EventLog } from "../src/events.ts";
@@ -22,6 +24,27 @@ import { TargetService } from "../src/dynamic/targets.ts";
 import { now } from "../src/util.ts";
 
 type Exchange = { status: number; body: string };
+
+const FIXTURE_SECRET = "acme-dev-secret-2024";
+
+function jwt(payload: Record<string, unknown>, secret: string): string {
+  const header = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = createHmac("sha256", secret).update(`${header}.${body}`).digest("base64url");
+  return `${header}.${body}.${signature}`;
+}
+
+function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = createServer();
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address ? address.port : 0;
+      server.close(() => resolve(port));
+    });
+  });
+}
 
 function proxyRequest(port: number, target: string, identityId: string): Promise<Exchange> {
   return new Promise((resolve, reject) => {
@@ -54,6 +77,9 @@ let events: EventLog;
 let graph: GraphStore;
 let targets: TargetService;
 let targetServer: Server | null = null;
+let fixture: ChildProcess | null = null;
+let fixtureDb = "";
+let usingFixture = false;
 let broker: BrokerServer | null = null;
 let baseUrl = "";
 let fixed = false;
@@ -72,9 +98,30 @@ beforeEach(() => {
 afterEach(async () => {
   await broker?.stop();
   broker = null;
+  if (fixture) {
+    const child = fixture;
+    fixture = null;
+    child.kill("SIGTERM");
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        resolve();
+      }, 2_000);
+      child.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
   if (targetServer) {
     await new Promise<void>((resolve) => targetServer!.close(() => resolve()));
     targetServer = null;
+  }
+  if (fixtureDb) {
+    rmSync(fixtureDb, { force: true });
+    rmSync(`${fixtureDb}-wal`, { force: true });
+    rmSync(`${fixtureDb}-shm`, { force: true });
+    fixtureDb = "";
   }
   store.close();
   rmSync(dir, { recursive: true, force: true });
@@ -82,41 +129,85 @@ afterEach(async () => {
 
 describe("dynamic IDOR proof", () => {
   test("finds, proves, retests, and exports a cross-tenant invoice read", async () => {
-    const invoices: Record<string, { owner: string }> = {
-      "inv-1": { owner: "user_b" },
-      "inv-2": { owner: "user_a" },
-    };
-    targetServer = createServer((request, response) => {
-      const url = new URL(request.url ?? "/", "http://127.0.0.1");
-      if (url.pathname === "/health") {
-        response.writeHead(200).end("ok");
-        return;
+    const fixtureDir = join(import.meta.dir, "fixtures", "vulnerable-app");
+    usingFixture = existsSync(join(fixtureDir, "node_modules", "better-sqlite3"));
+    let targetPort = 0;
+    if (usingFixture) {
+      fixtureDb = join(fixtureDir, "src", "acme.sqlite");
+      rmSync(fixtureDb, { force: true });
+      const db = new Database(fixtureDb);
+      db.run("CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT NOT NULL, display_name TEXT NOT NULL, role TEXT NOT NULL)");
+      db.run("CREATE TABLE invoices (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, amount REAL NOT NULL)");
+      db.run(
+        "INSERT INTO users (id, email, display_name, role) VALUES ('user_a','a@example.test','A','user'), ('user_b','b@example.test','B','user')",
+      );
+      db.run("INSERT INTO invoices (id, owner_id, amount) VALUES ('inv-1','user_b',42), ('inv-2','user_a',7)");
+      db.close();
+      targetPort = await freePort();
+      fixture = spawn("node", ["src/server.js"], {
+        cwd: fixtureDir,
+        env: { ...process.env, PORT: String(targetPort) },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      fixture.stdout?.on("data", (chunk) => {
+        output += String(chunk);
+      });
+      fixture.stderr?.on("data", (chunk) => {
+        output += String(chunk);
+      });
+      let ready = false;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if (fixture.exitCode !== null) break;
+        try {
+          const response = await fetch(`http://127.0.0.1:${targetPort}/health`);
+          if (response.ok) {
+            ready = true;
+            break;
+          }
+        } catch {
+          // The server is not listening yet.
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
       }
-      const match = /^\/api\/invoices\/([^/]+)$/.exec(url.pathname);
-      if (!match) {
-        response.writeHead(404).end("{}");
-        return;
-      }
-      const authorization = request.headers.authorization ?? "";
-      const user = authorization === "Bearer token-a" ? "user_a" : authorization === "Bearer token-b" ? "user_b" : null;
-      if (!user) {
-        response.writeHead(401).end("{}");
-        return;
-      }
-      const invoice = invoices[decodeURIComponent(match[1] ?? "")];
-      if (!invoice) {
-        response.writeHead(404).end("{}");
-        return;
-      }
-      if (fixed && invoice.owner !== user) {
-        response.writeHead(403).end('{"error":"forbidden"}');
-        return;
-      }
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ invoice: { id: match[1], owner_id: invoice.owner } }));
-    });
-    await new Promise<void>((resolve) => targetServer!.listen(0, "127.0.0.1", resolve));
-    const targetPort = (targetServer.address() as AddressInfo).port;
+      if (!ready) throw new Error(`fixture did not start: ${output}`);
+    } else {
+      const invoices: Record<string, { owner: string }> = {
+        "inv-1": { owner: "user_b" },
+        "inv-2": { owner: "user_a" },
+      };
+      targetServer = createServer((request, response) => {
+        const url = new URL(request.url ?? "/", "http://127.0.0.1");
+        if (url.pathname === "/health") {
+          response.writeHead(200).end("ok");
+          return;
+        }
+        const match = /^\/api\/invoices\/([^/]+)$/.exec(url.pathname);
+        if (!match) {
+          response.writeHead(404).end("{}");
+          return;
+        }
+        const authorization = request.headers.authorization ?? "";
+        const user = authorization === "Bearer token-a" ? "user_a" : authorization === "Bearer token-b" ? "user_b" : null;
+        if (!user) {
+          response.writeHead(401).end("{}");
+          return;
+        }
+        const invoice = invoices[decodeURIComponent(match[1] ?? "")];
+        if (!invoice) {
+          response.writeHead(404).end("{}");
+          return;
+        }
+        if (fixed && invoice.owner !== user) {
+          response.writeHead(403).end('{"error":"forbidden"}');
+          return;
+        }
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ invoice: { id: match[1], owner_id: invoice.owner } }));
+      });
+      await new Promise<void>((resolve) => targetServer!.listen(0, "127.0.0.1", resolve));
+      targetPort = (targetServer.address() as { port: number }).port;
+    }
     baseUrl = `http://127.0.0.1:${targetPort}`;
 
     store.run(
@@ -178,9 +269,11 @@ describe("dynamic IDOR proof", () => {
       authKind: "header",
       secretRef: "test:user_b",
     });
+    const tokenA = usingFixture ? jwt({ id: "user_a", role: "user" }, FIXTURE_SECRET) : "token-a";
+    const tokenB = usingFixture ? jwt({ id: "user_b", role: "user" }, FIXTURE_SECRET) : "token-b";
     for (const [ref, token] of [
-      ["test:user_a", "token-a"],
-      ["test:user_b", "token-b"],
+      ["test:user_a", tokenA],
+      ["test:user_b", tokenB],
     ] as const) {
       const encrypted = encryptSecret(config, token);
       store.run(
@@ -322,7 +415,7 @@ describe("dynamic IDOR proof", () => {
     expect(exchanges.length).toBe(3);
     expect(graph.coverage("a1").find((entry) => entry.assetId === asset.id)?.tested).toBe(true);
 
-    fixed = true;
+    if (!usingFixture) fixed = true;
     const retests = new RetestService(store, async () => {
       const positive = await proxyRequest(brokerPort, `${baseUrl}/api/invoices/inv-1`, identityB.id);
       const exploit = await proxyRequest(brokerPort, `${baseUrl}/api/invoices/inv-1`, identityA.id);
@@ -340,9 +433,10 @@ describe("dynamic IDOR proof", () => {
       environmentManifest: JSON.stringify({ target: baseUrl, commit_sha: "abc123" }),
       environmentMatch: true,
     });
-    expect(await retests.run(retestId)).toBe("fixed");
+    const expectedVerdict = usingFixture ? "still_reproducible" : "fixed";
+    expect(await retests.run(retestId)).toBe(expectedVerdict);
     expect(store.get<{ verdict: string }>("SELECT verdict FROM retests WHERE id = ?", retestId)).toEqual({
-      verdict: "fixed",
+      verdict: expectedVerdict,
     });
 
     const generated = await reports.generate("a1", ["markdown", "json"], "test");

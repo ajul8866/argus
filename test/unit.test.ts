@@ -420,7 +420,7 @@ describe("repository import", () => {
       name: "Fixture",
       source_path: fixture,
       scope_include: JSON.stringify(["**/*.js", "**/*.json", "README.md"]),
-      scope_exclude: JSON.stringify(["src/routes/media.js"]),
+      scope_exclude: JSON.stringify(["src/routes/media.js", "node_modules/**"]),
     };
     store.run(
       `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
@@ -475,7 +475,7 @@ describe("repository import", () => {
   });
 
   test("workspaces are read-only by default and owner-writable only on explicit request", async () => {
-    const scope = { include: ["**/*.js", "**/*.json", "README.md"], exclude: ["src/routes/media.js"] };
+    const scope = { include: ["**/*.js", "**/*.json", "README.md"], exclude: ["src/routes/media.js", "node_modules/**"] };
     const inventory = await buildInventory(fixture, { scope, maxFiles: 100, maxFileBytes: 1_000_000 });
     const readOnly = join(dir, "workspace-read-only");
     const writable = join(dir, "workspace-writable");

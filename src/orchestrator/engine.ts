@@ -55,10 +55,13 @@ import { localResourcePrompt } from "../harness/resources.ts";
 type AuditRow = {
   id: string;
   project_id: string;
-  repository_id: string;
+  repository_id: string | null;
   status: string;
   current_phase: number;
   config: string;
+  mode: "static" | "dynamic" | "hybrid";
+  stop_reason: string | null;
+  exploration_status: "not_applicable" | "open" | "closing" | "closed" | null;
   created_by: string | null;
   created_at: string;
   started_at: string | null;
@@ -422,17 +425,34 @@ export class AuditEngine {
     repositoryId?: string;
     userId: string | null;
     overrides?: Record<string, unknown>;
+    mode?: "static" | "dynamic" | "hybrid";
   }): string {
     validateAuditOverrides(this.store, input.overrides ?? {});
+    const mode = input.mode ?? "static";
+    if (!["static", "dynamic", "hybrid"].includes(mode)) {
+      throw new AppError(400, "invalid_mode", "mode must be static, dynamic, or hybrid");
+    }
     const project = this.store.get<ProjectRow>("SELECT * FROM projects WHERE id = ?", input.projectId);
     if (!project) throw new AppError(404, "project_not_found", "Project not found");
-    const repository = input.repositoryId
-      ? this.store.get<RepositoryRow>("SELECT * FROM repositories WHERE id = ? AND project_id = ?", input.repositoryId, input.projectId)
-      : this.store.get<RepositoryRow>(
-          "SELECT * FROM repositories WHERE project_id = ? ORDER BY imported_at DESC LIMIT 1",
+    const explicitRepository = input.repositoryId
+      ? this.store.get<RepositoryRow>(
+          "SELECT * FROM repositories WHERE id = ? AND project_id = ?",
+          input.repositoryId,
           input.projectId,
-        );
-    if (!repository) {
+        )
+      : null;
+    if (input.repositoryId && !explicitRepository) {
+      throw new AppError(400, "repository_not_found", "Repository not found for this project");
+    }
+    const repository = input.repositoryId
+      ? explicitRepository
+      : mode === "dynamic"
+        ? null
+        : this.store.get<RepositoryRow>(
+            "SELECT * FROM repositories WHERE project_id = ? ORDER BY imported_at DESC LIMIT 1",
+            input.projectId,
+          );
+    if (!repository && mode !== "dynamic") {
       throw new AppError(
         400,
         "repository_required",
@@ -498,12 +518,13 @@ export class AuditEngine {
     const timestamp = now();
     this.store.transaction(() => {
       this.store.run(
-        `INSERT INTO audits (id, project_id, repository_id, status, current_phase, config, created_by, created_at)
-         VALUES (?, ?, ?, 'queued', 1, ?, ?, ?)`,
+        `INSERT INTO audits (id, project_id, repository_id, status, current_phase, config, mode, created_by, created_at)
+         VALUES (?, ?, ?, 'queued', 1, ?, ?, ?, ?)`,
         id,
         input.projectId,
-        repository.id,
+        repository?.id ?? null,
         toJson(config),
+        mode,
         input.userId,
         timestamp,
       );
@@ -521,8 +542,9 @@ export class AuditEngine {
       type: "audit.created",
       payload: {
         project: project.name,
-        repository: repository.id,
-        commit: repository.commit_sha,
+        repository: repository?.id ?? null,
+        commit: repository?.commit_sha ?? null,
+        mode,
         config,
       },
     });

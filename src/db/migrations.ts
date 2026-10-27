@@ -1,4 +1,4 @@
-export type Migration = { version: number; name: string; sql: string };
+export type Migration = { version: number; name: string; sql: string; foreignKeysOff?: boolean };
 
 export const migrations: Migration[] = [
   {
@@ -470,6 +470,37 @@ CREATE TABLE test_identities (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX idx_test_identities_target ON test_identities(target_id, status);
+`,
+  },
+  {
+    version: 5,
+    name: "audit_mode_and_nullable_repository",
+    foreignKeysOff: true,
+    sql: `
+CREATE TABLE audits_new (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  repository_id TEXT REFERENCES repositories(id),
+  status TEXT NOT NULL CHECK (status IN ('queued','running','completed','completed_with_errors','failed','cancelling','cancelled')),
+  current_phase INTEGER NOT NULL DEFAULT 1,
+  config TEXT NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'static' CHECK (mode IN ('static','dynamic','hybrid')),
+  stop_reason TEXT,
+  exploration_status TEXT CHECK (exploration_status IN ('not_applicable','open','closing','closed')),
+  created_by TEXT REFERENCES users(id),
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  error TEXT
+);
+INSERT INTO audits_new
+  (id, project_id, repository_id, status, current_phase, config, created_by, created_at, started_at, finished_at, error)
+SELECT id, project_id, repository_id, status, current_phase, config, created_by, created_at, started_at, finished_at, error
+FROM audits;
+DROP TABLE audits;
+ALTER TABLE audits_new RENAME TO audits;
+CREATE INDEX idx_audits_project ON audits(project_id);
+CREATE INDEX idx_audits_status ON audits(status);
 `,
   },
 ];

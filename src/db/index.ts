@@ -32,12 +32,23 @@ export class Store {
     );
     for (const migration of migrations) {
       if (applied.has(migration.version)) continue;
-      this.db.transaction(() => {
-        this.db.exec(migration.sql);
-        this.db
-          .query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
-          .run(migration.version, migration.name, new Date().toISOString());
-      })();
+      if (migration.foreignKeysOff) this.db.exec("PRAGMA foreign_keys = OFF");
+      try {
+        this.db.transaction(() => {
+          this.db.exec(migration.sql);
+          this.db
+            .query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
+            .run(migration.version, migration.name, new Date().toISOString());
+        })();
+      } finally {
+        if (migration.foreignKeysOff) this.db.exec("PRAGMA foreign_keys = ON");
+      }
+      if (migration.foreignKeysOff) {
+        const violations = this.db.query("PRAGMA foreign_key_check").all();
+        if (violations.length > 0) {
+          throw new Error(`foreign key violations after migration ${migration.version}: ${JSON.stringify(violations)}`);
+        }
+      }
     }
   }
 

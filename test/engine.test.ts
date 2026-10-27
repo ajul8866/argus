@@ -1249,3 +1249,29 @@ test("a writable workspace task fails closed on the first check when the setting
   expect(store.all("SELECT seq FROM execution_events WHERE task_id = ? AND type = 'task.retry'", taskId)).toHaveLength(0);
   expect(store.all("SELECT id FROM agent_sessions WHERE task_id = ?", taskId)).toHaveLength(0);
 });
+
+describe("audit modes", () => {
+  function insertRepositorylessProject(): void {
+    store.run(
+      `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+       VALUES ('p2','No repo','', ?, '[]', '[]', 'Tester','AUTH-2', ?, ?)`,
+      dir,
+      now(),
+      now(),
+    );
+  }
+
+  test("a dynamic audit can be created without a repository", () => {
+    insertRepositorylessProject();
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic" });
+    expect(store.get("SELECT mode, repository_id FROM audits WHERE id = ?", id)).toEqual({
+      mode: "dynamic",
+      repository_id: null,
+    });
+  });
+
+  test("a static audit without a repository is refused", () => {
+    insertRepositorylessProject();
+    expect(() => engine.createAudit({ projectId: "p2", userId: "u1", mode: "static" })).toThrow(/repository/i);
+  });
+});

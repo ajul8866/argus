@@ -32,8 +32,8 @@ export const DEFAULT_EXCLUDES = [
   "**/*.dll",
   "**/*.exe",
   "**/*.bin",
-  ".env",
-  ".env.*",
+  "**/.env",
+  "**/.env.*",
 ];
 
 const LANGUAGE_BY_EXT: Record<string, string> = {

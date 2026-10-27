@@ -24,12 +24,16 @@ LLM agents. Use it only on repositories you are authorized to assess.
   APIs, and in excerpt verification. Prompt text is never the authorization
   boundary.
 - Only regular files are imported; symlinks are skipped. Files larger than the
-  cap are skipped and recorded. Inventory reads and snapshot copies pin the
-  repository directory without following a symlink, then open the file without
-  following a symlink and without waiting on a pipe. The opened descriptor must
-  still be that in-scope path. Replacing the repository directory with a
-  symlink is rejected. The read stops at the size checked there, and a file
-  whose bytes no longer match the inventory is not copied.
+  cap are skipped and recorded. Inventory reads and snapshot copies walk each
+  component of the repository path without following a symlink, then open the
+  file without following a symlink and without waiting on a pipe. The opened
+  descriptor must still be that in-scope path. Replacing the repository
+  directory, or an ancestor directory, with a symlink is rejected. The
+  filesystem-root directories `/tmp`, `/var`, and `/etc` are followed only when
+  they are symlinks to `private/<name>`, which is the macOS layout for those
+  directories. A symlink of any other name, or with any other target, is
+  rejected. The read stops at the size checked there, and a file whose bytes no
+  longer match the inventory is not copied.
 - An immutable snapshot is created at import, so later edits to the original
   worktree cannot change what the evidence refers to.
 - Git-ref imports resolve the ref once, archive that immutable commit, and copy
@@ -119,8 +123,8 @@ local MCP executable available.
   be either prior session. This is checked in code, not just prompts.
 - `CONFIRMED`/`REVERIFIED` requires at least one exact excerpt on an affected
   file, verified against the snapshot. That read rejects a symlink, a pipe, or
-  a repository directory replaced by a symlink, and it stops at the size
-  checked on the opened file. LLM agreement alone is insufficient.
+  a repository path whose directory or ancestor was replaced by a symlink, and
+  it stops at the size checked on the opened file. LLM agreement alone is insufficient.
 
 Residual prompt-injection risk remains: a model could be manipulated into
 reporting a false positive or missing an issue. The platform gates reduce the

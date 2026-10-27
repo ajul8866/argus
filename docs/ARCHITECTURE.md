@@ -209,15 +209,16 @@ operation, preserving include/exclude short-circuit behavior.
 1. Project source path is resolved with `realpath` and must be under
    `ARGUS_ALLOWED_ROOTS`.
 2. Import builds an inventory using include/exclude globs. Only regular files
-   (no symlinks) within scope and size caps are included. The repository
-   directory is pinned without following a symlink. Each read opens the file
-   without following a symlink and without waiting on a pipe, checks that the
-   descriptor is still that path, and stops at the size observed there.
+   (no symlinks) within scope and size caps are included. The repository path
+   is pinned by walking each component without following a symlink. Each read
+   opens the file without following a symlink and without waiting on a pipe,
+   checks that the descriptor is still that path, and stops at the size
+   observed there.
 3. A snapshot is copied under `$ARGUS_DATA_DIR/repos/<project>/<id>` (or a git
-   archive for a ref) with the same open. A symlink, a repository directory
-   replaced by a symlink, a path that escapes the source, or bytes that no
-   longer match the inventory are not copied. The inventory is then rebuilt
-   from the snapshot.
+   archive for a ref) with the same open. A symlink, a repository directory or
+   ancestor replaced by a symlink, a path that escapes the source, or bytes
+   that no longer match the inventory are not copied. The inventory is then
+   rebuilt from the snapshot.
 4. Each task gets a fresh read-only copy under
    `$ARGUS_DATA_DIR/workspaces/<audit>/<session>`.
 5. If Bubblewrap is available, the harness runs with a new session, new PID/IPC/

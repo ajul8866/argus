@@ -1,6 +1,6 @@
-import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, realpath, stat, writeFile } from "node:fs/promises";
-import { dirname, join, relative } from "node:path";
+import { constants, fstatSync } from "node:fs";
+import { chmod, lstat, mkdir, open, readlink, realpath, stat, writeFile } from "node:fs/promises";
+import { dirname, join, relative, resolve } from "node:path";
 import { AppError, createScopeMatcher, matchesScope, normalizePath, safeJoin, sha256 } from "../util.ts";
 import type { Scope } from "../util.ts";
 import type { Inventory } from "./inventory.ts";
@@ -56,32 +56,122 @@ const OUT_OF_SCOPE = "File is outside the authorized project scope";
 const NOT_A_FILE = "Path is not a regular file";
 
 type PinnedDirectory = { path: string; dev: number; ino: number };
+type OpenedFile = Awaited<ReturnType<typeof open>>;
 
-// Resolve a directory without following a symlink at its final component.
-// A second realpath after the caller has already resolved the root follows a
-// directory that was replaced by a symlink and makes the outside tree look
-// in scope. The returned identity is checked again after the file is opened.
-async function pinDirectory(root: string): Promise<PinnedDirectory> {
-  const before = await lstat(root);
-  if (before.isSymbolicLink() || !before.isDirectory()) {
+// macOS keeps temporary files under /var, and /var, /tmp, and /etc are symlinks
+// to private/<name>. Follow only that fixed alias at the filesystem root.
+// A symlink anywhere else, including an ancestor of the repository, is rejected.
+const PLATFORM_ROOT_LINKS = new Set(["tmp", "var", "etc"]);
+
+function systemErrorCode(error: unknown): string | undefined {
+  if (error instanceof Error && "code" in error && typeof error.code === "string") return error.code;
+  return undefined;
+}
+
+async function descriptorPrefix(fd: number): Promise<string> {
+  for (const prefix of ["/proc/self/fd", "/dev/fd"]) {
+    try {
+      const probe = await open(`${prefix}/${fd}`, constants.O_RDONLY | constants.O_DIRECTORY);
+      await probe.close();
+      return prefix;
+    } catch {
+      // This platform exposes directory descriptors at the other prefix.
+    }
+  }
+  throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
+}
+
+async function openChild(prefix: string, parent: OpenedFile, name: string, flags: number): Promise<OpenedFile> {
+  if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\0")) {
     throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
   }
-  const path = await realpath(root);
-  const after = await lstat(root);
-  const canonical = await lstat(path);
+  return open(`${prefix}/${parent.fd}/${name}`, flags);
+}
+
+async function openPlatformRootAlias(prefix: string, rootFd: OpenedFile, name: string, flags: number): Promise<OpenedFile> {
+  if (!PLATFORM_ROOT_LINKS.has(name)) throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
+  let link: string;
+  try {
+    link = await readlink(`/${name}`);
+  } catch {
+    throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
+  }
+  if (link !== `private/${name}` && link !== `/private/${name}`) {
+    throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
+  }
+  const privateDir = await openChild(prefix, rootFd, "private", flags);
+  try {
+    return await openChild(prefix, privateDir, name, flags);
+  } catch (error) {
+    if (systemErrorCode(error) === "ELOOP" || systemErrorCode(error) === "ENOTDIR") {
+      throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
+    }
+    throw error;
+  } finally {
+    await privateDir.close().catch(() => undefined);
+  }
+}
+
+// Walk each component without following a symlink. realpath() on the whole
+// repository path follows an ancestor that was replaced by a symlink and makes
+// the outside tree look in scope. The returned identity is checked again
+// after a file is opened.
+async function pinDirectory(root: string): Promise<PinnedDirectory> {
+  const noFollow = constants.O_NOFOLLOW;
+  const nonBlock = constants.O_NONBLOCK;
+  const directoryFlag = constants.O_DIRECTORY;
   if (
-    after.isSymbolicLink() ||
-    !after.isDirectory() ||
-    canonical.isSymbolicLink() ||
-    !canonical.isDirectory() ||
-    after.dev !== before.dev ||
-    after.ino !== before.ino ||
-    canonical.dev !== before.dev ||
-    canonical.ino !== before.ino
+    typeof noFollow !== "number" ||
+    typeof nonBlock !== "number" ||
+    typeof directoryFlag !== "number" ||
+    noFollow === 0 ||
+    nonBlock === 0 ||
+    directoryFlag === 0
   ) {
     throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
   }
-  return { path, dev: before.dev, ino: before.ino };
+  const parts = resolve(root).split("/").filter((part) => part.length > 0);
+  if (parts.length === 0 || parts.some((part) => part === "." || part === ".." || part.includes("\0"))) {
+    throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
+  }
+  const dirFlags = constants.O_RDONLY | directoryFlag | noFollow | nonBlock;
+  let current: OpenedFile | undefined;
+  try {
+    current = await open("/", dirFlags);
+    const prefix = await descriptorPrefix(current.fd);
+    for (let index = 0; index < parts.length; index += 1) {
+      const part = parts[index]!;
+      let next: OpenedFile;
+      try {
+        next = await openChild(prefix, current, part, dirFlags);
+      } catch (error) {
+        if (index === 0 && systemErrorCode(error) === "ELOOP") {
+          next = await openPlatformRootAlias(prefix, current, part, dirFlags);
+        } else if (systemErrorCode(error) === "ELOOP" || systemErrorCode(error) === "ENOTDIR") {
+          throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
+        } else {
+          throw error;
+        }
+      }
+      await current.close();
+      current = next;
+    }
+    const info = fstatSync(current.fd);
+    const path = await openedRealPath(current.fd);
+    const named = await lstat(path);
+    if (
+      !info.isDirectory() ||
+      named.isSymbolicLink() ||
+      !named.isDirectory() ||
+      named.dev !== info.dev ||
+      named.ino !== info.ino
+    ) {
+      throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
+    }
+    return { path, dev: info.dev, ino: info.ino };
+  } finally {
+    await current?.close().catch(() => undefined);
+  }
 }
 
 export async function canonicalDirectory(root: string): Promise<string> {
@@ -129,9 +219,10 @@ export async function readCappedRegularFile(
     const expectedPath = join(pinned.path, expected);
     // O_NOFOLLOW refuses a symlink at the final path component. O_NONBLOCK
     // makes a pipe return immediately; opening it for read would otherwise
-    // wait until another process connects a writer. O_NOFOLLOW does not cover
-    // the repository directory or another intermediate component, so the
-    // opened descriptor must still be the path under the pinned directory.
+    // wait until another process connects a writer. The repository path is
+    // pinned one component at a time. O_NOFOLLOW still does not cover an
+    // intermediate component of this file path, so the opened descriptor must
+    // be the path under that pinned directory.
     handle = await open(path, constants.O_RDONLY | noFollow | nonBlock);
     const info = await handle.stat();
     if (!info.isFile()) throw new AppError(400, "not_a_file", NOT_A_FILE);

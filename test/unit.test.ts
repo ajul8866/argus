@@ -758,6 +758,85 @@ describe("repository import", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test("scoped reads, inventory, and snapshot copy reject an ancestor directory replaced by a symlink", async () => {
+    const root = mkdtempSync(join(tmpdir(), "argus-ancestor-swap-"));
+    const parent = join(root, "parent");
+    const source = join(parent, "repo");
+    const outside = join(root, "outside");
+    const outsideRepo = join(outside, "repo");
+    const scope = { include: ["**/*"], exclude: [] };
+    const secretInventory = {
+      files: [{
+        path: "a.js",
+        size: Buffer.byteLength("SECRET_ANCESTOR_SENTINEL"),
+        lines: 1,
+        language: "JavaScript",
+        sha256: sha256("SECRET_ANCESTOR_SENTINEL"),
+      }],
+      skipped: [],
+      languages: {},
+      frameworks: [],
+      endpoints: [],
+      auth_boundaries: [],
+      dependency_graph: [],
+      entrypoints: [],
+      total_bytes: Buffer.byteLength("SECRET_ANCESTOR_SENTINEL"),
+      truncated: false,
+    };
+    try {
+      mkdirSync(join(source, "src"), { recursive: true });
+      mkdirSync(join(outsideRepo, "src"), { recursive: true });
+      writeFileSync(join(source, "a.js"), "INSIDE_CONTENT");
+      writeFileSync(join(source, "src", "a.js"), "INSIDE_NESTED");
+      writeFileSync(join(outsideRepo, "a.js"), "SECRET_ANCESTOR_SENTINEL");
+      writeFileSync(join(outsideRepo, "src", "a.js"), "SECRET_NESTED_SENTINEL");
+
+      const before = await readScopedFile(source, "src/a.js", scope);
+      expect(before.content).toBe("INSIDE_NESTED");
+
+      renameSync(parent, `${parent}.bak`);
+      symlinkSync(outside, parent);
+
+      await expect(canonicalDirectory(source)).rejects.toMatchObject({ code: "out_of_scope" });
+      await expect(readScopedFile(source, "a.js", scope)).rejects.toMatchObject({ code: "out_of_scope" });
+      await expect(readScopedFile(source, "src/a.js", scope)).rejects.toMatchObject({ code: "out_of_scope" });
+      await expect(readCappedRegularFile(join(source, "a.js"), 1_000, {
+        root: source,
+        relativePath: "a.js",
+      })).rejects.toMatchObject({ code: "out_of_scope" });
+      await expect(readCappedRegularFile(join(source, "src", "a.js"), 1_000, {
+        root: source,
+        relativePath: "src/a.js",
+      })).rejects.toMatchObject({ code: "out_of_scope" });
+      await expect(buildInventory(source, { scope, maxFiles: 20, maxFileBytes: 1_000 })).rejects.toMatchObject({
+        code: "out_of_scope",
+      });
+      const copy = join(root, "copy");
+      await expect(createWorkspace(source, secretInventory, scope, copy, {})).rejects.toMatchObject({
+        code: "out_of_scope",
+      });
+      expect(existsSync(join(copy, "a.js"))).toBe(false);
+      expect(existsSync(join(copy, "src", "a.js"))).toBe(false);
+
+      const aliasParent = join(root, "alias-parent");
+      const alias = join(aliasParent, "tmp");
+      const aliasOutside = join(aliasParent, "outside");
+      mkdirSync(alias, { recursive: true });
+      mkdirSync(aliasOutside, { recursive: true });
+      writeFileSync(join(alias, "a.js"), "INSIDE_ALIAS");
+      writeFileSync(join(aliasOutside, "a.js"), "SECRET_ALIAS_SENTINEL");
+      renameSync(alias, `${alias}.bak`);
+      symlinkSync(aliasOutside, alias);
+      await expect(readScopedFile(alias, "a.js", scope)).rejects.toMatchObject({ code: "out_of_scope" });
+      await expect(readCappedRegularFile(join(alias, "a.js"), 1_000, {
+        root: alias,
+        relativePath: "a.js",
+      })).rejects.toMatchObject({ code: "out_of_scope" });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("evidence chain", () => {

@@ -55,7 +55,9 @@ LLM agents. Use it only on repositories you are authorized to assess.
   probes are the git directory file of that name, that name under `refs`,
   `refs/tags`, `refs/heads`, and `refs/remotes`, and
   `refs/remotes/<name>/HEAD`. A symref target of one of those files is checked
-  the same way. `rev-parse --abbrev-ref HEAD` follows the HEAD symref chain and
+  the same way. A later hop that names a private ref is read beside the worktree
+  `HEAD`, and `main-worktree/` on that kind of name is the bare file in the common
+  directory. `rev-parse --abbrev-ref HEAD` follows the HEAD symref chain and
   probes each abbreviation of the final ref, including the longer name used when
   a shorter one is ambiguous. Those probes run for every import, including one
   that does not request a revision, and a linked worktree probes them in its

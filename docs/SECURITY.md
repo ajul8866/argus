@@ -15,9 +15,13 @@ LLM agents. Use it only on repositories you are authorized to assess.
   locations, temporary directory, and mounted volumes. Administrators may
   restrict them by setting `ARGUS_ALLOWED_ROOTS`. Imported snapshots under
   `<dataDir>/repos` remain included in either mode.
-- The source path is canonicalized with `realpath` and checked against the
-  effective source locations on folder browsing and create/import, and again
-  when a workspace/evidence file is opened. Folder browsing requires the
+- Folder browsing, project creation, import, workspace copies, and evidence
+  reads pin the source path by walking each component without following a
+  symlink. The pinned path must sit under an allowed source location.
+  Configured locations are canonicalized when they are detected. The source
+  path is not passed through `realpath`, because that would follow a symlink
+  and authorize its target. A repository symlink is rejected even when that
+  target remains inside an allowed location. Folder browsing requires the
   auditor role, returns directory metadata only, and omits hidden folders,
   `node_modules`, and symlinks.
 - Scope globs are enforced before file copy, in inventory, in explorer/file

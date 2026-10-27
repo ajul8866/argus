@@ -1,5 +1,5 @@
 import { constants, fstatSync } from "node:fs";
-import { chmod, lstat, mkdir, open, readlink, realpath, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readlink, realpath, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { AppError, createScopeMatcher, matchesScope, normalizePath, safeJoin, sha256 } from "../util.ts";
 import type { Scope } from "../util.ts";
@@ -408,26 +408,40 @@ export async function verifyQuote(
   };
 }
 
+function pathWithinRoot(candidate: string, root: string): boolean {
+  const normalizedRoot = root.endsWith("/") ? root : `${root}/`;
+  return candidate === root || candidate.startsWith(normalizedRoot);
+}
+
+// Authorize the pinned directory, not a realpath of the caller's string.
+// realpath follows an ancestor symlink and would accept its target whenever
+// that target is still inside an allowed root. Allowed roots are pinned with
+// the same walk so a macOS /tmp, /var, or /etc alias matches /private/<name>
+// without following any other symlink.
 export async function assertAuthorizedRoot(path: string, allowedRoots: string[]): Promise<string> {
-  const { realpath } = await import("node:fs/promises");
   let resolved: string;
   try {
-    resolved = await realpath(path);
-  } catch {
+    resolved = await canonicalDirectory(path);
+  } catch (error) {
+    if (error instanceof AppError && error.code === "out_of_scope") {
+      throw new AppError(400, "invalid_repository", "Repository path must be a real directory");
+    }
     throw new AppError(400, "invalid_repository", "Repository path does not exist");
   }
-  const stats = await stat(resolved);
-  if (!stats.isDirectory()) throw new AppError(400, "invalid_repository", "Repository path must be a directory");
-  const allowed = allowedRoots.some((root) => {
-    const normalizedRoot = root.endsWith("/") ? root : `${root}/`;
-    return resolved === root || resolved.startsWith(normalizedRoot);
-  });
-  if (!allowed) {
-    throw new AppError(
-      403,
-      "repository_not_authorized",
-      "This folder is outside the configured repository locations. Choose a folder from Browse folders.",
-    );
+  for (const root of allowedRoots) {
+    if (pathWithinRoot(resolved, root)) return resolved;
   }
-  return resolved;
+  for (const root of allowedRoots) {
+    try {
+      const boundary = await canonicalDirectory(root);
+      if (pathWithinRoot(resolved, boundary)) return resolved;
+    } catch {
+      // A boundary that cannot be pinned does not expand authorization.
+    }
+  }
+  throw new AppError(
+    403,
+    "repository_not_authorized",
+    "This folder is outside the configured repository locations. Choose a folder from Browse folders.",
+  );
 }

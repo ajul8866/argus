@@ -43,7 +43,7 @@ change the throttle bucket.
 | `GET` | `/api/repositories` | any | All snapshots |
 | `GET` | `/api/repositories/:id` | any | Snapshot + inventory + architecture map |
 | `GET` | `/api/repositories/:id/tree?path=` | any | Inventory-derived tree |
-| `GET` | `/api/repositories/:id/file?path=` | any | Scoped text preview. A symlink, a pipe, or a repository directory or ancestor replaced by a symlink is rejected. The read stops at the checked size and the preview cap |
+| `GET` | `/api/repositories/:id/file?path=` | any | Scoped text preview. Authorization rejects a repository directory or ancestor that was replaced by a symlink before the preview is read, including when the target remains inside an allowed root. A symlink or pipe in the file path is rejected. The read stops at the checked size and the preview cap |
 
 Creating a project requires only `name` and `source_path`. The optional
 `authorized_by` and `authorization_ref` fields remain supported for existing
@@ -69,8 +69,9 @@ Markdown, HTML, and PDF; JSON retains the fields for compatibility.
 Folder discovery returns `{path, parent_path, roots, folders, next_offset}`.
 Each root has `name` and `path`; each folder also has `is_repository`. The
 endpoint returns directory names and paths, never file contents. Hidden
-folders, `node_modules`, and symlinks are omitted. Invalid paths and
-offsets return 400, and paths outside configured locations return 403.
+folders, `node_modules`, and symlinks are omitted. Invalid paths, including a
+symlink or a symlink ancestor, and invalid offsets return 400. Paths outside
+configured locations return 403.
 
 Import writes an immutable snapshot under `$ARGUS_DATA_DIR/repos/...`, records
 the commit/ref, and rejects empty/invalid snapshots.

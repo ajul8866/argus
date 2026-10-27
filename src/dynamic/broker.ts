@@ -7,7 +7,7 @@ import type { CredentialBroker } from "./credentials.ts";
 
 /** The only capability the broker needs from a credential source. */
 export type CredentialSource = {
-  inject(identityId: string): Record<string, string>;
+  inject(identityId: string, expectedTargetId?: string): Record<string, string>;
 };
 
 export type ExchangeRecord = {
@@ -24,6 +24,8 @@ export type ExchangeRecord = {
 export type BrokerOptions = {
   policy: EgressPolicy;
   credentials?: CredentialSource;
+  /** Target id the broker may resolve identities for. */
+  targetId?: string;
   onExchange?: (record: ExchangeRecord) => void | Promise<void>;
   /** Health checks report whether the broker is ready to serve traffic. */
   isReady?: () => boolean;
@@ -34,6 +36,11 @@ export type BrokerOptions = {
 export const BROKER_FORWARD_PATH = "/__argus/forward";
 export const BROKER_TARGET_HEADER = "x-argus-target-url";
 export const BROKER_DEADLINE_HEADER = "x-argus-deadline";
+/**
+ * Marks a response the broker generated itself. A target response can never
+ * carry this header: it is stripped when upstream headers are forwarded.
+ */
+export const BROKER_ERROR_HEADER = "x-argus-broker-error";
 
 const SENSITIVE = new Set(["authorization", "cookie", "set-cookie", "x-api-key", "x-argus-identity"]);
 const HOP_BY_HOP = new Set(["host", "proxy-connection", "connection", "content-length", "x-argus-identity", BROKER_TARGET_HEADER, BROKER_DEADLINE_HEADER]);
@@ -55,7 +62,7 @@ export class BrokerServer {
       void this.handleHttp(request, response).catch((error) => {
         if (response.destroyed) return;
         if (!response.headersSent) {
-          response.writeHead(502, { "content-type": "application/json" });
+          response.writeHead(502, { "content-type": "application/json", [BROKER_ERROR_HEADER]: "broker_error" });
         }
         response.end(JSON.stringify({ error: { code: "broker_error", message: String(error) } }));
       });
@@ -137,7 +144,7 @@ export class BrokerServer {
       else if (value) headers.set(key, value);
     }
     if (identityId && this.options.credentials) {
-      for (const [key, value] of Object.entries(this.options.credentials.inject(identityId))) {
+      for (const [key, value] of Object.entries(this.options.credentials.inject(identityId, this.options.targetId))) {
         headers.set(key, value);
       }
     }
@@ -164,7 +171,7 @@ export class BrokerServer {
       return;
     } catch (error) {
       if (!response.destroyed) {
-        response.writeHead(502, { "content-type": "application/json" });
+        response.writeHead(502, { "content-type": "application/json", [BROKER_ERROR_HEADER]: "upstream_error" });
         response.end(JSON.stringify({ error: { code: "upstream_error", message: String(error) } }));
       }
       await this.record({
@@ -282,7 +289,7 @@ export class BrokerServer {
           const forwarded: Record<string, string> = {};
           const recorded: Record<string, string> = {};
           for (const [key, value] of Object.entries(response.headers)) {
-            if (["content-encoding", "content-length", "transfer-encoding", "connection"].includes(key)) continue;
+            if (["content-length", "transfer-encoding", "connection", BROKER_ERROR_HEADER].includes(key)) continue;
             const text = Array.isArray(value) ? value.join(", ") : String(value ?? "");
             forwarded[key] = text;
             recorded[key] = SENSITIVE.has(key) ? "[REDACTED]" : text;
@@ -405,7 +412,7 @@ export class BrokerServer {
     url: string,
     started: number,
   ): Promise<void> {
-    response.writeHead(403, { "content-type": "application/json" });
+    response.writeHead(403, { "content-type": "application/json", [BROKER_ERROR_HEADER]: code });
     response.end(JSON.stringify({ error: { code, message } }));
     await this.record({
       method,

@@ -493,7 +493,7 @@ export class ReportService {
         findings: data.findings.map((finding) => ({
           ...finding,
           verified_excerpts: data.excerpts_by_finding[finding.id] ?? [],
-          dynamic_proof: data.dynamic_by_finding[finding.id]?.proof ?? null,
+          dynamic_proof: reportDynamicProof(data.dynamic_by_finding[finding.id]?.proof ?? null),
         })),
         verifications: data.verifications,
         evidence: data.evidence.map((row) => ({
@@ -508,7 +508,12 @@ export class ReportService {
           created_at: row.created_at,
         })),
         evidence_chain: data.chain,
-        dynamic_evidence: data.dynamic_by_finding,
+        dynamic_evidence: Object.fromEntries(
+          Object.entries(data.dynamic_by_finding).map(([id, entry]) => [
+            id,
+            { proof: reportDynamicProof(entry.proof), evidence_ids: entry.evidence_ids },
+          ]),
+        ),
         tasks: data.tasks.map((task) => ({ ...task, result: task.result ? "[stored]" : null })),
         agent_sessions: data.sessions,
         reports: data.reports,
@@ -979,6 +984,21 @@ function markdownToHtml(markdown: string): string {
   closeTable();
   if (inCode) out.push("</code></pre>");
   return out.join("\n");
+}
+
+/**
+ * The JSON report must not embed the full PoC manifest: `checks` and
+ * `environment` carry arbitrary request text (including body expectations)
+ * that may contain credentials. The object, result, and statuses are enough
+ * for a report reader; the raw manifest stays in the protected evidence file.
+ */
+function reportDynamicProof(proof: DynamicProof | null): Record<string, unknown> | null {
+  if (!proof) return null;
+  return {
+    manifest: proof.manifest ? { object: proof.manifest.object } : null,
+    result: proof.result ?? null,
+    exchanges: proof.exchanges ?? null,
+  };
 }
 
 function inline(value: string): string {

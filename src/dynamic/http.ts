@@ -1,4 +1,11 @@
-import { BROKER_DEADLINE_HEADER, BROKER_FORWARD_PATH, BROKER_TARGET_HEADER } from "./broker.ts";
+import { BROKER_DEADLINE_HEADER, BROKER_ERROR_HEADER, BROKER_FORWARD_PATH, BROKER_TARGET_HEADER } from "./broker.ts";
+
+export type BrokerResponse = {
+  status: number;
+  body: string;
+  /** Set only when the broker, not the target, produced the response. */
+  brokerError?: string | null;
+};
 
 const SUPPORTED_METHODS = new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE"]);
 
@@ -8,7 +15,7 @@ export async function requestThroughBroker(
   method: string,
   identityId: string | null,
   limits: { timeoutMs?: number; maxBytes?: number } = {},
-): Promise<{ status: number; body: string }> {
+): Promise<BrokerResponse> {
   const normalizedMethod = method.trim().toUpperCase();
   // Bun may silently send GET for unknown method tokens.
   if (!SUPPORTED_METHODS.has(normalizedMethod)) throw new Error(`Unsupported broker request method: ${normalizedMethod}`);
@@ -39,7 +46,12 @@ export async function requestThroughBroker(
         chunks.push(value);
       }
     }
-    return { status: response.status, body: Buffer.concat(chunks).toString("utf8") };
+    const brokerError = response.headers.get(BROKER_ERROR_HEADER);
+    return {
+      status: response.status,
+      body: Buffer.concat(chunks).toString("utf8"),
+      ...(brokerError ? { brokerError } : {}),
+    };
   } catch (error) {
     if (controller.signal.aborted) throw controller.signal.reason;
     throw error;

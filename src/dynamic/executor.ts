@@ -5,14 +5,38 @@ import { BrokerServer } from "./broker.ts";
 import { CredentialBroker } from "./credentials.ts";
 import type { EgressPolicy } from "./egress.ts";
 import { GraphStore } from "./graph.ts";
-import { TargetService } from "./targets.ts";
-import { requestThroughBroker } from "./http.ts";
+import { TargetService, type AuditScopeSnapshot } from "./targets.ts";
+import { requestThroughBroker, type BrokerResponse } from "./http.ts";
+import type { PocExchange } from "./poc.ts";
 
 export type BrokerCheckExchanges = {
-  positive: { status: number; body: string };
-  exploit: { status: number; body: string };
-  negative: { status: number; body: string };
+  positive: PocExchange;
+  exploit: PocExchange;
+  negative: PocExchange;
 };
+
+/**
+ * Replay is live testing: the authorization captured at start must still be
+ * active, and the target must still be enabled. Revocation must stop traffic,
+ * not merely be recorded in the snapshot.
+ */
+function assertReplayAuthorized(targets: TargetService, snapshot: AuditScopeSnapshot): void {
+  const target = targets.getTarget(snapshot.target.id);
+  if (!target || target.status !== "active") {
+    throw new Error("The target is no longer active; refusing to replay the PoC");
+  }
+  const live = targets.getAuthorization(snapshot.authorization.id);
+  const nowMs = Date.now();
+  if (
+    !live ||
+    live.targetId !== snapshot.target.id ||
+    live.status !== "active" ||
+    Date.parse(live.validFrom) > nowMs ||
+    Date.parse(live.validUntil) <= nowMs
+  ) {
+    throw new Error("The target authorization is no longer active; refusing to replay the PoC");
+  }
+}
 
 /**
  * Executes the three PoC checks through a fresh per-audit broker. Used by
@@ -26,8 +50,17 @@ export async function runPocChecks(
     checks: Record<"positive" | "exploit" | "negative", { identity: string; request: { method: string; path: string } }>;
   },
 ): Promise<BrokerCheckExchanges> {
-  const snapshot = new TargetService(store).getSnapshot(auditId)?.snapshot;
+  const targets = new TargetService(store);
+  const snapshot = targets.getSnapshot(auditId)?.snapshot;
   if (!snapshot) throw new Error("The audit has no scope snapshot");
+  assertReplayAuthorized(targets, snapshot);
+  const scoped = new Set(snapshot.identities.map((identity) => identity.id));
+  const identities = (["positive", "exploit", "negative"] as const).map((name) => manifest.checks[name].identity);
+  for (const identityId of identities) {
+    if (!scoped.has(identityId)) {
+      throw new Error(`Identity ${identityId} is not part of this audit scope`);
+    }
+  }
   const policy: EgressPolicy = {
     baseUrl: snapshot.target.base_url,
     allowedHosts: snapshot.target.allowed_hosts,
@@ -38,15 +71,33 @@ export async function runPocChecks(
     authorizedActions: snapshot.authorization.authorized_actions,
     restrictions: snapshot.authorization.restrictions,
   };
-  const broker = new BrokerServer({ policy, credentials: new CredentialBroker(config, store) });
+  const credentials = new CredentialBroker(config, store);
+  const secrets = credentials.secretValues(identities);
+  if (secrets.some((secret) => secret.length < 4)) {
+    throw new Error("An identity secret is too short to redact safely");
+  }
+  const manifestText = JSON.stringify(manifest);
+  if (secrets.some((secret) => manifestText.includes(secret))) {
+    throw new Error("The PoC manifest contains an identity secret; refusing to replay it");
+  }
+  const broker = new BrokerServer({ policy, credentials, targetId: snapshot.target.id });
   const port = (await broker.start()).port;
+  const sanitize = (exchange: BrokerResponse): PocExchange => {
+    const evidenceBody = credentials.redactExchange({}, exchange.body, secrets).body;
+    credentials.assertNoSecrets(evidenceBody, secrets);
+    return { ...exchange, body: exchange.body, evidenceBody };
+  };
   try {
     const run = async (name: "positive" | "exploit" | "negative") => {
       const check = manifest.checks[name];
       const target = new URL(check.request.path, snapshot.target.base_url).toString();
-      return requestThroughBroker(port, target, check.request.method, check.identity);
+      return sanitize(await requestThroughBroker(port, target, check.request.method, check.identity));
     };
-    return { positive: await run("positive"), exploit: await run("exploit"), negative: await run("negative") };
+    return {
+      positive: await run("positive"),
+      exploit: await run("exploit"),
+      negative: await run("negative"),
+    };
   } finally {
     await broker.stop();
   }
@@ -90,6 +141,7 @@ export function createBrokerDynamicExecutor(config: Config, store: Store): Dynam
     async execute(auditId, intent): Promise<DynamicExecutionResult> {
       const snapshot = targets.getSnapshot(auditId)?.snapshot;
       if (!snapshot) throw new Error("The audit has no scope snapshot");
+      assertReplayAuthorized(targets, snapshot);
       const policy: EgressPolicy = {
         baseUrl: snapshot.target.base_url,
         allowedHosts: snapshot.target.allowed_hosts,
@@ -100,7 +152,7 @@ export function createBrokerDynamicExecutor(config: Config, store: Store): Dynam
         authorizedActions: snapshot.authorization.authorized_actions,
         restrictions: snapshot.authorization.restrictions,
       };
-      const broker = new BrokerServer({ policy, credentials });
+      const broker = new BrokerServer({ policy, credentials, targetId: snapshot.target.id });
       const port = (await broker.start()).port;
       try {
         const target = new URL(intent.path, snapshot.target.base_url).toString();

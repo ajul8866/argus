@@ -15,7 +15,17 @@ export type PocManifest = {
   environment: { target: string; commit_sha?: string | null; identities: string[] };
 };
 
-export type PocExchange = { status: number; body: string };
+export type PocExchange = {
+  status: number;
+  body: string;
+  /**
+   * Redacted body for storage. Evaluation still uses `body`, so a control that
+   * asserts on a credential value is not changed by storage redaction.
+   */
+  evidenceBody?: string;
+  /** Set when the broker generated the response (scope, rate, upstream error). */
+  brokerError?: string | null;
+};
 
 export type PocRunResult = {
   status: "passed" | "failed" | "error";
@@ -85,7 +95,7 @@ export function validatePoc(manifest: PocManifest): void {
 }
 
 function checkResult(check: PocCheck, exchange: PocExchange | undefined): boolean {
-  if (!exchange) return false;
+  if (!exchange || exchange.brokerError) return false;
   const allowed = Array.isArray(check.expect.status) ? check.expect.status : [check.expect.status];
   if (!allowed.includes(exchange.status)) return false;
   if (check.expect.body_contains && !exchange.body.includes(check.expect.body_contains)) return false;
@@ -97,9 +107,18 @@ export function evaluateRun(
   exchanges: { positive?: PocExchange; exploit?: PocExchange; negative?: PocExchange },
 ): PocRunResult {
   validatePoc(manifest);
+  const brokerError = [exchanges.positive, exchanges.exploit, exchanges.negative]
+    .map((exchange) => exchange?.brokerError)
+    .find((error): error is string => Boolean(error));
   const positive = checkResult(manifest.checks.positive, exchanges.positive);
   const exploit = checkResult(manifest.checks.exploit, exchanges.exploit);
   const negative = checkResult(manifest.checks.negative, exchanges.negative);
+
+  // A broker-generated response means the controller never obtained a target
+  // verdict. Treat it as an error, never as evidence that a control failed.
+  if (brokerError) {
+    return { status: "error", positive, exploit, negative, reason: `broker error: ${brokerError}` };
+  }
 
   if (!positive) {
     return { status: "error", positive, exploit, negative, reason: "positive control failed" };

@@ -1,5 +1,6 @@
 import type { Store } from "../db/index.ts";
 import { badRequest, conflict, notFound, now, sha256, toJson, uid } from "../util.ts";
+import { KeyedSerialQueue } from "../concurrency.ts";
 import { redactSecrets } from "../security/redact.ts";
 import type { EvidenceStore } from "../orchestrator/evidence.ts";
 import { GraphStore } from "./graph.ts";
@@ -81,6 +82,13 @@ function redact(value: string): string {
   return redactSecrets(value).text;
 }
 
+/**
+ * Confirmation includes an awaited network replay. Serialize per candidate
+ * process-wide: the API constructs a DynamicProofService per request, so an
+ * instance field would not protect two simultaneous confirms.
+ */
+const confirmations = new KeyedSerialQueue();
+
 export class DynamicProofService {
   private readonly graph: GraphStore;
 
@@ -115,6 +123,15 @@ export class DynamicProofService {
     }
     if (!input.proposedBy?.trim()) throw badRequest("proposed_by is required");
     validatePoc(input.manifest);
+    const snapshot = new TargetService(this.store).getSnapshot(input.auditId)?.snapshot;
+    if (!snapshot) throw conflict("The audit has no scope snapshot");
+    const scopedIdentities = new Set(snapshot.identities.map((identity) => identity.id));
+    for (const name of ["positive", "exploit", "negative"] as const) {
+      const identityId = input.manifest.checks[name].identity;
+      if (!scopedIdentities.has(identityId)) {
+        throw badRequest(`${name}.identity is not registered in this audit scope`);
+      }
+    }
 
     let source: StoredProposal["source"] = null;
     let sourceVerified = false;
@@ -184,6 +201,10 @@ export class DynamicProofService {
    * through the broker and only then writes the finding and its evidence.
    */
   async confirm(candidateId: string, confirmedBy: string): Promise<ConfirmResult> {
+    return confirmations.run(candidateId, () => this.confirmInternal(candidateId, confirmedBy));
+  }
+
+  private async confirmInternal(candidateId: string, confirmedBy: string): Promise<ConfirmResult> {
     const row = this.store.get<CandidateRow>("SELECT * FROM candidates WHERE id = ?", candidateId);
     if (!row) throw notFound("Candidate not found");
     if (row.provenance !== "dynamic") throw badRequest("Only dynamic candidates are confirmed here");
@@ -202,13 +223,19 @@ export class DynamicProofService {
     );
     if (!audit) throw notFound("Audit not found");
 
-    this.store.run("UPDATE candidates SET status = 'confirming' WHERE id = ?", candidateId);
+    const claimed = this.store.changes(
+      "UPDATE candidates SET status = 'confirming' WHERE id = ? AND status IN ('discovered','confirming')",
+      candidateId,
+    );
+    if (claimed !== 1) {
+      throw conflict("Candidate is already being confirmed or was decided by another request");
+    }
 
     let replay: ProvenExchanges;
     try {
       replay = await this.replay(row.audit_id, proposal.manifest);
     } catch (error) {
-      this.store.run("UPDATE candidates SET status = 'inconclusive' WHERE id = ?", candidateId);
+      this.store.run("UPDATE candidates SET status = 'inconclusive' WHERE id = ? AND status = 'confirming'", candidateId);
       this.writeVerification(row, "INCONCLUSIVE", `The broker replay failed: ${String(error)}`, {}, confirmedBy);
       return {
         candidateId,
@@ -222,8 +249,14 @@ export class DynamicProofService {
 
     const run = evaluateRun(proposal.manifest, replay);
     if (run.status !== "passed") {
-      const verdict = run.positive ? "REFUTED" : "INCONCLUSIVE";
-      this.store.run("UPDATE candidates SET status = ? WHERE id = ?", run.positive ? "refuted" : "inconclusive", candidateId);
+      // A transport/broker error cannot refute a candidate: only a run whose
+      // positive control passed and whose exploit check failed can do that.
+      const verdict = run.status === "failed" && run.positive ? "REFUTED" : "INCONCLUSIVE";
+      this.store.run(
+        "UPDATE candidates SET status = ? WHERE id = ? AND status = 'confirming'",
+        verdict === "REFUTED" ? "refuted" : "inconclusive",
+        candidateId,
+      );
       this.writeVerification(row, verdict, `Replay verdict: ${run.reason ?? run.status}`, run, confirmedBy);
       return { candidateId, verdict, findingId: null, code: null, evidenceIds: [], run };
     }
@@ -241,7 +274,7 @@ export class DynamicProofService {
     confirmedBy: string,
   ): Promise<{ findingId: string; code: string; evidenceIds: string[] }> {
     const findingId = uid();
-    const code = this.nextCode(row.audit_id);
+    let code = "";
     const commit = audit.repository_id
       ? this.store.get<{ commit_sha: string | null }>(
           "SELECT commit_sha FROM repositories WHERE id = ?",
@@ -272,7 +305,7 @@ export class DynamicProofService {
           method: check.request.method,
           path: check.request.path,
           status: exchange.status,
-          body: redact(exchange.body),
+          body: redact(exchange.evidenceBody ?? exchange.body),
         },
         redacted: true,
       });
@@ -288,9 +321,9 @@ export class DynamicProofService {
         result: run,
         confirmed_by: confirmedBy,
         exchanges: {
-          positive: { status: replay.positive.status, body_sha256: sha256(replay.positive.body) },
-          exploit: { status: replay.exploit.status, body_sha256: sha256(replay.exploit.body) },
-          negative: { status: replay.negative.status, body_sha256: sha256(replay.negative.body) },
+          positive: { status: replay.positive.status, body_sha256: sha256(replay.positive.evidenceBody ?? replay.positive.body) },
+          exploit: { status: replay.exploit.status, body_sha256: sha256(replay.exploit.evidenceBody ?? replay.exploit.body) },
+          negative: { status: replay.negative.status, body_sha256: sha256(replay.negative.evidenceBody ?? replay.negative.body) },
         },
       },
       redacted: true,
@@ -315,6 +348,9 @@ export class DynamicProofService {
     const evidenceIds = [scriptEvidence.id, ...exchangeIds, proofEvidence.id];
 
     this.store.transaction(() => {
+      // Allocate the human-readable code inside the transaction so two
+      // confirmations for different candidates cannot choose the same code.
+      code = this.nextCode(row.audit_id);
       this.store.run(
         `INSERT INTO findings
          (id, code, audit_id, project_id, candidate_id, title, category, cwe, severity, status,
@@ -348,7 +384,12 @@ export class DynamicProofService {
         now(),
         now(),
       );
-      this.store.run("UPDATE candidates SET status = 'confirmed', finding_id = ? WHERE id = ?", findingId, row.id);
+      const updated = this.store.changes(
+        "UPDATE candidates SET status = 'confirmed', finding_id = ? WHERE id = ? AND status = 'confirming'",
+        findingId,
+        row.id,
+      );
+      if (updated !== 1) throw new Error("The candidate was not in a confirming state");
     });
 
     this.writeVerification(row, "CONFIRMED", "An independent replay passed all three PoC checks.", run, confirmedBy);

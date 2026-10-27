@@ -1254,6 +1254,13 @@ export class AuditEngine {
       const snapshot = this.targets.getSnapshot(finding.audit_id);
       if (!snapshot) throw new AppError(409, "scope_snapshot_missing", "The audit has no scope snapshot");
       const authorization = snapshot.snapshot.authorization;
+      if (!this.authorizationStillActive(snapshot.snapshot)) {
+        throw new AppError(
+          409,
+          "authorization_inactive",
+          "The target authorization is no longer active; a retest requires a current authorization",
+        );
+      }
       retestId = new RetestService(this.store, (input) =>
         this.replayPocForRetest(input.findingId, input.auditId),
       ).request({
@@ -1698,6 +1705,10 @@ export class AuditEngine {
     }
     if (task.kind === "phase5.reverify") {
       const payload = parseJson<Record<string, unknown>>(task.payload, {});
+      if (payload.dynamic_replay === true) {
+        await this.runDynamicReverifyTask(task, String(payload.finding_id ?? ""));
+        return;
+      }
       if (typeof payload.retest_id === "string") {
         await this.runRetestTask(task, payload.retest_id);
         return;
@@ -1724,6 +1735,28 @@ export class AuditEngine {
         type: "finding.retest_completed",
         payload: { retest_id: retestId, verdict },
       });
+    } catch (error) {
+      this.finishTaskFailure(task.id, "internal", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  /**
+   * Dynamic reverification performs network I/O. It runs as a claimed task so
+   * a slow or unreachable target cannot stall the global scheduler tick.
+   */
+  private async runDynamicReverifyTask(task: TaskRow, findingId: string): Promise<void> {
+    try {
+      if (this.cancelIfAuditClosed(task, "Audit was cancelled before dynamic reverification")) return;
+      const finding = this.store.get<FindingRow>("SELECT * FROM findings WHERE id = ?", findingId);
+      if (!finding || finding.audit_id !== task.audit_id) {
+        throw new Error("Finding not found for dynamic reverification");
+      }
+      await this.reverifyDynamicFinding(finding);
+      if (!this.auditIsRunning(task.audit_id)) {
+        this.finishTaskFailure(task.id, "cancelled", "Audit was cancelled while the PoC was being replayed");
+        return;
+      }
+      this.completeTask(task.id, { finding_id: findingId });
     } catch (error) {
       this.finishTaskFailure(task.id, "internal", error instanceof Error ? error.message : String(error));
     }
@@ -2929,9 +2962,17 @@ export class AuditEngine {
       .map((entry) => {
         const [path, start, end] = entry.split(":");
         return { path: path!, start_line: Number(start), end_line: Number(end) };
-      });
+      })
+      .sort((left, right) =>
+        left.path.localeCompare(right.path) ||
+        left.start_line - right.start_line ||
+        left.end_line - right.end_line,
+      );
+    // Deduplicate only when the title, category, and exact affected locations
+    // all match. Title equality alone would drop a separate issue that happens
+    // to share a generic title in a different file.
     const existing = this.store.get<FindingRow>(
-      `SELECT * FROM findings WHERE audit_id = ? AND (title = ? OR (category = ? AND files = ?)) LIMIT 1`,
+      `SELECT * FROM findings WHERE audit_id = ? AND title = ? AND category = ? AND files = ? LIMIT 1`,
       task.audit_id,
       candidate.title,
       candidate.category,
@@ -3226,6 +3267,12 @@ export class AuditEngine {
     await this.reconcile(auditId);
   }
 
+  /** Test seam: claim and run queued work for one audit without the clock. */
+  async runScheduledForTest(auditId: string): Promise<void> {
+    this.schedule(auditId);
+    await Promise.allSettled([...this.taskRuns.values()]);
+  }
+
   /**
    * The snapshot is immutable, but the authorization it captured can be
    * revoked or expire at any time. Every execution re-checks the live record.
@@ -3277,7 +3324,11 @@ export class AuditEngine {
         positivePassed: run.positive,
         exploitPassed: run.exploit,
         evidenceRefs: [proof.id],
-        ...(run.status === "error" ? { error: run.reason ?? "positive control failed" } : {}),
+        // A failed negative control means the environment or identity model is
+        // inconsistent; a missing exploit response is not evidence of a fix.
+        ...(run.status === "error" || !run.negative
+          ? { error: run.reason ?? "control check did not establish a trustworthy environment" }
+          : {}),
       };
     } catch (error) {
       return {
@@ -3590,7 +3641,17 @@ export class AuditEngine {
           }
           const isDynamic = this.isDynamicFinding(finding);
           if (isDynamic) {
-            await this.reverifyDynamicFinding(finding);
+            this.createTask({
+              auditId,
+              phase: 5,
+              kind: "phase5.reverify",
+              taskKey: `phase5:finding:${finding.id}`,
+              title: `Phase 5 — Replay dynamic PoC for ${finding.code}`,
+              payload: { finding_id: finding.id, dynamic_replay: true },
+              agentRole: null,
+              priority: 40,
+            });
+            canonicalRetests += 1;
             continue;
           }
           this.createTask({

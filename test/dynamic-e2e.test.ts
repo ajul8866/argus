@@ -409,6 +409,11 @@ describe("dynamic IDOR proof", () => {
 
     await engine.runExplorationStep("a1");
 
+    // Dynamic reverification now runs as a claimed phase-5 task so a slow
+    // target cannot stall the scheduler tick. Drive the scheduler directly
+    // instead of waiting on its 1.5 s clock.
+    await engine.runScheduledForTest("a1");
+
     const candidate = store.get<{ status: string; provenance: string; finding_id: string }>(
       "SELECT status, provenance, finding_id FROM candidates WHERE audit_id = 'a1'",
     )!;

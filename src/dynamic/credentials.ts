@@ -34,12 +34,15 @@ export class CredentialBroker {
     private readonly store: Store,
   ) {}
 
-  inject(identityId: string): Record<string, string> {
+  inject(identityId: string, expectedTargetId?: string): Record<string, string> {
     const identity = this.store.get<IdentityRow>(
       "SELECT id, target_id, role, auth_kind, secret_ref, status FROM test_identities WHERE id = ?",
       identityId,
     );
     if (!identity) throw new AppError(404, "identity_not_found", "Test identity not found");
+    if (expectedTargetId && identity.target_id !== expectedTargetId) {
+      throw new AppError(403, "identity_target_mismatch", "Test identity belongs to another target");
+    }
     if (identity.status !== "active") {
       throw new AppError(409, "identity_unavailable", "Test identity is not active");
     }
@@ -65,6 +68,32 @@ export class CredentialBroker {
       default:
         return {};
     }
+  }
+
+  /**
+   * Decrypted secrets for the identities a replay is allowed to use. Used to
+   * remove known credential values from recorded exchanges before storage.
+   */
+  secretValues(identityIds: string[]): string[] {
+    const values = new Set<string>();
+    for (const identityId of identityIds) {
+      const identity = this.store.get<IdentityRow>(
+        "SELECT id, target_id, role, auth_kind, secret_ref, status FROM test_identities WHERE id = ?",
+        identityId,
+      );
+      if (!identity || identity.auth_kind === "none" || !identity.secret_ref) continue;
+      const credential = this.store.get<StoredCredential>(
+        "SELECT * FROM provider_credentials WHERE provider = 'test-identity' AND env_var = ?",
+        identity.secret_ref,
+      );
+      if (!credential) continue;
+      try {
+        values.add(decryptSecret(this.config, credential));
+      } catch {
+        // A corrupt credential is reported when the broker injects it.
+      }
+    }
+    return [...values];
   }
 
   redactExchange(headers: Record<string, string>, body: string, secrets: string[] = []): RedactedExchange {

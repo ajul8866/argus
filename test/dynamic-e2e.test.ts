@@ -377,7 +377,7 @@ describe("dynamic IDOR proof", () => {
       },
       async execute(_auditId, intent) {
         const exploit = await proxyRequest(brokerPort, `${baseUrl}/api/invoices/inv-1`, identityA.id);
-        const result = await proof.record({
+        const proposed = await proof.propose({
           auditId: "a1",
           assetId: asset.id,
           title: "Cross-tenant invoice read",
@@ -386,6 +386,7 @@ describe("dynamic IDOR proof", () => {
           manifest,
           script: `# Reproduces the cross-tenant invoice read\nrequests.get("${baseUrl}/api/invoices/inv-1", headers={"authorization": "Bearer <user_a>"})`,
           intentNodeId: intent.nodeId,
+          proposedBy: "worker-1",
           source: {
             path: "src/routes/invoices.js",
             start_line: 11,
@@ -393,7 +394,10 @@ describe("dynamic IDOR proof", () => {
             quote: "router.get(\"/:id\", (request, response) => {\n  const invoice = findInvoiceById(request.params.id);",
           },
         });
-        expect(result.run.status).toBe("passed");
+        expect(proposed.sourceVerified).toBe(true);
+        const confirmed = await proof.confirm(proposed.candidateId, "validator-1");
+        expect(confirmed.verdict).toBe("CONFIRMED");
+        expect(confirmed.run.status).toBe("passed");
         return { costUsd: 0.01, facts: [{ status: exploit.status, assetIds: [asset.id], summary: "cross-tenant read" }] };
       },
     };

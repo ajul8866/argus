@@ -42,6 +42,8 @@ import { LocalCatalog } from "../local/catalog.ts";
 import { localResourceRoutes } from "./local-resources.ts";
 import { TargetService, type AuthorizedActions, type Restrictions } from "../dynamic/targets.ts";
 import { GraphStore } from "../dynamic/graph.ts";
+import { runPocChecks } from "../dynamic/executor.ts";
+import { DynamicProofService } from "../dynamic/proof.ts";
 import { TokenService } from "../auth/tokens.ts";
 
 type ApiDeps = {
@@ -953,8 +955,80 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         }
       }
 
+      const auditCandidatesMatch = path.match(/^\/api\/audits\/([^/]+)\/candidates$/);
+      if (auditCandidatesMatch) {
+        const auditId = auditCandidatesMatch[1]!;
+        const audit = deps.store.get<{ id: string; project_id: string; mode: string; status: string }>(
+          "SELECT id, project_id, mode, status FROM audits WHERE id = ?",
+          auditId,
+        );
+        if (!audit) throw notFound("Audit not found");
+        if (audit.mode === "static") throw conflict("Static audits do not accept dynamic candidates");
+        if (audit.status !== "running") throw conflict("Candidates can be proposed only while the audit is running");
+        requireScope("audit:propose_candidate");
+        requireAuditScope(auditId);
+        requireProjectScope(audit.project_id);
+        const current = requireRole("auditor");
+        if (method !== "POST") throw badRequest("Use POST to propose a dynamic candidate");
+        const body = await readJson(request);
+        const manifest = body.manifest;
+        if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
+          throw badRequest("manifest must be an object");
+        }
+        const service = new DynamicProofService(deps.store, deps.evidence, (id, poc) =>
+          runPocChecks(deps.config, deps.store, id, poc),
+        );
+        const proposed = await service.propose({
+          auditId,
+          assetId: requireString(body, "asset_id", 100),
+          title: requireString(body, "title", 300),
+          category: requireString(body, "category", 100),
+          severity: requireString(body, "severity", 20) as never,
+          manifest: manifest as never,
+          script: requireString(body, "script", 100_000),
+          impact: optionalString(body, "impact", 2_000) ?? undefined,
+          remediation: optionalString(body, "remediation", 2_000) ?? undefined,
+          intentNodeId: optionalString(body, "intent_node_id", 100),
+          source: (body.source ?? null) as never,
+          proposedBy: optionalString(body, "proposed_by", 200) ?? current.id,
+        });
+        deps.auth.logAction(current.email, "candidate.proposed", proposed.candidateId, { audit_id: auditId }, ip);
+        return json(proposed, 201);
+      }
+
+      const candidateConfirmMatch = path.match(/^\/api\/candidates\/([^/]+)\/confirm$/);
+      if (candidateConfirmMatch && method === "POST") {
+        const current = requireRole("auditor");
+        requireScope("audit:confirm_candidate");
+        const candidate = deps.store.get<{ audit_id: string }>(
+          "SELECT audit_id FROM candidates WHERE id = ?",
+          candidateConfirmMatch[1]!,
+        );
+        if (!candidate) throw notFound("Candidate not found");
+        const audit = deps.store.get<{ project_id: string }>(
+          "SELECT project_id FROM audits WHERE id = ?",
+          candidate.audit_id,
+        );
+        requireAuditScope(candidate.audit_id);
+        if (audit) requireProjectScope(audit.project_id);
+        const body = request.body === null ? {} : await readJson(request);
+        const service = new DynamicProofService(deps.store, deps.evidence, (id, poc) =>
+          runPocChecks(deps.config, deps.store, id, poc),
+        );
+        const result = await service.confirm(
+          candidateConfirmMatch[1]!,
+          optionalString(body, "confirmed_by", 200) ?? current.id,
+        );
+        deps.auth.logAction(current.email, `candidate.${result.verdict.toLowerCase()}`, result.candidateId, {
+          audit_id: candidate.audit_id,
+          finding_id: result.findingId,
+        }, ip);
+        return json(result);
+      }
+
       if (path === "/api/findings" && method === "GET") {
         requireUser();
+        requireScope("finding:read");
         const auditId = url.searchParams.get("audit_id");
         const status = url.searchParams.get("status");
         const clauses: string[] = [];

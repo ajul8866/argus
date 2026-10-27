@@ -629,4 +629,39 @@ CREATE INDEX idx_retests_finding ON retests(finding_id, created_at);
 ALTER TABLE audits ADD COLUMN exploration_cost_usd REAL NOT NULL DEFAULT 0;
 `,
   },
+  {
+    version: 11,
+    name: "dynamic_candidates",
+    foreignKeysOff: true,
+    sql: `
+CREATE TABLE candidates_new (
+  id TEXT PRIMARY KEY,
+  audit_id TEXT NOT NULL REFERENCES audits(id) ON DELETE CASCADE,
+  area_id TEXT,
+  discovery_task_id TEXT REFERENCES tasks(id),
+  discovery_session_id TEXT REFERENCES agent_sessions(id),
+  title TEXT NOT NULL,
+  category TEXT NOT NULL,
+  cwe TEXT,
+  severity TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('discovered','confirming','confirmed','refuted','inconclusive','duplicate','persisted')),
+  finding_id TEXT,
+  provenance TEXT NOT NULL DEFAULT 'static' CHECK (provenance IN ('static','dynamic','hybrid')),
+  link_key TEXT,
+  payload TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+INSERT INTO candidates_new
+  (id, audit_id, area_id, discovery_task_id, discovery_session_id, title, category, cwe, severity,
+   status, finding_id, provenance, link_key, payload, created_at)
+SELECT id, audit_id, area_id, discovery_task_id, discovery_session_id, title, category, cwe, severity,
+       status, finding_id, 'static', NULL, payload, created_at
+FROM candidates;
+DROP TABLE candidates;
+ALTER TABLE candidates_new RENAME TO candidates;
+CREATE INDEX idx_candidates_audit ON candidates(audit_id);
+CREATE INDEX idx_candidates_status ON candidates(status);
+CREATE INDEX idx_candidates_link ON candidates(audit_id, link_key);
+`,
+  },
 ];

@@ -15,6 +15,12 @@ export const REPORT_FORMATS: ReportFormat[] = ["markdown", "json", "html", "pdf"
 
 type ReportData = NonNullable<Awaited<ReturnType<ReportService["loadData"]>>>;
 
+type DynamicProof = {
+  manifest?: { object?: { object_id?: string; owner_identity?: string } };
+  result?: { status?: string; positive?: boolean; exploit?: boolean; negative?: boolean };
+  exchanges?: Record<string, { status?: number }>;
+};
+
 export class ReportService {
   constructor(
     private readonly config: Config,
@@ -72,7 +78,7 @@ export class ReportService {
         JSON.stringify({
           actor,
           findings: data.findings.length,
-          verified: data.findings.filter((finding) => finding.status === "reverified").length,
+          verified: data.findings.filter((finding) => this.isVerifiedFinding(data, finding)).length,
           chain_ok: data.chain.ok,
         }),
         now(),
@@ -253,6 +259,22 @@ export class ReportService {
         if (!(error instanceof AppError)) throw error;
       }
     }
+    const dynamicByFinding: Record<string, { proof: DynamicProof | null; evidence_ids: string[] }> = {};
+    for (const row of evidenceRows) {
+      if (!row.finding_id) continue;
+      if (!["poc_script", "http_exchange", "dynamic_proof"].includes(row.kind)) continue;
+      const entry = dynamicByFinding[row.finding_id] ?? { proof: null, evidence_ids: [] };
+      entry.evidence_ids.push(row.id);
+      if (row.kind === "dynamic_proof" && entry.proof === null) {
+        try {
+          const verified = await this.evidence.content(row.id);
+          if (verified) entry.proof = JSON.parse(verified.content) as DynamicProof;
+        } catch (error) {
+          if (!(error instanceof AppError)) throw error;
+        }
+      }
+      dynamicByFinding[row.finding_id] = entry;
+    }
     const verifications = this.store.all<{
       id: string;
       kind: string;
@@ -381,6 +403,7 @@ export class ReportService {
       })),
       evidence: evidenceRows,
       evidence_by_finding: groupEvidenceByFinding(evidenceRows),
+      dynamic_by_finding: dynamicByFinding,
       excerpts_by_finding: excerptsByFinding,
       verifications: verifications.map((row) => ({ ...row, evidence_check: parseJson<Record<string, unknown>>(row.evidence_check, {}) })),
       tasks: displayTasks,
@@ -395,9 +418,16 @@ export class ReportService {
     };
   }
 
+  private isVerifiedFinding(data: ReportData, finding: { id: string; status: string }): boolean {
+    return (
+      finding.status === "reverified" ||
+      (finding.status === "confirmed" && Boolean(data.dynamic_by_finding[finding.id]?.proof))
+    );
+  }
+
   private renderJson(rawData: ReportData): string {
     const data = redactObject(rawData);
-    const verified = data.findings.filter((finding) => finding.status === "reverified");
+    const verified = data.findings.filter((finding) => this.isVerifiedFinding(data, finding));
     const unresolved = data.findings.filter((finding) =>
       ["confirmed", "needs_correction", "unresolved"].includes(finding.status),
     );
@@ -452,6 +482,7 @@ export class ReportService {
         findings: data.findings.map((finding) => ({
           ...finding,
           verified_excerpts: data.excerpts_by_finding[finding.id] ?? [],
+          dynamic_proof: data.dynamic_by_finding[finding.id]?.proof ?? null,
         })),
         verifications: data.verifications,
         evidence: data.evidence.map((row) => ({
@@ -466,6 +497,7 @@ export class ReportService {
           created_at: row.created_at,
         })),
         evidence_chain: data.chain,
+        dynamic_evidence: data.dynamic_by_finding,
         tasks: data.tasks.map((task) => ({ ...task, result: task.result ? "[stored]" : null })),
         agent_sessions: data.sessions,
         reports: data.reports,
@@ -478,8 +510,8 @@ export class ReportService {
 
   private limitations(data: ReportData): string[] {
     const limitations = [
-      "This assessment is source-code analysis. No live system was contacted and no exploit was executed unless a finding explicitly states otherwise.",
-      "Agent output is treated as untrusted; only findings that passed the platform evidence gate and independent reverification are presented as verified.",
+      "This assessment is source-code analysis unless a finding carries dynamic evidence, in which case the listed exchanges were executed against the authorized target.",
+      "Agent output is treated as untrusted; only findings that passed the platform evidence gate and independent reverification, or a passed dynamic PoC with positive and negative controls, are presented as verified.",
       "Coverage is bounded by the authorized scope, model context, and configured limits. Completion of scheduled tasks does not prove exhaustive vulnerability discovery.",
       "LLM-based analysis can miss issues, misinterpret framework behavior, or produce incorrect remediation advice. Human review is required before remediation or disclosure.",
     ];
@@ -496,7 +528,7 @@ export class ReportService {
   }
 
   private renderMarkdown(data: ReportData): string {
-    const verified = data.findings.filter((finding) => finding.status === "reverified");
+    const verified = data.findings.filter((finding) => this.isVerifiedFinding(data, finding));
     const unresolved = data.findings.filter((finding) => ["confirmed", "needs_correction", "unresolved"].includes(finding.status));
     const rejected = data.findings.filter((finding) => finding.status === "rejected");
     const severityOrder = { critical: 0, high: 1, medium: 2, low: 3, info: 4 } as const;
@@ -517,7 +549,7 @@ export class ReportService {
     lines.push("");
     lines.push("## Executive summary");
     lines.push("");
-    lines.push(`Argus performed a six-phase autonomous source-code security audit of **${data.project.name}** across ${data.repository.file_count} in-scope files. The workflow used independent agent sessions and required every verified finding to pass an exact-source evidence check plus an independent retest.`);
+    lines.push(`Argus performed an autonomous security audit of **${data.project.name}** across ${data.repository.file_count} in-scope files. The workflow used independent agent sessions and required every verified finding to pass either an exact-source evidence check plus an independent retest, or a reproducible dynamic PoC with positive and negative controls.`);
     lines.push("");
     lines.push(`- **Verified findings:** ${verified.length}${verified.length ? ` (${Object.entries(counts).map(([severity, count]) => `${count} ${severity}`).join(", ")})` : ""}`);
     lines.push(`- **Unresolved / awaiting retest:** ${unresolved.length}`);
@@ -643,6 +675,20 @@ export class ReportService {
       lines.push("");
       lines.push(finding.remediation);
       lines.push("");
+      const dynamic = data.dynamic_by_finding[finding.id];
+      if (dynamic?.proof) {
+        const proof = dynamic.proof;
+        lines.push("**Dynamic evidence**");
+        lines.push("");
+        for (const name of ["positive", "exploit", "negative"] as const) {
+          lines.push(`- ${name} check: HTTP ${proof.exchanges?.[name]?.status ?? "n/a"}`);
+        }
+        lines.push(`- PoC result: ${proof.result?.status ?? "unknown"}`);
+        lines.push(
+          `- Object: ${proof.manifest?.object?.object_id ?? "n/a"} owned by ${proof.manifest?.object?.owner_identity ?? "n/a"}`,
+        );
+        lines.push("");
+      }
       const evidence = data.evidence_by_finding[finding.id] ?? [];
       if (evidence.length > 0) {
         lines.push("**Evidence index**");

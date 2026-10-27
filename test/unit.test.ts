@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { stat } from "node:fs/promises";
+import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Config } from "../src/config.ts";
@@ -600,6 +600,63 @@ describe("evidence chain", () => {
     expect(Bun.file(row.content_path).size - row.size).toBeGreaterThan(1_000_000);
     expect((await evidence.content(row.id))?.content).toBe(content);
     expect((await evidence.verifyChain("a1")).ok).toBe(true);
+  });
+
+  test("evidence content reads only the size it checked when the sidecar grows", async () => {
+    const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "one", content: "alpha" });
+    const before = (await stat(row.content_path)).size;
+    const probe = await open(row.content_path, "r");
+    const proto = Object.getPrototypeOf(probe) as {
+      stat: (this: unknown, ...args: unknown[]) => Promise<{ isFile: () => boolean; size: number }>;
+      read: (
+        this: unknown,
+        buffer: Buffer,
+        offset?: number,
+        length?: number,
+        position?: number | null,
+      ) => Promise<{ bytesRead: number }>;
+      readFile: (this: unknown, ...args: unknown[]) => Promise<unknown>;
+    };
+    await probe.close();
+    const originalStat = proto.stat;
+    const originalRead = proto.read;
+    const originalReadFile = proto.readFile;
+    let readFileCalls = 0;
+    let bytesRequested = 0;
+    proto.stat = async function (this: unknown, ...args: unknown[]) {
+      const info = await originalStat.apply(this, args);
+      const size = info.size;
+      const file = info.isFile();
+      if (file && size === before) writeFileSync(row.content_path, "Q".repeat(1024 * 1024));
+      return { isFile: () => file, size };
+    };
+    proto.read = async function (
+      this: unknown,
+      buffer: Buffer,
+      offset?: number,
+      length?: number,
+      position?: number | null,
+    ) {
+      if (length === undefined || length > before) {
+        throw new Error(`unbounded evidence read of ${String(length)} bytes`);
+      }
+      bytesRequested += length;
+      return originalRead.call(this, buffer, offset, length, position);
+    };
+    proto.readFile = async function (this: unknown, ...args: unknown[]) {
+      readFileCalls += 1;
+      return originalReadFile.apply(this, args);
+    };
+    try {
+      await expect(evidence.content(row.id)).rejects.toMatchObject({ status: 409, code: "conflict" });
+      expect(readFileCalls).toBe(0);
+      expect(bytesRequested).toBeGreaterThan(0);
+      expect(bytesRequested).toBeLessThanOrEqual(before);
+    } finally {
+      proto.stat = originalStat;
+      proto.read = originalRead;
+      proto.readFile = originalReadFile;
+    }
   });
 
   test("evidence content rejects a sidecar larger than the recorded content can encode", async () => {

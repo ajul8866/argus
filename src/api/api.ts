@@ -1321,11 +1321,19 @@ async function readRegularFile(path: string, expectedSize: number): Promise<Uint
     if (info.size !== expectedSize) {
       throw conflict("Report integrity check failed; the stored file does not match its recorded size");
     }
-    const bytes = new Uint8Array(await handle.readFile());
-    if (bytes.byteLength !== expectedSize) {
+    // Cap the read at the size just observed. readFile() stats again and would
+    // load a file that grew past the bound after this check.
+    const buffer = Buffer.alloc(expectedSize);
+    let offset = 0;
+    while (offset < expectedSize) {
+      const { bytesRead } = await handle.read(buffer, offset, expectedSize - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset !== expectedSize) {
       throw conflict("Report integrity check failed; the stored file does not match its recorded size");
     }
-    return bytes;
+    return new Uint8Array(buffer);
   } catch (error) {
     if (error instanceof AppError) throw error;
     if (fsErrorCode(error) === "ENOENT") throw notFound("Report file is not available");

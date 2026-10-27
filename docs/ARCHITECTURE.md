@@ -228,6 +228,10 @@ operation, preserving include/exclude short-circuit behavior.
    archive, including `config.worktree`, sparse-checkout, and a config include
    wherever Git would start that section, is rejected before Git starts. The
    or a symlink in the object store is rejected, and `GIT_*` variables are not
+   passed through. The archive itself runs from a separate repository that
+   unsets the `filter` attribute, so a configured smudge or process filter
+   cannot read or rewrite the snapshot. A subdirectory archives only its own
+   tree. The inventory is then rebuilt from the snapshot.
    passed through. The archive reads that git directory's object store through
    a new Git directory with the same object format, including SHA-256.
    Repository, system, and global filter commands are not used, and system and

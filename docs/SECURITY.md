@@ -47,6 +47,10 @@ LLM agents. Use it only on repositories you are authorized to assess.
   symlink or gitfile, a Git common directory other than that Git directory, an
   alternate object database, a symlink inside the object store, and `GIT_*`
   environment variables are rejected or ignored, so a ref import cannot copy
+  commits stored outside that work tree. The archive uses a separate Git
+  repository that can read that object store but not the source repository's
+  config, and it unsets the `filter` attribute, so a smudge or process filter
+  cannot read or rewrite the snapshot. A subdirectory of a repository
   commits stored outside that work tree. The archive is produced from that
   object store through a new Git directory. That directory uses the pinned
   repository's object format, including SHA-256, and replaces repository,

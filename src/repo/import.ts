@@ -965,6 +965,7 @@ async function assertContainedObjectStore(gitDir: string): Promise<void> {
 // when that discovered metadata is the work tree containing this source path,
 // and the object store does not point at another repository. subpath is the
 // directory to archive when the source sits below the work tree root.
+async function prepareRefArchive(sourceRoot: string): Promise<{ gitDir: string; subpath: string | null }> {
 async function prepareRefArchive(sourceRoot: string): Promise<{ subpath: string | null; gitDir: string }> {
   const gitPath = join(sourceRoot, ".git");
   let localGit;
@@ -1017,6 +1018,7 @@ async function prepareRefArchive(sourceRoot: string): Promise<{ subpath: string 
   if (pinnedCommon !== pinnedGit) throw invalidGitMetadata();
   await assertContainedObjectStore(pinnedGit);
   const relativePath = relative(pinnedTop, sourceRoot);
+  if (!relativePath) return { gitDir: pinnedGit, subpath: null };
   if (!relativePath) return { subpath: null, gitDir: pinnedGit };
   if (
     relativePath.startsWith("..") ||
@@ -1025,6 +1027,23 @@ async function prepareRefArchive(sourceRoot: string): Promise<{ subpath: string 
   ) {
     throw invalidGitMetadata();
   }
+  return { gitDir: pinnedGit, subpath: relativePath.split(sep).join("/") };
+}
+
+// `git archive` runs smudge and process filters named by the committed
+// attributes. Those commands come from Git config and can read files outside
+// the repository. Archive through a new repository that only shares the object
+// store already checked above, and unset filter so a global or system Git
+// config cannot supply the command either.
+async function archiveSanitizedCommit(
+  repoPath: string,
+  gitDir: string,
+  treeish: string,
+  archivePath: string,
+  env: Record<string, string>,
+): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> {
+  const objects = join(gitDir, "objects");
+  if (objects.includes("\n") || objects.includes("\0")) throw invalidGitMetadata();
   return { subpath: relativePath.split(sep).join("/"), gitDir: pinnedGit };
 }
 
@@ -1058,6 +1077,20 @@ async function archivePinnedCommit(
     ["git", "--git-dir", gitDir, "rev-parse", "--show-object-format"],
     { env, timeoutMs: 20_000 },
   );
+  const objectFormat = format.code === 0 && !format.timedOut && format.stdout.trim() === "sha256" ? "sha256" : "sha1";
+  const initArgs = ["git", "init", "-q", "--template="];
+  if (objectFormat === "sha256") initArgs.push("--object-format=sha256");
+  initArgs.push(repoPath);
+  const init = await runCommand(initArgs, { env, timeoutMs: 20_000 });
+  if (init.code !== 0 || init.timedOut) {
+    throw badRequest(`Failed to prepare the git archive: ${init.stderr.slice(0, 500)}`);
+  }
+  await mkdir(join(repoPath, ".git", "info"), { recursive: true, mode: 0o700 });
+  await mkdir(join(repoPath, ".git", "objects", "info"), { recursive: true, mode: 0o700 });
+  await writeFile(join(repoPath, ".git", "info", "attributes"), "* -filter\n", { mode: 0o600 });
+  await writeFile(join(repoPath, ".git", "objects", "info", "alternates"), `${objects}\n`, { mode: 0o600 });
+  return runCommand(
+    ["git", "-C", repoPath, "archive", "--format=tar", "--output", archivePath, treeish],
   if (format.timedOut) throw badRequest("Failed to read the git object format");
   // Any other answer keeps the historical SHA-1 Git directory. A SHA-256
   // repository then fails the archive instead of being read as SHA-1.
@@ -1133,6 +1166,12 @@ export async function importRepository(
       const archivePath = join(staging, "snapshot.tar");
       const extractedRoot = join(staging, "source");
       await mkdir(extractedRoot, { mode: 0o700 });
+      const archived = await archiveSanitizedCommit(
+        join(staging, "archive-repo"),
+        refArchive.gitDir,
+        treeish,
+        archivePath,
+        env,
       const archived = await archivePinnedCommit(refArchive.gitDir, treeish, archivePath, staging);
       const archived = await runCommand(
         gitArgv(["-C", refArchive?.toplevel ?? sourceRoot, "archive", "--format=tar", "--output", archivePath, treeish]),

@@ -130,7 +130,9 @@ DELETE are blocked by triggers.
 
 Code (`ARG-001`), audit/project/candidate, title, category, CWE, severity,
 status `confirmed|reverified|rejected|needs_correction|unresolved`, commit,
-files JSON, root cause, preconditions JSON, reproduction JSON, expected,
+files JSON (`path`, `start_line`, and `end_line` stored separately, so a
+repository-relative path that contains `:` is kept in full), root cause,
+preconditions JSON, reproduction JSON, expected,
 observed, impact, remediation, discovery/verification/retest session ids,
 decisions, timestamps. Provenance columns are immutable by trigger; retest
 session may be set once but never changed.

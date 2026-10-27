@@ -34,7 +34,7 @@ function withinRoots(path: string, roots: string[]): boolean {
 
 export async function listRepositoryFolders(
   allowedRoots: string[],
-  options: { path?: string; search?: string; offset?: string } = {},
+  options: { path?: string; search?: string; offset?: string; dataDir?: string } = {},
 ): Promise<RepositoryFolders> {
   if ((options.path?.length ?? 0) > 2_000 || options.path?.includes("\0")) throw badRequest("Invalid folder path");
   if ((options.search?.length ?? 0) > 200) throw badRequest("Folder search exceeds 200 characters");
@@ -44,7 +44,7 @@ export async function listRepositoryFolders(
   const home = detectRepositoryRoots([homedir()])[0];
   const initial = home && withinRoots(home, roots) ? home : roots[0];
   if (!initial) throw new AppError(400, "folders_unavailable", "No readable repository folders were found on this host");
-  const path = await assertAuthorizedRoot(resolve(options.path || initial), roots);
+  const path = await assertAuthorizedRoot(resolve(options.path || initial), roots, options.dataDir);
   let entries;
   try {
     entries = await readdir(path, { withFileTypes: true });

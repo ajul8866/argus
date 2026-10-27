@@ -297,10 +297,21 @@ function isCurrentWorktreeRef(name: string): boolean {
   return true;
 }
 
-// Read one loose ref without following a symref. Missing files are resolved
-// from a linked worktree's common directory. A pipe or symlink is rejected.
+// Git reads `main-worktree/<ref>` from the common directory only when `<ref>`
+// is a pseudoref or a per-worktree namespace. Any other remainder is a literal
+// shared ref, so the prefix stays part of that path.
+function mainWorktreeBareRef(refName: string): string | null {
+  const prefix = "main-worktree/";
+  if (!refName.startsWith(prefix)) return null;
+  const bare = refName.slice(prefix.length);
+  return isCurrentWorktreeRef(bare) ? bare : null;
+}
+
+// Read one loose ref without following a symref. A pipe or symlink is rejected.
+// The caller passes the git directory Git uses for this hop. A main-worktree
+// prefix on a pseudoref or per-worktree ref names the file in that directory.
 async function readLooseRefLine(gitDir: string, refName: string): Promise<string | null> {
-  const parts = gitRefParts(refName);
+  const parts = gitRefParts(mainWorktreeBareRef(refName) ?? refName);
   let current = gitDir;
   for (let index = 0; index < parts.length; index += 1) {
     const part = parts[index];

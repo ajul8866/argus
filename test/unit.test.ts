@@ -1392,6 +1392,157 @@ describe("repository import", () => {
     expect(await attempt("p-linked-worktree-ref", linkedWorktree, "HEAD")).toBe("invalid_repository");
   });
 
+  test("import does not wait on a pipe in a loose ref, pseudoref, or worktree", async () => {
+    const gitEnv = {
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      GIT_AUTHOR_NAME: "Tester",
+      GIT_AUTHOR_EMAIL: "tester@example.com",
+      GIT_COMMITTER_NAME: "Tester",
+      GIT_COMMITTER_EMAIL: "tester@example.com",
+    };
+    const git = (cwd: string, args: string[]): void => {
+      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+        env: gitEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+    };
+    const fifo = (path: string): void => {
+      expect(Bun.spawnSync(["mkfifo", path]).exitCode).toBe(0);
+    };
+    const prepare = (name: string): string => {
+      const source = join(dir, name);
+      mkdirSync(source);
+      git(source, ["init", "-q"]);
+      writeFileSync(join(source, "a.js"), "LOCAL_ONLY\n");
+      git(source, ["add", "a.js"]);
+      git(source, ["commit", "-qm", "local"]);
+      return source;
+    };
+    const insert = (id: string, source: string): void => {
+      store.run(
+        `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+         VALUES (?, ?, '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+        id, id, source, JSON.stringify(["**/*.js"]),
+      );
+    };
+    const projectFor = (id: string, source: string) => ({
+      id,
+      source_path: source,
+      scope_include: JSON.stringify(["**/*.js"]),
+      scope_exclude: "[]",
+    });
+    const attempt = async (id: string, source: string, ref: string | null): Promise<string> => {
+      return Promise.race([
+        importRepository({ config, store }, projectFor(id, source), ref, "tester")
+          .then(() => "imported")
+          .catch((error: { code?: string }) => error.code ?? "error"),
+        Bun.sleep(800).then(() => "blocked"),
+      ]);
+    };
+
+    const side = prepare("ref-fifo");
+    fifo(join(side, ".git", "refs", "heads", "side"));
+    insert("p-ref-fifo", side);
+
+    const linked = prepare("ref-link-fifo");
+    const linkedFifo = join(dir, "ref-link.fifo");
+    fifo(linkedFifo);
+    symlinkSync(linkedFifo, join(linked, ".git", "refs", "heads", "side"));
+    insert("p-ref-link-fifo", linked);
+
+    const worktree = prepare("worktree-fifo");
+    mkdirSync(join(worktree, ".git", "worktrees", "evil"), { recursive: true });
+    fifo(join(worktree, ".git", "worktrees", "evil", "HEAD"));
+    insert("p-worktree-fifo", worktree);
+
+    const pseudo = prepare("pseudo-fifo");
+    fifo(join(pseudo, ".git", "FETCH_HEAD"));
+    insert("p-pseudo-fifo", pseudo);
+
+    for (const [id, source, ref] of [
+      ["p-ref-fifo", side, "side"],
+      ["p-ref-link-fifo", linked, "side"],
+      ["p-worktree-fifo", worktree, "worktrees/evil/HEAD"],
+      ["p-pseudo-fifo", pseudo, "FETCH_HEAD"],
+    ] as const) {
+      expect(await attempt(id, source, ref)).toBe("invalid_repository");
+    }
+    expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories WHERE project_id IN ('p-ref-fifo', 'p-ref-link-fifo', 'p-worktree-fifo', 'p-pseudo-fifo')")?.count).toBe(0);
+
+    const healthy = prepare("ref-healthy");
+    const trunk = Bun.spawnSync(["git", "-C", healthy, "branch", "--show-current"], {
+      env: gitEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    }).stdout.toString().trim();
+    expect(trunk.length).toBeGreaterThan(0);
+    writeFileSync(join(healthy, "a.js"), "SIDE\n");
+    git(healthy, ["checkout", "-q", "-b", "side"]);
+    git(healthy, ["add", "a.js"]);
+    git(healthy, ["commit", "-qm", "side"]);
+    git(healthy, ["checkout", "-q", trunk]);
+    mkdirSync(join(healthy, ".git", "worktrees", "demo"), { recursive: true });
+    const socket = Bun.spawnSync([
+      "python3",
+      "-c",
+      "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); t=socket.socket(socket.AF_UNIX); t.bind(sys.argv[2])",
+      join(healthy, ".git", "fsmonitor--daemon.ipc"),
+      join(healthy, ".git", "worktrees", "demo", "fsmonitor--daemon.ipc"),
+    ]);
+    expect(socket.exitCode).toBe(0);
+    insert("p-ref-healthy", healthy);
+    const imported = await importRepository({ config, store }, projectFor("p-ref-healthy", healthy), "side", "tester");
+    expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("SIDE\n");
+    const head = await importRepository({ config, store }, projectFor("p-ref-healthy", healthy), "HEAD", "tester");
+    expect(await Bun.file(join(head.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+  });
+
+  test("a git ref import archives the requested commit without replacement refs", async () => {
+    const gitEnv = {
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      GIT_AUTHOR_NAME: "Tester",
+      GIT_AUTHOR_EMAIL: "tester@example.com",
+      GIT_COMMITTER_NAME: "Tester",
+      GIT_COMMITTER_EMAIL: "tester@example.com",
+    };
+    const source = join(dir, "replace-ref");
+    mkdirSync(source);
+    const git = (args: string[], stdin?: Buffer): string => {
+      const result = Bun.spawnSync(["git", "-C", source, ...args], {
+        env: gitEnv,
+        stdin,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+      return result.stdout.toString().trim();
+    };
+    git(["init", "-q"]);
+    writeFileSync(join(source, "a.js"), "VISIBLE\n");
+    git(["add", "a.js"]);
+    git(["commit", "-qm", "visible"]);
+    const commit = git(["rev-parse", "HEAD"]);
+    const blob = git(["rev-parse", "HEAD:a.js"]);
+    const hidden = git(["hash-object", "-w", "--stdin"], Buffer.from("HIDDEN\n"));
+    mkdirSync(join(source, ".git", "refs", "replace"));
+    writeFileSync(join(source, ".git", "refs", "replace", blob), `${hidden}\n`);
+    store.run(
+      `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+       VALUES ('p-replace', 'replace', '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+      source, JSON.stringify(["**/*.js"]),
+    );
+    const imported = await importRepository({ config, store }, {
+      id: "p-replace",
+      source_path: source,
+      scope_include: JSON.stringify(["**/*.js"]),
+      scope_exclude: "[]",
+    }, "HEAD", "tester");
+    expect(imported.commit_sha).toBe(commit);
+    expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("VISIBLE\n");
+  });
+
   test("workspaces are read-only by default and owner-writable only on explicit request", async () => {
     const scope = { include: ["**/*.js", "**/*.json", "README.md"], exclude: ["src/routes/media.js"] };
     const inventory = await buildInventory(fixture, { scope, maxFiles: 100, maxFileBytes: 1_000_000 });

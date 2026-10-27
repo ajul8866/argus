@@ -96,7 +96,8 @@ Phase handlers are code, not one prompt:
 Barriers prevent Phase 6 until phases 3–5 are terminal. A stale report (created
 before a later retest finished) is detected and a rebuild task is scheduled.
 Phase 4 and Phase 6 are intentionally deterministic: no model can invent a
-finding or report fact.
+finding or report fact. Phase 4 copies each verified path and line range into
+the finding. It does not parse those fields back out of a colon-separated string.
 
 ### 2.4 Two independent real harnesses
 

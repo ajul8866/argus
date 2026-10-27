@@ -12,6 +12,7 @@ import { AuditEngine } from "../src/orchestrator/engine.ts";
 import { EvidenceStore } from "../src/orchestrator/evidence.ts";
 import { ReportService } from "../src/reports/generator.ts";
 import { buildInventory } from "../src/repo/inventory.ts";
+import { verifyQuote } from "../src/repo/workspace.ts";
 import { harnessConfig, saveHarnessConfig, seedDefaults, setSetting } from "../src/settings.ts";
 import { now, toJson, uid } from "../src/util.ts";
 import { LocalCatalog } from "../src/local/catalog.ts";
@@ -1249,3 +1250,138 @@ test("a writable workspace task fails closed on the first check when the setting
   expect(store.all("SELECT seq FROM execution_events WHERE task_id = ? AND type = 'task.retry'", taskId)).toHaveLength(0);
   expect(store.all("SELECT id FROM agent_sessions WHERE task_id = ?", taskId)).toHaveLength(0);
 });
+
+test("a persisted finding keeps verified paths that contain a colon", async () => {
+  const repo = join(dir, "colon-repo");
+  mkdirSync(join(repo, "src"), { recursive: true });
+  const barPath = "src/foo:bar.js";
+  const otherPath = "src/foo:other.js";
+  const barQuote = "const token = request.headers.authorization;";
+  const otherQuote = "return db.get(\"SELECT * FROM invoices WHERE id = \" + id);";
+  writeFileSync(join(repo, "src", "foo:bar.js"), `function auth(request) {\n  ${barQuote}\n}\n`);
+  writeFileSync(join(repo, "src", "foo:other.js"), `function load(id) {\n  ${otherQuote}\n}\n`);
+  const scope = { include: ["**/*.js"], exclude: [".git/**"] };
+  const barCheck = await verifyQuote(repo, scope, { path: barPath, quote: barQuote, start_line: 2, end_line: 2 });
+  const otherCheck = await verifyQuote(repo, scope, { path: otherPath, quote: otherQuote, start_line: 2, end_line: 2 });
+  expect(barCheck).toMatchObject({ path: barPath, found: true, exact: true });
+  expect(otherCheck).toMatchObject({ path: otherPath, found: true, exact: true });
+  expect(barCheck.line_start).toBe(2);
+  expect(otherCheck.line_start).toBe(2);
+
+  const timestamp = now();
+  store.run(
+    `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, max_concurrent_agents, created_at, updated_at)
+     VALUES ('p-colon','Colon paths','', ?, ?, ?, 'Tester','TEST-AUTH',3,?,?)`,
+    repo,
+    toJson(scope.include),
+    toJson(scope.exclude),
+    timestamp,
+    timestamp,
+  );
+  store.run(
+    `INSERT INTO repositories (id, project_id, path, commit_sha, branch, languages, frameworks, inventory, graph, file_count, total_bytes, imported_at)
+     VALUES ('r-colon','p-colon',?,NULL,'test','{}','[]','{}','{}',2,20,?)`,
+    repo,
+    timestamp,
+  );
+  const colonAudit = engine.createAudit({
+    projectId: "p-colon",
+    repositoryId: "r-colon",
+    userId: "u1",
+    overrides: { max_reverifications: 0, max_areas: 1, max_candidates_per_area: 1, max_confirmations: 1, max_concurrent_agents: 1 },
+  });
+  store.run("UPDATE audits SET status = 'running', started_at = ? WHERE id = ?", timestamp, colonAudit);
+  store.run(
+    `INSERT INTO tasks (id, audit_id, phase, kind, task_key, title, status, priority, payload, agent_role, attempts, max_attempts, requires_approval, created_at, finished_at)
+     VALUES ('disc-colon', ?, 2, 'phase2.discover', 'phase2:area:api', 'discover', 'completed', 0, '{}', 'security_researcher', 1, 2, 0, ?, ?)`,
+    colonAudit,
+    timestamp,
+    timestamp,
+  );
+  store.run(
+    `INSERT INTO agent_sessions (id, audit_id, task_id, role, harness, model, status, workspace, sandbox_mode, started_at, ended_at)
+     VALUES ('sess-colon', ?, 'disc-colon', 'independent_validator', 'pi', 'test', 'completed', ?, 'none', ?, ?)`,
+    colonAudit,
+    repo,
+    timestamp,
+    timestamp,
+  );
+  const candidate = {
+    title: "Header and query values are copied into trusted calls",
+    category: "Injection",
+    cwe: "CWE-89",
+    severity: "high",
+    files: [
+      { path: barPath, start_line: barCheck.line_start, end_line: barCheck.line_end },
+      { path: otherPath, start_line: otherCheck.line_start, end_line: otherCheck.line_end },
+    ],
+    hypothesis: "Request data reaches a token variable and a SQL statement.",
+    source_to_sink: "request -> token and id -> SQL",
+    preconditions: ["A request"],
+    evidence_excerpts: [
+      { path: barPath, start_line: barCheck.line_start, end_line: barCheck.line_end, quote: barQuote },
+      { path: otherPath, start_line: otherCheck.line_start, end_line: otherCheck.line_end, quote: otherQuote },
+    ],
+    reproduction_notes: "Send a request that supplies both values.",
+    expected: "Both values are constrained before use.",
+    observed: "Both values are concatenated into trusted operations.",
+    impact: "Request data can change the token and the invoice query.",
+    remediation: "Validate the header and bind the query parameter.",
+  };
+  store.run(
+    `INSERT INTO candidates (id, audit_id, area_id, discovery_task_id, discovery_session_id, title, category, cwe, severity, status, payload, created_at)
+     VALUES ('cand-colon', ?, 'api', 'disc-colon', 'sess-colon', ?, ?, ?, ?, 'confirmed', ?, ?)`,
+    colonAudit,
+    candidate.title,
+    candidate.category,
+    candidate.cwe,
+    candidate.severity,
+    toJson(candidate),
+    timestamp,
+  );
+  const checks = [barCheck, otherCheck, barCheck];
+  store.run(
+    `INSERT INTO verifications (id, audit_id, candidate_id, kind, agent_session_id, discovery_session_id, verdict, rationale, evidence_check, payload, created_at)
+     VALUES ('ver-colon', ?, 'cand-colon', 'confirmation', 'sess-colon', 'sess-colon', 'CONFIRMED', 'Both quotes are in the snapshot.', ?, ?, ?)`,
+    colonAudit,
+    toJson({ verified_count: 2, relevant_count: 2, checks, original_verdict: "CONFIRMED", effective_verdict: "CONFIRMED" }),
+    toJson({
+      raw: {
+        verified_excerpts: candidate.evidence_excerpts,
+        reproduction_steps: ["Send the request."],
+        severity_assessment: "high",
+        impact_assessment: "Request data reaches the token and the query.",
+      },
+      evidence_checks: checks,
+    }),
+    timestamp,
+  );
+  engine.createTask({
+    auditId: colonAudit,
+    phase: 4,
+    kind: "phase4.persist",
+    taskKey: "phase4:candidate:cand-colon",
+    title: "Phase 4 — Persist colon-path finding",
+    payload: { candidate_id: "cand-colon", verification_id: "ver-colon" },
+    agentRole: null,
+  });
+
+  await waitFor(() => {
+    const status = store.get<{ status: string }>(
+      "SELECT status FROM tasks WHERE audit_id = ? AND task_key = 'phase4:candidate:cand-colon'",
+      colonAudit,
+    )?.status;
+    return status === "completed" || status === "failed";
+  }, 8_000);
+
+  const task = store.get<{ status: string; error: string | null }>(
+    "SELECT status, error FROM tasks WHERE audit_id = ? AND task_key = 'phase4:candidate:cand-colon'",
+    colonAudit,
+  );
+  expect(task).toMatchObject({ status: "completed", error: null });
+  const finding = store.get<{ files: string }>("SELECT files FROM findings WHERE audit_id = ?", colonAudit);
+  expect(JSON.parse(finding!.files)).toEqual([
+    { path: barPath, start_line: barCheck.line_start, end_line: barCheck.line_end },
+    { path: otherPath, start_line: otherCheck.line_start, end_line: otherCheck.line_end },
+  ]);
+}, 15_000);

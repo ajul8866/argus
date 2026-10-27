@@ -1708,6 +1708,130 @@ describe("repository import", () => {
     insert("p-branch-main-worktree-literal", literal);
     expect(await attempt("p-branch-main-worktree-literal", literal, null)).toBe("imported");
 
+    // Git skips tab, LF, CR, and space after "ref:" before reading the target.
+    // The first line is not the whole symref. An interior break is not resolved.
+    const continued = prepare("branch-continued-symref");
+    git(continued, ["branch", "feature"]);
+    git(continued, ["branch", "link"]);
+    writeFileSync(join(continued, ".git", "refs", "heads", "link"), "ref:\nrefs/heads/feature\n");
+    git(continued, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    fifo(join(continued, ".git", "refs", "tags", "feature"));
+    insert("p-branch-continued-symref", continued);
+    expect(await attempt("p-branch-continued-symref", continued, null)).toBe("invalid_repository");
+
+    const continuedSpace = prepare("branch-continued-space");
+    git(continuedSpace, ["branch", "feature"]);
+    git(continuedSpace, ["branch", "link"]);
+    writeFileSync(join(continuedSpace, ".git", "refs", "heads", "link"), "ref: \n refs/heads/feature\n");
+    git(continuedSpace, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    fifo(join(continuedSpace, ".git", "refs", "tags", "feature"));
+    insert("p-branch-continued-space", continuedSpace);
+    expect(await attempt("p-branch-continued-space", continuedSpace, null)).toBe("invalid_repository");
+
+    const continuedCrlf = prepare("branch-continued-crlf");
+    git(continuedCrlf, ["branch", "feature"]);
+    git(continuedCrlf, ["branch", "link"]);
+    writeFileSync(join(continuedCrlf, ".git", "refs", "heads", "link"), "ref:\r\nrefs/heads/feature\n");
+    git(continuedCrlf, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    fifo(join(continuedCrlf, ".git", "refs", "tags", "feature"));
+    insert("p-branch-continued-crlf", continuedCrlf);
+    expect(await attempt("p-branch-continued-crlf", continuedCrlf, null)).toBe("invalid_repository");
+
+    const continuedHead = prepare("branch-continued-head");
+    git(continuedHead, ["branch", "feature"]);
+    writeFileSync(join(continuedHead, ".git", "HEAD"), "ref:\nrefs/heads/feature\n");
+    fifo(join(continuedHead, ".git", "refs", "tags", "feature"));
+    insert("p-branch-continued-head", continuedHead);
+    expect(await attempt("p-branch-continued-head", continuedHead, null)).toBe("invalid_repository");
+
+    const continuedMain = prepare("branch-continued-main-worktree");
+    git(continuedMain, ["branch", "feature"]);
+    git(continuedMain, ["branch", "link"]);
+    mkdirSync(join(continuedMain, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(continuedMain, ".git", "refs", "bisect", "bad"), "ref:\nrefs/heads/feature\n");
+    writeFileSync(join(continuedMain, ".git", "refs", "heads", "link"), "ref:\nmain-worktree/refs/bisect/bad\n");
+    git(continuedMain, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    fifo(join(continuedMain, ".git", "refs", "tags", "feature"));
+    insert("p-branch-continued-main-worktree", continuedMain);
+    expect(await attempt("p-branch-continued-main-worktree", continuedMain, null)).toBe("invalid_repository");
+
+    const continuedLinkedMain = prepare("branch-continued-linked-main");
+    git(continuedLinkedMain, ["branch", "feature"]);
+    git(continuedLinkedMain, ["branch", "link"]);
+    const continuedLinked = join(dir, "branch-continued-linked");
+    git(continuedLinkedMain, ["worktree", "add", "-q", continuedLinked, "link"]);
+    writeFileSync(join(continuedLinkedMain, ".git", "refs", "heads", "link"), "ref:\nrefs/heads/feature\n");
+    fifo(join(continuedLinkedMain, ".git", "refs", "tags", "feature"));
+    insert("p-branch-continued-linked", continuedLinked);
+    expect(await attempt("p-branch-continued-linked", continuedLinked, null)).toBe("invalid_repository");
+
+    const continuedNested = prepare("branch-continued-nested");
+    git(continuedNested, ["branch", "feature"]);
+    git(continuedNested, ["branch", "link"]);
+    writeFileSync(join(continuedNested, ".git", "refs", "heads", "feature"), "ref:\nrefs/heads/master\n");
+    writeFileSync(join(continuedNested, ".git", "refs", "heads", "link"), "ref:\nrefs/heads/feature\n");
+    git(continuedNested, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    fifo(join(continuedNested, ".git", "refs", "tags", "master"));
+    insert("p-branch-continued-nested", continuedNested);
+    expect(await attempt("p-branch-continued-nested", continuedNested, null)).toBe("invalid_repository");
+
+    const continuedNbsp = prepare("branch-continued-nbsp");
+    git(continuedNbsp, ["branch", "feature"]);
+    git(continuedNbsp, ["branch", "link"]);
+    const continuedNbspBranch = "feature\u00a0";
+    writeFileSync(
+      join(continuedNbsp, ".git", "refs", "heads", continuedNbspBranch),
+      readFileSync(join(continuedNbsp, ".git", "refs", "heads", "feature")),
+    );
+    writeFileSync(join(continuedNbsp, ".git", "refs", "heads", "link"), `ref:\nrefs/heads/${continuedNbspBranch}\n`);
+    git(continuedNbsp, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    fifo(join(continuedNbsp, ".git", "refs", "tags", continuedNbspBranch));
+    insert("p-branch-continued-nbsp", continuedNbsp);
+    expect(await attempt("p-branch-continued-nbsp", continuedNbsp, null)).toBe("invalid_repository");
+
+    const continuedHealthy = prepare("branch-continued-healthy");
+    git(continuedHealthy, ["branch", "feature"]);
+    git(continuedHealthy, ["branch", "link"]);
+    writeFileSync(join(continuedHealthy, ".git", "refs", "heads", "link"), "ref:\nrefs/heads/feature\n");
+    git(continuedHealthy, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    insert("p-branch-continued-healthy", continuedHealthy);
+    const continuedImported = await importRepository(
+      { config, store },
+      projectFor("p-branch-continued-healthy", continuedHealthy),
+      null,
+      "tester",
+    );
+    expect(await Bun.file(join(continuedImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const continuedInterior = prepare("branch-continued-interior");
+    git(continuedInterior, ["branch", "feature"]);
+    git(continuedInterior, ["branch", "link"]);
+    writeFileSync(join(continuedInterior, ".git", "refs", "heads", "link"), "ref: refs/heads/feature\njunk\n");
+    git(continuedInterior, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    fifo(join(continuedInterior, ".git", "refs", "tags", "feature"));
+    insert("p-branch-continued-interior", continuedInterior);
+    const interiorImported = await importRepository(
+      { config, store },
+      projectFor("p-branch-continued-interior", continuedInterior),
+      null,
+      "tester",
+    );
+    expect(await Bun.file(join(interiorImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const continuedLiteral = prepare("branch-continued-literal");
+    git(continuedLiteral, ["branch", "feature"]);
+    git(continuedLiteral, ["branch", "link"]);
+    mkdirSync(join(continuedLiteral, ".git", "main-worktree", "refs", "heads"), { recursive: true });
+    writeFileSync(
+      join(continuedLiteral, ".git", "main-worktree", "refs", "heads", "feature"),
+      readFileSync(join(continuedLiteral, ".git", "refs", "heads", "feature")),
+    );
+    writeFileSync(join(continuedLiteral, ".git", "refs", "heads", "link"), "ref:\nmain-worktree/refs/heads/feature\n");
+    git(continuedLiteral, ["symbolic-ref", "HEAD", "refs/heads/link"]);
+    fifo(join(continuedLiteral, ".git", "refs", "tags", "feature"));
+    insert("p-branch-continued-literal", continuedLiteral);
+    expect(await attempt("p-branch-continued-literal", continuedLiteral, null)).toBe("imported");
+
     const otherMain = prepare("branch-other-worktree-main");
     git(otherMain, ["branch", "feature"]);
     git(otherMain, ["branch", "link"]);

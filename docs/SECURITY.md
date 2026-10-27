@@ -63,7 +63,9 @@ LLM agents. Use it only on repositories you are authorized to assess.
   the remainder is a pseudoref or a `refs/bisect`, `refs/worktree`, or
   `refs/rewritten` ref, and that file is read from the common directory. The
   target keeps Unicode spaces Git does not treat as whitespace, and a symref
-  that is not valid UTF-8 is rejected. The
+  that is not valid UTF-8 is rejected. Whitespace after `ref:` is skipped,
+  including a line break, so the target may start on a later line. A line
+  break left inside the target is not a symref Git resolves. The
   short names of that chain are probed before Git starts. A config `include` or
   `includeIf` is rejected wherever Git would start that section, including
   after another section on the same line. The directory named by a gitfile or

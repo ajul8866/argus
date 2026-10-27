@@ -22,7 +22,7 @@ export async function importRepository(
   total_bytes: number;
   imported_at: string;
 }> {
-  const sourceRoot = await assertAuthorizedRoot(project.source_path, deps.config.allowedRoots);
+  const sourceRoot = await assertAuthorizedRoot(project.source_path, deps.config.allowedRoots, deps.config.dataDir);
   const git = await gitInfo(sourceRoot);
   const scope = {
     include: parseJson<string[]>(project.scope_include, ["**/*"]),

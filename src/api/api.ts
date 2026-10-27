@@ -261,6 +261,7 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
           path: url.searchParams.get("path") ?? undefined,
           search: url.searchParams.get("search") ?? undefined,
           offset: url.searchParams.get("offset") ?? undefined,
+          dataDir: deps.config.dataDir,
         }));
       }
 
@@ -292,7 +293,7 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         const exclude = requireStringArray(body, "scope_exclude", DEFAULT_EXCLUDES);
         validateScopeGlobs(include);
         validateScopeGlobs(exclude);
-        const realPath = await assertAuthorizedRoot(resolve(sourcePath), deps.config.allowedRoots);
+        const realPath = await assertAuthorizedRoot(resolve(sourcePath), deps.config.allowedRoots, deps.config.dataDir);
         const id = uid();
         const timestamp = now();
         deps.store.run(
@@ -647,7 +648,7 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         };
         const relative = url.searchParams.get("path");
         if (!relative) throw badRequest("path is required");
-        const root = await assertAuthorizedRoot(repository.path, deps.config.allowedRoots);
+        const root = await assertAuthorizedRoot(repository.path, deps.config.allowedRoots, deps.config.dataDir);
         const file = await readScopedFile(root, relative, scope);
         return json({ ...file, lines: file.content.split("\n").length });
       }

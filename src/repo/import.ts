@@ -792,6 +792,54 @@ async function resolveExistingGitDirectory(target: string): Promise<string | nul
   return resolved;
 }
 
+// `git rev-parse --verify <ref>` opens the loose ref for that name even when
+// HEAD points somewhere else. `worktrees/<name>/HEAD` and a pseudoref such as
+// FETCH_HEAD are opened by that name too. A pipe at the final path blocks the
+// open. A symlink is followed. An fsmonitor socket is not a ref, so a socket
+// is left in place; a pipe, device, or symlink is not.
+const PSEUDO_REF_NAME = /^[A-Z_-]+$/;
+
+async function assertPlainGitTree(directory: string): Promise<void> {
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch {
+    throw invalidGitMetadata();
+  }
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      await assertPlainGitTree(join(directory, entry.name));
+      continue;
+    }
+    if (entry.isFile() || entry.isSocket()) continue;
+    throw invalidGitMetadata();
+  }
+}
+
+async function assertPlainGitTreeIfPresent(directory: string): Promise<void> {
+  let info;
+  try {
+    info = await lstat(directory);
+  } catch {
+    return;
+  }
+  if (info.isSymbolicLink() || !info.isDirectory()) throw invalidGitMetadata();
+  await assertPlainGitTree(directory);
+}
+
+async function assertPlainPseudoRefs(gitDir: string): Promise<void> {
+  let entries;
+  try {
+    entries = await readdir(gitDir, { withFileTypes: true });
+  } catch {
+    throw invalidGitMetadata();
+  }
+  for (const entry of entries) {
+    if (!PSEUDO_REF_NAME.test(entry.name)) continue;
+    if (entry.isSymbolicLink() || !entry.isFile()) throw invalidGitMetadata();
+  }
+}
+
 // commondir is a path relative to this git directory, or an absolute path.
 // Git reads config and exclude files from that other directory before the
 // later equality check can reject it.
@@ -828,6 +876,12 @@ async function assertGitDirectoryMetadata(gitDir: string, seen = new Set<string>
   const head = await readSmallGitText(join(gitDir, "HEAD"), 4_096, { requireUtf8: true });
   const headTarget = looseSymrefTarget(head ?? "");
   if (headTarget) await assertLooseRef(gitDir, headTarget, 0);
+  await assertPlainPseudoRefs(gitDir);
+  await assertPlainGitTreeIfPresent(join(gitDir, "refs"));
+  await assertPlainGitTreeIfPresent(join(gitDir, "worktrees"));
+  const head = await readSmallGitText(join(gitDir, "HEAD"));
+  const headLine = head?.split("\n", 1)[0] ?? "";
+  if (headLine.startsWith("ref:")) await assertLooseRef(gitDir, headLine.slice("ref:".length).trim(), 0);
   const common = await linkedGitDirectory(gitDir);
   if (common) await assertGitDirectoryMetadata(common, seen);
 }

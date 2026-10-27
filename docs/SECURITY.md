@@ -86,6 +86,11 @@ LLM agents. Use it only on repositories you are authorized to assess.
   is removed, a `:` path keeps the revision before the colon, and each side
   of `..` or `...` is checked. A symref target of one of those files is checked
   the same way. A config `include` or
+  current ref, any other loose ref, worktree metadata, a pseudoref such as
+  `FETCH_HEAD`, exclude or attribute files, `config.worktree`, and
+  sparse-checkout, is rejected before Git starts. These commands pass
+  `--no-replace-objects`, so a replacement ref cannot change the archived
+  bytes or the commit id that is recorded. A config `include` or
   `includeIf` is rejected wherever Git would start that section, including
   after another section on the same line. The directory named by a gitfile or
   `commondir` is the path Git opens: trailing CR and LF are removed, spaces

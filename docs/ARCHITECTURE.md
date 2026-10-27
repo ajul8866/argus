@@ -231,6 +231,10 @@ operation, preserving include/exclude short-circuit behavior.
    probes for the requested revision, is rejected before Git starts. A trailing
    `~` or `^` suffix, the revision before `:`, and each side of `..` or `...`
    select those paths. The
+   archive, including a loose ref other than `HEAD`, worktree metadata, a
+   pseudoref, `config.worktree`, sparse-checkout, and a config include
+   wherever Git would start that section, is rejected before Git starts.
+   Replacement refs are not applied. The
   directory named by a gitfile or `commondir` is the path Git opens, with
   trailing breaks removed and `..` applied after each symlink is followed.
   The runtime `realpath` is not used for that walk. A pointer that is not

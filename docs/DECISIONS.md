@@ -61,7 +61,17 @@ suite asserts report creation happens after the last retest.
 snapshot (or `git archive` for a ref) and rebuilds the inventory there. This
 prevents a later worktree edit from invalidating evidence. The original commit
 and branch are recorded; uncommitted worktree state is represented by the file
-hashes in the inventory.
+hashes in the inventory. A ref archive reads a git directory opened without
+following a symlink and does not pass inherited `GIT_*` overrides through.
+A common directory that does not resolve to that git directory, an alternate
+Git would resolve outside the allowed locations, and a symlink in an object
+store are rejected. Alternate paths follow a symlink before `..`, keep raw
+bytes, and reject `/proc` and `/dev/fd`. The archive runs in a separate Git
+directory with the pinned object format, including SHA-256, with `filter` and
+`export-subst` unset, so config cannot run a smudge filter or `gpg`. System
+and global attribute files are not read. Committed attributes can still request
+line-ending conversion. Lazy fetch is disabled, so a missing object fails the
+import instead of being downloaded. Replacement refs are not applied.
 
 **Scope is a platform boundary.** The prompt tells the agent what it is doing,
 but the workspace, explorer, and evidence checker independently enforce scope.

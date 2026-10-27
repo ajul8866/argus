@@ -1,7 +1,9 @@
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readdir } from "node:fs/promises";
 import { extname, join, relative } from "node:path";
+import { runCommand } from "../harness/process.ts";
 import { createScopeMatcher, normalizePath, sha256, toJson, truncate } from "../util.ts";
 import type { Scope } from "../util.ts";
+import { canonicalDirectory, readCappedRegularFile } from "./workspace.ts";
 
 export const DEFAULT_EXCLUDES = [
   ".git/**",
@@ -135,17 +137,34 @@ export function clampText(value: unknown, max = 4000): string {
   return truncate(typeof value === "string" ? value : "", max);
 }
 
+// Repository config can point core.excludesFile and core.attributesFile at a
+// fifo. Git opens that path from every command that reads the config. Force
+// both settings at the command line so the fifo is never opened.
+// --no-replace-objects keeps refs/replace from substituting another object for
+// the commit being archived. Without it, archive can store different bytes
+// than that commit while rev-parse still prints the original commit id.
+const GIT_CONFIG_OVERRIDES = ["-c", "core.excludesFile=/dev/null", "-c", "core.attributesFile=/dev/null"] as const;
+
+export function gitArgv(args: readonly string[]): string[] {
+  return ["git", "--no-replace-objects", ...GIT_CONFIG_OVERRIDES, ...args];
+}
+
 export async function gitInfo(path: string): Promise<{ commit: string | null; branch: string | null }> {
   const run = async (args: string[]): Promise<string | null> => {
     try {
-      const proc = Bun.spawn(["git", ...args], {
+      const result = await runCommand(gitArgv(args), {
         cwd: path,
-        stdout: "pipe",
-        stderr: "ignore",
-        env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          // A promisor remote can download the commit while its name is being
+          // read. Refuse that fetch here too, so a later archive cannot see
+          // an object this command just stored.
+          GIT_NO_LAZY_FETCH: "1",
+        },
+        timeoutMs: 15_000,
       });
-      const [output, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-      return code === 0 ? output.trim() : null;
+      if (result.timedOut || result.code !== 0) return null;
+      return result.stdout.trim() || null;
     } catch {
       return null;
     }
@@ -165,9 +184,11 @@ export type InventoryOptions = {
 
 export async function buildInventory(root: string, options: InventoryOptions): Promise<Inventory> {
   const scopeMatcher = createScopeMatcher(options.scope);
+  const rootReal = await canonicalDirectory(root);
   const files: RepoFile[] = [];
   const skipped: Array<{ path: string; reason: string }> = [];
   const languages: Record<string, number> = {};
+  const textByPath = new Map<string, string>();
   let totalBytes = 0;
   let truncated = false;
 
@@ -181,7 +202,7 @@ export async function buildInventory(root: string, options: InventoryOptions): P
     for (const entry of entries) {
       if (entry.name === ".git") continue;
       const absolute = join(directory, entry.name);
-      const rel = normalizePath(relative(root, absolute));
+      const rel = normalizePath(relative(rootReal, absolute));
       if (entry.isSymbolicLink()) {
         skipped.push({ path: rel, reason: "symlink" });
         continue;
@@ -198,43 +219,38 @@ export async function buildInventory(root: string, options: InventoryOptions): P
         truncated = true;
         break;
       }
-      const stats = await stat(absolute);
-      if (stats.size > options.maxFileBytes) {
-        skipped.push({ path: rel, reason: `larger than ${options.maxFileBytes} bytes` });
-        continue;
-      }
-      let content: Buffer;
+      let opened: { size: number; bytes: Buffer; truncated: boolean };
       try {
-        content = Buffer.from(await readFile(absolute));
+        opened = await readCappedRegularFile(absolute, options.maxFileBytes, {
+          root: rootReal,
+          relativePath: rel,
+        });
       } catch {
         skipped.push({ path: rel, reason: "unreadable" });
         continue;
       }
+      if (opened.truncated) {
+        skipped.push({ path: rel, reason: `larger than ${options.maxFileBytes} bytes` });
+        continue;
+      }
+      const content = opened.bytes;
       const language = languageFor(rel);
       const text = isTextFile(rel) ? content.toString("utf8") : "";
       const lineCount = text ? text.split("\n").length : 0;
       files.push({
         path: rel,
-        size: stats.size,
+        size: opened.size,
         lines: lineCount,
         language,
         sha256: sha256(content),
       });
+      if (text) textByPath.set(rel, text);
       languages[language] = (languages[language] ?? 0) + 1;
-      totalBytes += stats.size;
+      totalBytes += opened.size;
     }
   };
 
-  await visit(root);
-  const textByPath = new Map<string, string>();
-  for (const file of files) {
-    if (!isTextFile(file.path)) continue;
-    try {
-      textByPath.set(file.path, await readFile(join(root, file.path), "utf8"));
-    } catch {
-      // File changed between listing and read; the hash in the inventory is authoritative.
-    }
-  }
+  await visit(rootReal);
 
   return {
     files,

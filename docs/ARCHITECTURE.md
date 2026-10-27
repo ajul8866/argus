@@ -206,12 +206,36 @@ route handles HTTP authorization and audit logging. Inventory and workspace
 copying reuse a local scope matcher so each reached glob is compiled once per
 operation, preserving include/exclude short-circuit behavior.
 
-1. Project source path is resolved with `realpath` and must be under
-   `ARGUS_ALLOWED_ROOTS`.
+1. Project source path is pinned by walking each component without following
+   a symlink and must be under `ARGUS_ALLOWED_ROOTS`. A symlink is rejected
+   even when its target remains inside an allowed location. `realpath` is not
+   used here, because it would follow that symlink and authorize the target.
 2. Import builds an inventory using include/exclude globs. Only regular files
-   (no symlinks) within scope and size caps are included.
+   (no symlinks) within scope and size caps are included. The repository path
+   is pinned by walking each component without following a symlink. Each read
+   opens the file without following a symlink and without waiting on a pipe,
+   checks that the descriptor is still that path, and stops at the size
+   observed there.
 3. A snapshot is copied under `$ARGUS_DATA_DIR/repos/<project>/<id>` (or a git
-   archive for a ref) and the inventory is rebuilt from the snapshot.
+   archive for a ref) with the same open. The archive is taken from a git
+   directory descriptor opened without following a symlink. A `.git` symlink is
+   not followed. A gitfile is followed only when its target stays inside the
+   work tree that contains the source. A common directory that does not resolve to that
+   git directory, a symlink under the object store (including a non-UTF-8
+   name), a multi-pack-index pack name that leaves that store, and an alternate
+   object directory outside the allowed locations are rejected. The alternate
+   path is the directory Git opens after following a symlink and applying `..`,
+   nested alternates are checked the same way, and a path that enters `/proc`
+   or `/dev/fd` is rejected. Pipes, symlinks, config includes, and gitfile or
+   `commondir` targets Git would read are rejected before Git starts, including
+   the HEAD symref chain and the requested revision (`~`, `^`, `:`, and `..`).
+   Inherited `GIT_*` variables are not passed through. The archive runs from a
+   separate Git directory with the pinned object format, unsets `filter` and
+   `export-subst`, disables promisor fetch, and does not apply replacement
+   refs. A subdirectory archives only its own tree. A symlink, a repository
+   directory or ancestor replaced by a symlink, a path that escapes the source,
+   or bytes that no longer match the inventory are not copied. The inventory is
+   then rebuilt from the snapshot.
 4. Each task gets a fresh read-only copy under
    `$ARGUS_DATA_DIR/workspaces/<audit>/<session>`.
 5. If Bubblewrap is available, the harness runs with a new session, new PID/IPC/

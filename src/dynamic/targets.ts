@@ -1,5 +1,5 @@
 import type { Store } from "../db/index.ts";
-import { badRequest, notFound, now, toJson, uid } from "../util.ts";
+import { AppError, badRequest, notFound, now, sha256, toJson, uid } from "../util.ts";
 
 export type AuthorizedActions = {
   methods?: string[];
@@ -92,6 +92,54 @@ export type CreateIdentityInput = {
   status?: "active" | "expired" | "disabled";
 };
 
+export type AuditBudget = {
+  max_usd: number;
+  exploration_cap_usd: number;
+  verification_reserve_usd: number;
+  max_tasks: number;
+  max_requests: number;
+  max_runtime_minutes: number;
+};
+
+export type AuditScopeSnapshot = {
+  mode: "static" | "dynamic" | "hybrid";
+  target: {
+    id: string;
+    base_url: string;
+    allowed_hosts: string[];
+    allowed_cidrs: string[];
+    allowed_methods: string[];
+    max_rps: number;
+    tls: boolean;
+  };
+  authorization: {
+    id: string;
+    authorized_by: string;
+    reference: string;
+    valid_from: string;
+    valid_until: string;
+    authorized_actions: AuthorizedActions;
+    restrictions: Restrictions;
+  };
+  identities: Array<{ id: string; role: string }>;
+  permissions: string[];
+  budget: AuditBudget;
+  repository: { id: string; commit_sha: string | null } | null;
+  created_by: string | null;
+  created_at: string;
+};
+
+export type CreateSnapshotInput = {
+  auditId: string;
+  mode: "static" | "dynamic" | "hybrid";
+  targetId: string;
+  permissions: string[];
+  budget: AuditBudget;
+  repository: { id: string; commit_sha: string | null } | null;
+  createdBy?: string | null;
+  at?: string;
+};
+
 type TargetRow = {
   id: string;
   project_id: string;
@@ -134,6 +182,13 @@ type IdentityRow = {
   status: "active" | "expired" | "disabled";
   created_at: string;
   updated_at: string;
+};
+
+type SnapshotRow = {
+  audit_id: string;
+  created_at: string;
+  snapshot: string;
+  sha256: string;
 };
 
 function parseArray(value: string): string[] {
@@ -388,5 +443,66 @@ export class TargetService {
       id,
     );
     return row?.secret_ref ?? null;
+  }
+
+  createSnapshot(input: CreateSnapshotInput): { snapshot: AuditScopeSnapshot; sha256: string } {
+    if (this.store.get("SELECT audit_id FROM audit_scope_snapshots WHERE audit_id = ?", input.auditId)) {
+      throw new AppError(409, "scope_snapshot_exists", "This audit already has a scope snapshot");
+    }
+    const target = this.getTarget(input.targetId);
+    if (!target) throw notFound("Target not found");
+    if (target.status !== "active") throw new AppError(409, "target_disabled", "Target is disabled");
+    const authorization = this.activeAuthorization(target.id, input.at);
+    if (!authorization) {
+      throw new AppError(409, "authorization_invalid", "No active authorization covers this audit");
+    }
+    const identities = this.listIdentities(target.id).filter((identity) => identity.status === "active");
+    if (identities.length === 0) {
+      throw new AppError(409, "identity_required", "At least one active test identity is required");
+    }
+    const createdAt = now();
+    const snapshot: AuditScopeSnapshot = {
+      mode: input.mode,
+      target: {
+        id: target.id,
+        base_url: target.baseUrl,
+        allowed_hosts: target.allowedHosts,
+        allowed_cidrs: target.allowedCidrs,
+        allowed_methods: target.allowedMethods,
+        max_rps: target.maxRps,
+        tls: target.tlsRequired,
+      },
+      authorization: {
+        id: authorization.id,
+        authorized_by: authorization.authorizedBy,
+        reference: authorization.reference,
+        valid_from: authorization.validFrom,
+        valid_until: authorization.validUntil,
+        authorized_actions: authorization.authorizedActions,
+        restrictions: authorization.restrictions,
+      },
+      identities: identities.map((identity) => ({ id: identity.id, role: identity.role })),
+      permissions: [...new Set(input.permissions)],
+      budget: input.budget,
+      repository: input.repository,
+      created_by: input.createdBy ?? null,
+      created_at: createdAt,
+    };
+    const canonical = JSON.stringify(snapshot);
+    const digest = sha256(canonical);
+    this.store.run(
+      "INSERT INTO audit_scope_snapshots (audit_id, created_at, snapshot, sha256) VALUES (?, ?, ?, ?)",
+      input.auditId,
+      createdAt,
+      canonical,
+      digest,
+    );
+    return { snapshot, sha256: digest };
+  }
+
+  getSnapshot(auditId: string): { snapshot: AuditScopeSnapshot; sha256: string } | null {
+    const row = this.store.get<SnapshotRow>("SELECT * FROM audit_scope_snapshots WHERE audit_id = ?", auditId);
+    if (!row) return null;
+    return { snapshot: JSON.parse(row.snapshot) as AuditScopeSnapshot, sha256: row.sha256 };
   }
 }

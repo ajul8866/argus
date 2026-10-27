@@ -24,6 +24,7 @@ import { assertAuthorizedRoot, createWorkspace, verifyQuote } from "../repo/work
 import { redactObject, redactSecrets } from "../security/redact.ts";
 import { evaluateEvidence } from "./evidence-gate.ts";
 import { validateAuditOverrides } from "./options.ts";
+import { TargetService } from "../dynamic/targets.ts";
 import type { Inventory } from "../repo/inventory.ts";
 import { inventoryForAgent, inventorySummary } from "../repo/inventory.ts";
 import {
@@ -249,7 +250,11 @@ export class AuditEngine {
     private readonly events: EventLog,
     private readonly reports: ReportService,
     private readonly catalog?: LocalCatalog,
-  ) {}
+  ) {
+    this.targets = new TargetService(store);
+  }
+
+  private readonly targets: TargetService;
 
   start(): void {
     this.recoverAfterRestart();
@@ -426,6 +431,7 @@ export class AuditEngine {
     userId: string | null;
     overrides?: Record<string, unknown>;
     mode?: "static" | "dynamic" | "hybrid";
+    targetId?: string;
   }): string {
     validateAuditOverrides(this.store, input.overrides ?? {});
     const mode = input.mode ?? "static";
@@ -505,6 +511,10 @@ export class AuditEngine {
       ),
       writable_workspace: writableWorkspace,
       max_cost_usd: normalizeCostCeiling(input.overrides?.max_cost_usd),
+      target_id: input.targetId ?? null,
+      max_tasks: clamp(Number(input.overrides?.max_tasks ?? 200), 1, 100_000),
+      max_requests: clamp(Number(input.overrides?.max_requests ?? 5_000), 1, 10_000_000),
+      max_runtime_minutes: clamp(Number(input.overrides?.max_runtime_minutes ?? 240), 1, 10_080),
       harness_overrides:
         input.overrides?.harness_overrides && typeof input.overrides.harness_overrides === "object"
           ? input.overrides.harness_overrides
@@ -558,6 +568,37 @@ export class AuditEngine {
       if (audit.status !== "queued") {
         throw new AppError(409, "audit_not_startable", `Audit is ${audit.status} and cannot be started`);
       }
+      const config = parseJson<Record<string, unknown>>(audit.config, {});
+      if (audit.mode !== "static") {
+        const targetId = typeof config.target_id === "string" ? config.target_id : null;
+        if (!targetId) throw new AppError(400, "target_required", "A dynamic or hybrid audit requires a target");
+        const target = this.targets.getTarget(targetId);
+        if (!target) throw new AppError(400, "target_required", "Target not found");
+        if (target.projectId !== audit.project_id) {
+          throw new AppError(400, "target_not_in_project", "Target belongs to another project");
+        }
+        const maxUsd = typeof config.max_cost_usd === "number" ? config.max_cost_usd : 20;
+        const budget = {
+          max_usd: maxUsd,
+          exploration_cap_usd: maxUsd * 0.6,
+          verification_reserve_usd: maxUsd * 0.4,
+          max_tasks: Number(config.max_tasks ?? 200),
+          max_requests: Number(config.max_requests ?? 5_000),
+          max_runtime_minutes: Number(config.max_runtime_minutes ?? 240),
+        };
+        const repository = audit.repository_id
+          ? this.store.get<RepositoryRow>("SELECT * FROM repositories WHERE id = ?", audit.repository_id)
+          : null;
+        this.targets.createSnapshot({
+          auditId,
+          mode: audit.mode,
+          targetId,
+          permissions: ["audit:read", "task:create", "task:control", "audit:launch_dynamic"],
+          budget,
+          repository: repository ? { id: repository.id, commit_sha: repository.commit_sha ?? null } : null,
+          createdBy: userId,
+        });
+      }
       this.store.transaction(() => {
         this.store.run(
           "UPDATE audits SET status = 'running', started_at = COALESCE(started_at, ?), finished_at = NULL, error = NULL, current_phase = 1 WHERE id = ?",
@@ -571,16 +612,26 @@ export class AuditEngine {
       });
       this.events.append({ auditId, type: "audit.started", payload: { by: userId } });
       try {
-        this.createTask({
-          auditId,
-          phase: 1,
-          kind: "phase1.map",
-          taskKey: "phase1:map",
-          title: "Phase 1 — Map codebase and define assessment areas",
-          payload: {},
-          agentRole: "codebase_mapper",
-          priority: 100,
-        });
+        if (audit.mode === "dynamic") {
+          const timestamp = now();
+          this.store.run(
+            "UPDATE audit_phases SET status = 'skipped', started_at = ?, finished_at = ? WHERE audit_id = ? AND phase = 1",
+            timestamp,
+            timestamp,
+            auditId,
+          );
+        } else {
+          this.createTask({
+            auditId,
+            phase: 1,
+            kind: "phase1.map",
+            taskKey: "phase1:map",
+            title: "Phase 1 — Map codebase and define assessment areas",
+            payload: {},
+            agentRole: "codebase_mapper",
+            priority: 100,
+          });
+        }
       } catch (error) {
         const message = redactSecrets(error instanceof Error ? error.message : String(error)).text;
         this.store.transaction(() => {

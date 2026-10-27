@@ -503,4 +503,22 @@ CREATE INDEX idx_audits_project ON audits(project_id);
 CREATE INDEX idx_audits_status ON audits(status);
 `,
   },
+  {
+    version: 6,
+    name: "audit_scope_snapshots",
+    sql: `
+CREATE TABLE audit_scope_snapshots (
+  audit_id TEXT PRIMARY KEY REFERENCES audits(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL,
+  snapshot TEXT NOT NULL,
+  sha256 TEXT NOT NULL
+);
+CREATE TRIGGER audit_scope_snapshots_no_update
+BEFORE UPDATE ON audit_scope_snapshots
+BEGIN SELECT RAISE(ABORT, 'audit scope snapshot is immutable'); END;
+CREATE TRIGGER audit_scope_snapshots_no_delete
+BEFORE DELETE ON audit_scope_snapshots
+BEGIN SELECT RAISE(ABORT, 'audit scope snapshot is immutable'); END;
+`,
+  },
 ];

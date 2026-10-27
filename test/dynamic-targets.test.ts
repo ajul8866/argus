@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { Config } from "../src/config.ts";
 import { Store } from "../src/db/index.ts";
 import { TargetService } from "../src/dynamic/targets.ts";
+import { sha256 } from "../src/util.ts";
 
 let dir: string;
 let store: Store;
@@ -112,5 +113,55 @@ describe("TargetService", () => {
         restrictions: {},
       }),
     ).toThrow(/valid_until/);
+  });
+
+  test("creates an immutable scope snapshot", () => {
+    const target = targets.createTarget({
+      projectId,
+      label: "Staging",
+      baseUrl: "https://app.example.test",
+      environment: "staging",
+      allowedHosts: ["app.example.test"],
+      allowedMethods: ["GET"],
+    });
+    targets.createAuthorization({
+      targetId: target.id,
+      authorizedBy: "Test operator",
+      reference: "AUTH-TEST-3",
+      validFrom: "2026-10-27T00:00:00.000Z",
+      validUntil: "2026-11-03T00:00:00.000Z",
+      authorizedActions: { methods: ["GET"] },
+      restrictions: { allowed_paths: ["/api"], denied_paths: [], notes: "local" },
+    });
+    targets.createIdentity({ targetId: target.id, label: "User A", role: "user_a", authKind: "none" });
+    store.run(
+      "INSERT INTO audits (id, project_id, repository_id, status, current_phase, config, mode, created_at) VALUES ('a1', ?, NULL, 'queued', 1, '{}', 'dynamic', ?)",
+      projectId,
+      "2026-10-27T00:00:00.000Z",
+    );
+
+    const budget = {
+      max_usd: 20,
+      exploration_cap_usd: 12,
+      verification_reserve_usd: 8,
+      max_tasks: 200,
+      max_requests: 5_000,
+      max_runtime_minutes: 240,
+    };
+    const created = targets.createSnapshot({
+      auditId: "a1",
+      mode: "dynamic",
+      targetId: target.id,
+      permissions: ["audit:read", "audit:launch_dynamic"],
+      budget,
+      repository: null,
+      createdBy: null,
+    });
+
+    expect(created.sha256).toBe(sha256(JSON.stringify(created.snapshot)));
+    expect(targets.getSnapshot("a1")).toEqual(created);
+    expect(created.snapshot.target.base_url).toBe("https://app.example.test");
+    expect(created.snapshot.identities).toHaveLength(1);
+    expect(() => store.run("UPDATE audit_scope_snapshots SET sha256 = 'x' WHERE audit_id = 'a1'")).toThrow(/immutable/);
   });
 });

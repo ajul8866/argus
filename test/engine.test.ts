@@ -15,6 +15,7 @@ import { buildInventory } from "../src/repo/inventory.ts";
 import { harnessConfig, saveHarnessConfig, seedDefaults, setSetting } from "../src/settings.ts";
 import { now, toJson, uid } from "../src/util.ts";
 import { LocalCatalog } from "../src/local/catalog.ts";
+import { TargetService } from "../src/dynamic/targets.ts";
 import { mkdirSync, writeFileSync } from "node:fs";
 
 const fixture = join(import.meta.dir, "fixtures", "vulnerable-app");
@@ -1273,5 +1274,70 @@ describe("audit modes", () => {
   test("a static audit without a repository is refused", () => {
     insertRepositorylessProject();
     expect(() => engine.createAudit({ projectId: "p2", userId: "u1", mode: "static" })).toThrow(/repository/i);
+  });
+
+  function dynamicTarget(validUntil = "2099-01-01T00:00:00.000Z") {
+    const targets = new TargetService(store);
+    const target = targets.createTarget({
+      projectId: "p2",
+      label: "Staging",
+      baseUrl: "https://app.example.test",
+      environment: "staging",
+      allowedHosts: ["app.example.test"],
+      allowedMethods: ["GET"],
+    });
+    targets.createAuthorization({
+      targetId: target.id,
+      authorizedBy: "Tester",
+      reference: "AUTH-2",
+      validFrom: "2020-01-01T00:00:00.000Z",
+      validUntil,
+      authorizedActions: { methods: ["GET"] },
+      restrictions: {},
+    });
+    return { targets, target };
+  }
+
+  test("starting a dynamic audit writes a scope snapshot", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget();
+    targets.createIdentity({ targetId: target.id, label: "User A", role: "user_a", authKind: "none" });
+    targets.createIdentity({ targetId: target.id, label: "User B", role: "user_b", authKind: "none" });
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+
+    await engine.startAudit(id, "u1");
+
+    const snapshot = targets.getSnapshot(id);
+    expect(snapshot).not.toBeNull();
+    expect(snapshot!.snapshot.target.id).toBe(target.id);
+    expect(snapshot!.snapshot.mode).toBe("dynamic");
+    expect(snapshot!.snapshot.identities).toHaveLength(2);
+  });
+
+  test("an expired authorization refuses to start a dynamic audit", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget("2021-01-01T00:00:00.000Z");
+    targets.createIdentity({ targetId: target.id, label: "User A", role: "user_a", authKind: "none" });
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+
+    await expect(engine.startAudit(id, "u1")).rejects.toMatchObject({ code: "authorization_invalid" });
+  });
+
+  test("a disabled target refuses to start a dynamic audit", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget();
+    targets.createIdentity({ targetId: target.id, label: "User A", role: "user_a", authKind: "none" });
+    store.run("UPDATE project_targets SET status = 'disabled' WHERE id = ?", target.id);
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+
+    await expect(engine.startAudit(id, "u1")).rejects.toMatchObject({ code: "target_disabled" });
+  });
+
+  test("a dynamic audit without identities refuses to start", async () => {
+    insertRepositorylessProject();
+    const { target } = dynamicTarget();
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+
+    await expect(engine.startAudit(id, "u1")).rejects.toMatchObject({ code: "identity_required" });
   });
 });

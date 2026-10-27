@@ -8,6 +8,9 @@ const INTEGER_LIMITS: Record<string, [number, number]> = {
   max_reverifications: [0, 30],
   max_concurrent_agents: [1, 12],
   task_timeout_ms: [10_000, 3_600_000],
+  max_tasks: [1, 100_000],
+  max_requests: [1, 10_000_000],
+  max_runtime_minutes: [1, 10_080],
 };
 
 function isObject(value: unknown): value is Record<string, unknown> {

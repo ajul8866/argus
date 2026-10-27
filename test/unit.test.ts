@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
 import type { Config } from "../src/config.ts";
 import { loadConfig, PHASE_NAMES } from "../src/config.ts";
 import { KeyedSerialQueue } from "../src/concurrency.ts";
@@ -1044,6 +1044,97 @@ describe("repository import", () => {
       scope_include: JSON.stringify(["**/*"]),
       scope_exclude: "[]",
     }, "HEAD", "tester")).rejects.toMatchObject({ code: "invalid_repository", message: GIT_DIRECTORY_ERROR });
+  });
+
+  function pointBranch(repo: string, sha: string): void {
+    const head = readFileSync(join(repo, ".git/HEAD"), "utf8").trim();
+    if (!head.startsWith("ref: ")) throw new Error(`unexpected HEAD ${head}`);
+    const ref = head.slice("ref: ".length);
+    if (!ref || ref.startsWith("/") || ref.split("/").includes("..")) throw new Error(`unexpected ref ${ref}`);
+    writeFileSync(join(repo, ".git", ref), `${sha}\n`);
+  }
+
+  test("a git ref import rejects a symlinked pack, a commondir, and an alternate that escapes", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "argus-git-escape-"));
+    try {
+      initRepo(outside, { "secret.js": "SECRET_OBJECT_SENTINEL" });
+      gitExec(outside, ["gc", "-q"]);
+      const outsideSha = gitExec(outside, ["rev-parse", "HEAD"]);
+      const limited = { ...config, allowedRoots: [dir] };
+      const requested = {
+        ...project,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      };
+      const importRef = async (source: string) => importRepository({
+        config: limited,
+        store,
+      }, { ...requested, source_path: source }, "HEAD", "tester");
+
+      const packRepo = join(dir, "pack-repo");
+      initRepo(packRepo, { "a.js": "INSIDE_CONTENT" });
+      pointBranch(packRepo, outsideSha);
+      rmSync(join(packRepo, ".git/objects/pack"), { recursive: true, force: true });
+      symlinkSync(join(outside, ".git/objects/pack"), join(packRepo, ".git/objects/pack"));
+      await expect(importRef(packRepo)).rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+
+      const commonRepo = join(dir, "common-repo");
+      initRepo(commonRepo, { "a.js": "INSIDE_CONTENT" });
+      pointBranch(commonRepo, outsideSha);
+      writeFileSync(join(commonRepo, ".git/commondir"), `${realpathSync(join(outside, ".git"))}\n`);
+      await expect(importRef(commonRepo)).rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+
+      const chainRepo = join(dir, "chain-repo");
+      initRepo(chainRepo, { "a.js": "INSIDE_CONTENT" });
+      pointBranch(chainRepo, outsideSha);
+      const decoy = join(dir, "decoy-objects");
+      mkdirSync(join(decoy, "info"), { recursive: true });
+      writeFileSync(join(decoy, "info/alternates"), `${realpathSync(join(outside, ".git/objects"))}\n`);
+      mkdirSync(join(chainRepo, ".git/objects/info"), { recursive: true });
+      writeFileSync(join(chainRepo, ".git/objects/info/alternates"), `${decoy}\n`);
+      await expect(importRef(chainRepo)).rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+
+      const quotedRepo = join(dir, "quoted-repo");
+      initRepo(quotedRepo, { "a.js": "INSIDE_CONTENT" });
+      pointBranch(quotedRepo, outsideSha);
+      const objectsPath = realpathSync(join(quotedRepo, ".git/objects"));
+      const quotedLine = `"${relative(objectsPath, realpathSync(join(outside, ".git/objects")))}"`;
+      const literal = resolve(objectsPath, quotedLine);
+      expect(literal.startsWith(`${realpathSync(dir)}/`)).toBe(true);
+      mkdirSync(literal, { recursive: true });
+      mkdirSync(join(objectsPath, "info"), { recursive: true });
+      writeFileSync(join(objectsPath, "info/alternates"), `${quotedLine}\n`);
+      await expect(importRef(quotedRepo)).rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+      expect(existsSync(join(dir, "repos"))).toBe(false);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a git ref import accepts an alternate object store inside the allowed root", async () => {
+    const shared = join(dir, "shared-repo");
+    const consumer = join(dir, "consumer-repo");
+    initRepo(shared, { "shared.js": "SHARED_INSIDE_OBJECT" });
+    initRepo(consumer, { "a.js": "INSIDE_CONTENT" });
+    pointBranch(consumer, gitExec(shared, ["rev-parse", "HEAD"]));
+    mkdirSync(join(consumer, ".git/objects/info"), { recursive: true });
+    writeFileSync(
+      join(consumer, ".git/objects/info/alternates"),
+      `${realpathSync(join(shared, ".git/objects"))}\n`,
+    );
+    const imported = await importRepository({
+      config: { ...config, allowedRoots: [dir] },
+      store,
+    }, {
+      ...project,
+      source_path: consumer,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    }, "HEAD", "tester");
+    expect(await Bun.file(join(imported.path, "shared.js")).text()).toBe("SHARED_INSIDE_OBJECT");
+    expect(existsSync(join(imported.path, "secret.js"))).toBe(false);
   });
 
   test("a pinned git directory ignores a symlink that replaces .git", async () => {

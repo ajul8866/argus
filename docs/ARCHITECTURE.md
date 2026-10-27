@@ -219,8 +219,9 @@ operation, preserving include/exclude short-circuit behavior.
 3. A snapshot is copied under `$ARGUS_DATA_DIR/repos/<project>/<id>` (or a git
    archive for a ref) with the same open. The archive is taken from a git
    directory descriptor opened without following a symlink. A `.git` symlink,
-   a `gitdir:` file, a symlinked object store, and an alternate object
-   directory outside the allowed locations are rejected. A subdirectory import
+   a `gitdir:` file, a symlink under the object store, a `commondir` file, and
+   an alternate object directory outside the allowed locations are rejected.
+   Nested alternates are checked the same way. A subdirectory import
    archives only that subdirectory. A symlink, a repository directory or
    ancestor replaced by a symlink, a path that escapes the source, or bytes
    that no longer match the inventory are not copied. The inventory is then

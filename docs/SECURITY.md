@@ -45,9 +45,12 @@ LLM agents. Use it only on repositories you are authorized to assess.
   oversized files, and symlinks are not retained in the snapshot. The archive
   reads a git directory opened without following a symlink, and that directory
   must stay inside an allowed source location. A `.git` symlink or `gitdir:`
-  file is not followed. A symlinked object store, or an alternate object
-  directory outside the allowed locations, is rejected. When the source is a
-  subdirectory of a repository, the archive contains only that subdirectory.
+  file is not followed. A symlink anywhere under the object store is rejected,
+  including a pack or loose-object directory. An alternate object directory must
+  stay inside an allowed location, and its symlinks and nested alternates are
+  checked the same way. A `commondir` file is rejected, as is an alternate path
+  that contains quotes or backslashes. When the source is a subdirectory of a
+  repository, the archive contains only that subdirectory.
 
 ## Execution isolation
 

@@ -26,15 +26,27 @@ export async function runCommand(
     env?: Record<string, string>;
     timeoutMs?: number;
     stdin?: string;
+    // Inherited as fd 3. Git uses it as `--git-dir=/proc/self/fd/3` so a later
+    // symlink at the original path is not the directory that gets read.
+    extraFd?: number;
   } = {},
 ): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> {
-  const proc = Bun.spawn(command, {
-    cwd: options.cwd,
-    env: options.env,
-    stdin: options.stdin === undefined ? "ignore" : new TextEncoder().encode(options.stdin),
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  const proc = options.extraFd === undefined
+    ? Bun.spawn(command, {
+        cwd: options.cwd,
+        env: options.env,
+        stdin: options.stdin === undefined ? "ignore" : new TextEncoder().encode(options.stdin),
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+    : Bun.spawn(command, {
+        cwd: options.cwd,
+        env: options.env,
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+        stdio: ["ignore", "pipe", "pipe", options.extraFd],
+      });
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;

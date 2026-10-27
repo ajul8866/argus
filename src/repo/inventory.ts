@@ -137,10 +137,19 @@ export function clampText(value: unknown, max = 4000): string {
   return truncate(typeof value === "string" ? value : "", max);
 }
 
+// Repository config can point core.excludesFile and core.attributesFile at a
+// fifo. Git opens that path from every command that reads the config. Force
+// both settings at the command line so the fifo is never opened.
+const GIT_CONFIG_OVERRIDES = ["-c", "core.excludesFile=/dev/null", "-c", "core.attributesFile=/dev/null"] as const;
+
+export function gitArgv(args: readonly string[]): string[] {
+  return ["git", ...GIT_CONFIG_OVERRIDES, ...args];
+}
+
 export async function gitInfo(path: string): Promise<{ commit: string | null; branch: string | null }> {
   const run = async (args: string[]): Promise<string | null> => {
     try {
-      const result = await runCommand(["git", ...args], {
+      const result = await runCommand(gitArgv(args), {
         cwd: path,
         env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
         timeoutMs: 15_000,

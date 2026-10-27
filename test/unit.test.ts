@@ -2,8 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
-import { join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import type { Config } from "../src/config.ts";
 import { loadConfig, PHASE_NAMES } from "../src/config.ts";
 import { KeyedSerialQueue } from "../src/concurrency.ts";
@@ -1490,6 +1489,17 @@ describe("repository import", () => {
       }, {
         ...project,
         source_path: repo,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      }, "HEAD", "tester")).rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+    } finally {
+      if (allowed.includes(outsideName)) rmSync(allowed, { recursive: true, force: true });
+      const gitRoot = dirname(chosen.git);
+      if (gitRoot.includes(outsideName)) rmSync(gitRoot, { recursive: true, force: true });
+    }
+  });
+
   test("a git ref import rejects a multi-pack-index that names an outside pack", async () => {
     const outside = mkdtempSync(join(tmpdir(), "ao-"));
     const limited = { ...config, allowedRoots: [dir] };
@@ -1595,12 +1605,6 @@ describe("repository import", () => {
       }, "HEAD", "tester")).rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
       expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
     } finally {
-      if (allowed.includes(outsideName)) rmSync(allowed, { recursive: true, force: true });
-      const gitRoot = dirname(chosen.git);
-      if (gitRoot.includes(outsideName)) rmSync(gitRoot, { recursive: true, force: true });
-    }
-  });
-
       rmSync(outside, { recursive: true, force: true });
     }
   });

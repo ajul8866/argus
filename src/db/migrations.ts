@@ -521,4 +521,24 @@ BEFORE DELETE ON audit_scope_snapshots
 BEGIN SELECT RAISE(ABORT, 'audit scope snapshot is immutable'); END;
 `,
   },
+  {
+    version: 7,
+    name: "api_tokens",
+    sql: `
+CREATE TABLE api_tokens (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  label TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  scopes TEXT NOT NULL,
+  project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+  audit_id TEXT REFERENCES audits(id) ON DELETE CASCADE,
+  expires_at TEXT,
+  revoked_at TEXT,
+  last_used_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_api_tokens_user ON api_tokens(user_id);
+`,
+  },
 ];

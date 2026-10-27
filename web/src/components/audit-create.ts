@@ -46,6 +46,40 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
     ["max_confirmations", maxConfirmations.value], ["max_concurrent_agents", maxConcurrent.value],
   ]);
   const maxCost = input("max_cost_usd", { type: "number", min: 0, step: 0.5, placeholder: "No additional limit" });
+  const modeSelect = select("mode", [
+    { value: "static", label: "Source code only (static)" },
+    { value: "hybrid", label: "Source code plus live target (hybrid)" },
+    { value: "dynamic", label: "Live target only (dynamic)" },
+  ], "static");
+  const targetSelect = select("target_id", []);
+  const targetHint = h("p", { class: "modal-copy", role: "status" });
+  const targetField = field(
+    "Authorized target",
+    h("div", { class: "stack" }, targetSelect, targetHint),
+    "Dynamic audits need an active authorization and at least one test identity.",
+  );
+  let targets: Array<{ id: string; label: string; base_url: string; environment: string; status: string }> = [];
+  async function loadTargets(): Promise<void> {
+    targetSelect.replaceChildren();
+    targetHint.textContent = "Loading targets…";
+    try {
+      const { targets: rows } = await api<{ targets: typeof targets }>(`/api/projects/${projectSelect.value}/targets`);
+      targets = rows.filter((row) => row.status === "active");
+      targetSelect.replaceChildren(
+        ...targets.map((row) => h("option", { value: row.id }, `${row.label} — ${row.base_url} (${row.environment})`)),
+      );
+      targetHint.textContent = targets.length
+        ? "Requests run through the broker under the recorded authorization."
+        : "No target yet. Add one from the Targets tab of the project.";
+    } catch (error) {
+      targetHint.textContent = error instanceof Error ? error.message : "Unable to load targets";
+    }
+  }
+  function syncMode(): void {
+    const dynamic = modeSelect.value !== "static";
+    targetField.hidden = !dynamic;
+    if (dynamic) void loadTargets();
+  }
   const startNow = h("input", { type: "checkbox", name: "start_now", checked: true });
   const writableWorkspace = h("input", { type: "checkbox", name: "writable_workspace" });
   const errorBox = h("div", { class: "login-error hidden", role: "alert", tabindex: "-1" });
@@ -80,7 +114,11 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
       if (request === requestId) loadingRepositories = false;
     }
   }
-  projectSelect.addEventListener("change", () => void loadRepositories());
+  projectSelect.addEventListener("change", () => {
+    void loadRepositories();
+    if (modeSelect.value !== "static") void loadTargets();
+  });
+  modeSelect.addEventListener("change", syncMode);
   startNow.addEventListener("change", () => { submitButton.textContent = startNow.checked ? "Start audit" : "Save audit for later"; });
   const content = h("form", {
     class: "form",
@@ -97,9 +135,21 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
       if (maxCost.value.trim()) overrides.max_cost_usd = Number(maxCost.value);
       if (writablePolicy && writableWorkspace.checked) overrides.writable_workspace = true;
       try {
+        const mode = modeSelect.value as "static" | "dynamic" | "hybrid";
+        if (mode !== "static" && !targetSelect.value) {
+          errorBox.textContent = "Choose an authorized target for a dynamic or hybrid audit.";
+          errorBox.classList.remove("hidden");
+          submitButton.disabled = false;
+          submitButton.textContent = startNow.checked ? "Start audit" : "Save audit for later";
+          return;
+        }
         const result = await createAuditWithSnapshot({
-          projectId: projectSelect.value, repositoryId: repositorySelect.value || undefined,
-          overrides, startNow: startNow.checked,
+          projectId: projectSelect.value,
+          repositoryId: mode === "dynamic" ? undefined : repositorySelect.value || undefined,
+          overrides,
+          startNow: startNow.checked,
+          mode,
+          targetId: mode === "static" ? undefined : targetSelect.value,
         });
         instance.close();
         toast(result.startError ? `Audit saved. ${result.startError}` : startNow.checked ? "Audit started." : "Audit saved for later.", result.startError ? "error" : "success");
@@ -116,6 +166,8 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
     },
   }, errorBox,
   projects.length > 1 ? field("Project", projectSelect) : h("p", { class: "strong" }, projects[0]!.name),
+  field("Audit mode", modeSelect, "Static audits never contact a live system."),
+  targetField,
   repositoryHint,
   disclosure("Advanced audit settings",
     h("div", { class: "form-grid" },
@@ -129,6 +181,7 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
   ),
   h("div", { class: "form-actions" }, button("Cancel", () => instance.close(), "secondary"), submitButton));
   const instance = modal("New audit", content, null, { onClose: () => { closed = true; } });
+  syncMode();
   void loadRepositories();
   return null;
 }

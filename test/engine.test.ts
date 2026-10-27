@@ -15,6 +15,8 @@ import { buildInventory } from "../src/repo/inventory.ts";
 import { harnessConfig, saveHarnessConfig, seedDefaults, setSetting } from "../src/settings.ts";
 import { now, toJson, uid } from "../src/util.ts";
 import { LocalCatalog } from "../src/local/catalog.ts";
+import { TargetService } from "../src/dynamic/targets.ts";
+import { GraphStore } from "../src/dynamic/graph.ts";
 import { mkdirSync, writeFileSync } from "node:fs";
 
 const fixture = join(import.meta.dir, "fixtures", "vulnerable-app");
@@ -1444,4 +1446,348 @@ test("a writable workspace task fails closed on the first check when the setting
   expect(failed!.error).toContain("security.allow_writable_workspace is disabled");
   expect(store.all("SELECT seq FROM execution_events WHERE task_id = ? AND type = 'task.retry'", taskId)).toHaveLength(0);
   expect(store.all("SELECT id FROM agent_sessions WHERE task_id = ?", taskId)).toHaveLength(0);
+});
+
+describe("audit modes", () => {
+  function insertRepositorylessProject(): void {
+    store.run(
+      `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+       VALUES ('p2','No repo','', ?, '[]', '[]', 'Tester','AUTH-2', ?, ?)`,
+      dir,
+      now(),
+      now(),
+    );
+  }
+
+  test("a dynamic audit can be created without a repository", () => {
+    insertRepositorylessProject();
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic" });
+    expect(store.get("SELECT mode, repository_id FROM audits WHERE id = ?", id)).toEqual({
+      mode: "dynamic",
+      repository_id: null,
+    });
+  });
+
+  test("a static audit without a repository is refused", () => {
+    insertRepositorylessProject();
+    expect(() => engine.createAudit({ projectId: "p2", userId: "u1", mode: "static" })).toThrow(/repository/i);
+  });
+
+  function dynamicTarget(validUntil = "2099-01-01T00:00:00.000Z") {
+    const targets = new TargetService(store);
+    const target = targets.createTarget({
+      projectId: "p2",
+      label: "Staging",
+      baseUrl: "https://app.example.test",
+      environment: "staging",
+      allowedHosts: ["app.example.test"],
+      allowedMethods: ["GET"],
+    });
+    targets.createAuthorization({
+      targetId: target.id,
+      authorizedBy: "Tester",
+      reference: "AUTH-2",
+      validFrom: "2020-01-01T00:00:00.000Z",
+      validUntil,
+      authorizedActions: { methods: ["GET"] },
+      restrictions: {},
+    });
+    return { targets, target };
+  }
+
+  test("starting a dynamic audit writes a scope snapshot", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget();
+    targets.createIdentity({ targetId: target.id, label: "User A", role: "user_a", authKind: "none" });
+    targets.createIdentity({ targetId: target.id, label: "User B", role: "user_b", authKind: "none" });
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+
+    await engine.startAudit(id, "u1");
+
+    const snapshot = targets.getSnapshot(id);
+    expect(snapshot).not.toBeNull();
+    expect(snapshot!.snapshot.target.id).toBe(target.id);
+    expect(snapshot!.snapshot.mode).toBe("dynamic");
+    expect(snapshot!.snapshot.identities).toHaveLength(2);
+  });
+
+  test("an expired authorization refuses to start a dynamic audit", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget("2021-01-01T00:00:00.000Z");
+    targets.createIdentity({ targetId: target.id, label: "User A", role: "user_a", authKind: "none" });
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+
+    await expect(engine.startAudit(id, "u1")).rejects.toMatchObject({ code: "authorization_invalid" });
+  });
+
+  test("a disabled target refuses to start a dynamic audit", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget();
+    targets.createIdentity({ targetId: target.id, label: "User A", role: "user_a", authKind: "none" });
+    store.run("UPDATE project_targets SET status = 'disabled' WHERE id = ?", target.id);
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+
+    await expect(engine.startAudit(id, "u1")).rejects.toMatchObject({ code: "target_disabled" });
+  });
+
+  test("a dynamic audit without identities refuses to start", async () => {
+    insertRepositorylessProject();
+    const { target } = dynamicTarget();
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+
+    await expect(engine.startAudit(id, "u1")).rejects.toMatchObject({ code: "identity_required" });
+  });
+
+  test("accepts in-scope intents and rejects out-of-scope or duplicate intents", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget();
+    targets.createIdentity({ targetId: target.id, label: "User A", role: "user_a", authKind: "none" });
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+    await engine.startAudit(id, "u1");
+    const graph = new GraphStore(store);
+    const asset = graph.upsertAsset({ projectId: "p2", kind: "endpoint", assetKey: "GET /invoices/:id" });
+
+    const decision = engine.acceptIntents(id, [
+      { title: "read invoice", assetIds: [asset.id], method: "GET", path: "/invoices/123", rationale: "check ownership" },
+      { title: "off scope", assetIds: [asset.id], method: "GET", path: "https://evil.example.test/x" },
+      { title: "read invoice again", assetIds: [asset.id], method: "GET", path: "/invoices/123" },
+    ]);
+
+    expect(decision.accepted).toHaveLength(1);
+    expect(decision.rejected).toHaveLength(2);
+    const nodes = store.all<{ status: string }>(
+      "SELECT status FROM exploration_nodes WHERE audit_id = ? AND kind = 'intent' ORDER BY created_at",
+      id,
+    );
+    expect(nodes.map((node) => node.status)).toEqual(["approved", "rejected", "rejected"]);
+
+    await engine.closeExploration(id, "test finished");
+    expect(
+      store.get<{ exploration_status: string }>("SELECT exploration_status FROM audits WHERE id = ?", id)
+        ?.exploration_status,
+    ).toBe("closed");
+  });
+
+  test("phase 2 stays open until exploration closes", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget();
+    targets.createIdentity({ targetId: target.id, label: "User A", role: "user_a", authKind: "none" });
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+    await engine.startAudit(id, "u1");
+    store.run(
+      "INSERT INTO tasks (id, audit_id, phase, kind, task_key, title, status, payload, attempts, max_attempts, created_at) VALUES ('t2', ?, 2, 'phase2.discover', 'phase2:test', 'Discover', 'completed', '{}', 1, 2, ?)",
+      id,
+      now(),
+    );
+
+    await (engine as unknown as { reconcile(id: string): Promise<void> }).reconcile(id);
+    expect(
+      store.get<{ status: string }>("SELECT status FROM audit_phases WHERE audit_id = ? AND phase = 2", id)?.status,
+    ).toBe("running");
+
+    await engine.closeExploration(id, "done");
+    await (engine as unknown as { reconcile(id: string): Promise<void> }).reconcile(id);
+    expect(
+      store.get<{ status: string }>("SELECT status FROM audit_phases WHERE audit_id = ? AND phase = 2", id)?.status,
+    ).toBe("completed");
+  });
+
+  test("prove_goal requires coverage or an unreachable rationale", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget();
+    targets.createIdentity({ targetId: target.id, label: "User A", role: "user_a", authKind: "none" });
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+    await engine.startAudit(id, "u1");
+    const graph = new GraphStore(store);
+    const asset = graph.upsertAsset({ projectId: "p2", kind: "endpoint", assetKey: "GET /invoices/:id" });
+    const goal = graph.listGoal(id)!;
+
+    await expect(engine.proveGoal(id, goal.id, "")).rejects.toThrow(/coverage|rationale/i);
+
+    const intent = graph.createNode({ auditId: id, kind: "intent", status: "completed", payload: {} });
+    const fact = graph.createNode({ auditId: id, kind: "fact", status: "completed", payload: {} });
+    graph.linkNodes(intent.id, fact.id, "yields");
+    graph.anchor(fact.id, asset.id);
+    graph.upsertAsset({ projectId: "p2", kind: "endpoint", assetKey: "GET /admin" });
+    await expect(engine.proveGoal(id, goal.id, "")).rejects.toThrow(/coverage|rationale/i);
+
+    await engine.proveGoal(id, goal.id, "the admin endpoint is unreachable from the test network");
+    expect(graph.getNode(goal.id)?.status).toBe("completed");
+    expect(
+      store.get<{ exploration_status: string }>("SELECT exploration_status FROM audits WHERE id = ?", id)
+        ?.exploration_status,
+    ).toBe("closed");
+  });
+
+  test("the exploration loop plans, executes, and advances coverage", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget();
+    targets.createIdentity({ targetId: target.id, label: "User A", role: "user_a", authKind: "none" });
+    const id = engine.createAudit({
+      projectId: "p2",
+      userId: "u1",
+      mode: "dynamic",
+      targetId: target.id,
+      overrides: { max_cost_usd: 10 },
+    });
+    await engine.startAudit(id, "u1");
+    const graph = new GraphStore(store);
+    const asset = graph.upsertAsset({ projectId: "p2", kind: "endpoint", assetKey: "GET /invoices/:id" });
+    let plans = 0;
+    let executes = 0;
+    engine.setDynamicExecutor({
+      async plan() {
+        plans += 1;
+        return [
+          {
+            title: "read invoice",
+            assetIds: [asset.id],
+            method: "GET",
+            path: "/invoices/123",
+            rationale: "check ownership",
+          },
+        ];
+      },
+      async execute() {
+        executes += 1;
+        return { costUsd: 0.1, facts: [{ status: 200, assetIds: [asset.id] }] };
+      },
+    });
+
+    await engine.runExplorationStep(id);
+
+    expect(plans).toBe(1);
+    expect(executes).toBe(1);
+    expect(
+      store.get<{ status: string }>(
+        "SELECT status FROM exploration_nodes WHERE audit_id = ? AND kind = 'intent'",
+        id,
+      )?.status,
+    ).toBe("completed");
+    expect(graph.coverage(id).find((entry) => entry.assetId === asset.id)?.tested).toBe(true);
+
+    await engine.runExplorationStep(id);
+    expect(executes).toBe(1);
+  });
+
+  test("the exploration cap closes exploration", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget();
+    targets.createIdentity({ targetId: target.id, label: "User A", role: "user_a", authKind: "none" });
+    const id = engine.createAudit({
+      projectId: "p2",
+      userId: "u1",
+      mode: "dynamic",
+      targetId: target.id,
+      overrides: { max_cost_usd: 0.1 },
+    });
+    await engine.startAudit(id, "u1");
+    const graph = new GraphStore(store);
+    const asset = graph.upsertAsset({ projectId: "p2", kind: "endpoint", assetKey: "GET /invoices/:id" });
+    engine.setDynamicExecutor({
+      async plan() {
+        return [{ title: "read", assetIds: [asset.id], method: "GET", path: "/invoices/1" }];
+      },
+      async execute() {
+        return { costUsd: 0.1, facts: [{ status: 200, assetIds: [asset.id] }] };
+      },
+    });
+
+    await engine.runExplorationStep(id);
+
+    expect(
+      store.get<{ exploration_status: string; stop_reason: string }>(
+        "SELECT exploration_status, stop_reason FROM audits WHERE id = ?",
+        id,
+      ),
+    ).toMatchObject({ exploration_status: "closed", stop_reason: "exploration_budget" });
+  });
+
+  test("an expired authorization stops exploration", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget("2026-10-28T00:00:00.000Z");
+    targets.createIdentity({ targetId: target.id, label: "User A", role: "user_a", authKind: "none" });
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+    await engine.startAudit(id, "u1");
+    try {
+      setSystemTime(new Date("2026-11-01T00:00:00.000Z"));
+      await engine.runExplorationStep(id);
+      expect(
+        store.get<{ exploration_status: string; stop_reason: string }>(
+          "SELECT exploration_status, stop_reason FROM audits WHERE id = ?",
+          id,
+        ),
+      ).toMatchObject({ exploration_status: "closed", stop_reason: "authorization_expired" });
+    } finally {
+      setSystemTime();
+    }
+  });
+});
+
+describe("authorization and goal guards", () => {
+  function insertRepositorylessProject(): void {
+    store.run(
+      `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+       VALUES ('p2','No repo','', ?, '[]', '[]', 'Tester','AUTH-2', ?, ?)`,
+      dir,
+      now(),
+      now(),
+    );
+  }
+
+  function dynamicTarget(validUntil = "2099-01-01T00:00:00.000Z") {
+    const targets = new TargetService(store);
+    const target = targets.createTarget({
+      projectId: "p2",
+      label: "Staging",
+      baseUrl: "https://app.example.test",
+      environment: "staging",
+      allowedHosts: ["app.example.test"],
+      allowedMethods: ["GET"],
+    });
+    targets.createAuthorization({
+      targetId: target.id,
+      authorizedBy: "Tester",
+      reference: "AUTH-2",
+      validFrom: "2020-01-01T00:00:00.000Z",
+      validUntil,
+      authorizedActions: { methods: ["GET"] },
+      restrictions: {},
+    });
+    return { targets, target };
+  }
+
+  test("a revoked authorization stops exploration before the next intent", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget();
+    const authorization = targets.listAuthorizations(target.id)[0]!;
+    targets.createIdentity({ targetId: target.id, label: "anon", role: "user", authKind: "none" });
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+    await engine.startAudit(id, "u1");
+
+    store.run("UPDATE target_authorizations SET status = 'revoked' WHERE id = ?", authorization.id);
+    await engine.runExplorationStep(id);
+
+    expect(
+      store.get<{ exploration_status: string; stop_reason: string | null }>(
+        "SELECT exploration_status, stop_reason FROM audits WHERE id = ?",
+        id,
+      ),
+    ).toEqual({ exploration_status: "closed", stop_reason: "authorization_expired" });
+  });
+
+  test("prove_goal refuses while an intent is still open", async () => {
+    insertRepositorylessProject();
+    const { targets, target } = dynamicTarget();
+    targets.createIdentity({ targetId: target.id, label: "anon", role: "user", authKind: "none" });
+    const id = engine.createAudit({ projectId: "p2", userId: "u1", mode: "dynamic", targetId: target.id });
+    await engine.startAudit(id, "u1");
+    const graph = new GraphStore(store);
+    const goal = graph.listGoal(id)!;
+    graph.createNode({ auditId: id, kind: "intent", status: "approved", payload: { title: "open" } });
+
+    await expect(
+      engine.proveGoal(id, goal.id, "the remaining endpoint is unreachable from the test network"),
+    ).rejects.toThrow(/intent/i);
+  });
 });

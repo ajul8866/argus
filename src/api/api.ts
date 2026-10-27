@@ -1,5 +1,3 @@
-import { constants } from "node:fs";
-import { open } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { Config } from "../config.ts";
 import { APP_NAME, APP_VERSION, PHASE_NAMES } from "../config.ts";
@@ -21,6 +19,7 @@ import { listRepositoryFolders } from "../repo/directories.ts";
 import { agentDefinition, getSetting, harnessConfig, listAgents, listSettings, saveHarnessConfig, setSetting } from "../settings.ts";
 import { decryptSecret, encryptSecret, type StoredCredential } from "../security/credentials.ts";
 import { redactObject, redactSecrets } from "../security/redact.ts";
+import { readRegularFile } from "../security/regular-file.ts";
 import {
   AppError,
   badRequest,
@@ -40,6 +39,12 @@ import { clientIp, errorResponse, json, optionalString, readJson, requireString,
 import { sseResponse } from "./sse.ts";
 import { LocalCatalog } from "../local/catalog.ts";
 import { localResourceRoutes } from "./local-resources.ts";
+import { TargetService, type AuthorizedActions, type Restrictions } from "../dynamic/targets.ts";
+import { GraphStore } from "../dynamic/graph.ts";
+import { runPocChecks } from "../dynamic/executor.ts";
+import { DynamicProofService } from "../dynamic/proof.ts";
+import { TokenService } from "../auth/tokens.ts";
+import { authorizeTokenRoute } from "./token-policy.ts";
 
 type ApiDeps = {
   config: Config;
@@ -57,6 +62,8 @@ type AuthUser = AuthContext["user"];
 
 export function createApi(deps: ApiDeps): (request: Request, peerAddress?: string) => Promise<Response> {
   const catalog = deps.catalog ?? new LocalCatalog(deps.store);
+  const targets = new TargetService(deps.store);
+  const tokens = new TokenService(deps.store);
   return async (request: Request, peerAddress?: string): Promise<Response> => {
     const url = new URL(request.url);
     if (!url.pathname.startsWith("/api/")) return json({ error: "not_found" }, 404);
@@ -64,8 +71,13 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
       const path = url.pathname;
       const method = request.method.toUpperCase();
       const publicRoute = path === "/api/health" || (path === "/api/auth/login" && method === "POST");
-      const authContext = publicRoute ? null : deps.auth.authenticate(request);
-      if (!publicRoute && !authContext) {
+      const bearer = request.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() ?? null;
+      const tokenAuth = !publicRoute && bearer ? tokens.verify(bearer) : null;
+      if (!publicRoute && bearer && !tokenAuth) {
+        return json({ error: { code: "unauthorized", message: "Invalid or expired token" } }, 401);
+      }
+      const authContext = publicRoute || bearer ? null : deps.auth.authenticate(request);
+      if (!publicRoute && !authContext && !tokenAuth) {
         return json({ error: { code: "unauthorized", message: "Authentication required" } }, 401);
       }
       if (authContext && !["GET", "HEAD", "OPTIONS"].includes(method)) {
@@ -74,8 +86,19 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
           return json({ error: { code: "csrf_invalid", message: "Missing or invalid CSRF token" } }, 403);
         }
       }
+      if (tokenAuth) authorizeTokenRoute(tokens, tokenAuth.token, method, path);
       const ip = clientIp(peerAddress);
-      const user = authContext?.user ?? null;
+      const tokenUser: AuthUser | null = tokenAuth
+        ? {
+            id: tokenAuth.user.id,
+            email: tokenAuth.user.email,
+            name: tokenAuth.user.name,
+            role: tokenAuth.user.role as User["role"],
+            disabled: 0,
+            created_at: "",
+          }
+        : null;
+      const user = tokenUser ?? authContext?.user ?? null;
       const requireUser = (): AuthUser => {
         if (!user) throw new AppError(401, "unauthorized", "Authentication required");
         return user;
@@ -84,6 +107,21 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         const current = requireUser();
         if (!roleAtLeast(current, role)) throw new AppError(403, "forbidden", `Requires ${role} role`);
         return current;
+      };
+      const requireScope = (scope: string): void => {
+        if (tokenAuth && !tokens.hasScope(tokenAuth.token, scope)) {
+          throw new AppError(403, "forbidden", `Token requires ${scope}`);
+        }
+      };
+      const requireProjectScope = (projectId: string): void => {
+        if (tokenAuth && !tokens.allowsProject(tokenAuth.token, projectId)) {
+          throw new AppError(403, "forbidden", "Token is scoped to another project");
+        }
+      };
+      const requireAuditScope = (auditId: string): void => {
+        if (tokenAuth && !tokens.allowsAudit(tokenAuth.token, auditId)) {
+          throw new AppError(403, "forbidden", "Token is scoped to another audit");
+        }
       };
 
       if (path === "/api/health" && method === "GET") {
@@ -148,7 +186,7 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         const recentAudits = deps.store.all(
           `SELECT a.id, a.status, a.current_phase, a.created_at, a.started_at, a.finished_at,
                   p.name AS project_name, r.commit_sha
-           FROM audits a JOIN projects p ON p.id = a.project_id JOIN repositories r ON r.id = a.repository_id
+           FROM audits a JOIN projects p ON p.id = a.project_id LEFT JOIN repositories r ON r.id = a.repository_id
            ORDER BY a.created_at DESC LIMIT 8`,
         );
         const recentEvents = deps.store.all(
@@ -387,6 +425,118 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         return json({ repository: repositorySummary(imported) }, 201);
       }
 
+      const projectTargetsMatch = path.match(/^\/api\/projects\/([^/]+)\/targets$/);
+      if (projectTargetsMatch) {
+        const projectId = projectTargetsMatch[1]!;
+        if (!deps.store.get("SELECT id FROM projects WHERE id = ?", projectId)) throw notFound("Project not found");
+        if (method === "GET") {
+          requireUser();
+          requireScope("target:read");
+          requireProjectScope(projectId);
+          return json({ targets: targets.listTargets(projectId) });
+        }
+        if (method === "POST") {
+          const current = requireRole("auditor");
+          requireScope("target:manage");
+          requireProjectScope(projectId);
+          const body = await readJson(request);
+          const repositoryId = optionalString(body, "repository_id", 100);
+          if (repositoryId && !deps.store.get("SELECT id FROM repositories WHERE id = ? AND project_id = ?", repositoryId, projectId)) {
+            throw badRequest("repository_id must belong to this project");
+          }
+          const created = targets.createTarget({
+            projectId,
+            label: requireString(body, "label", 200),
+            baseUrl: requireString(body, "base_url", 2_000),
+            environment: requireString(body, "environment", 100),
+            repositoryId,
+            allowedHosts: requireStringArray(body, "allowed_hosts"),
+            allowedCidrs: body.allowed_cidrs === undefined ? [] : requireStringArray(body, "allowed_cidrs"),
+            allowedMethods: body.allowed_methods === undefined ? undefined : requireStringArray(body, "allowed_methods"),
+            maxRps: typeof body.max_rps === "number" ? body.max_rps : undefined,
+            tlsRequired: body.tls_required === undefined ? undefined : body.tls_required === true,
+            createdBy: current.id,
+          });
+          deps.auth.logAction(current.email, "target.created", created.id, { project_id: projectId }, ip);
+          return json({ target: created }, 201);
+        }
+      }
+
+      const targetAuthorizationsMatch = path.match(/^\/api\/targets\/([^/]+)\/authorizations$/);
+      if (targetAuthorizationsMatch) {
+        const targetId = targetAuthorizationsMatch[1]!;
+        if (!targets.getTarget(targetId)) throw notFound("Target not found");
+        const targetProject = deps.store.get<{ project_id: string }>(
+          "SELECT project_id FROM project_targets WHERE id = ?",
+          targetId,
+        );
+        if (targetProject) requireProjectScope(targetProject.project_id);
+        if (method === "GET") {
+          requireUser();
+          requireScope("target:read");
+          return json({ authorizations: targets.listAuthorizations(targetId) });
+        }
+        if (method === "POST") {
+          const current = requireRole("auditor");
+          requireScope("target:manage");
+          const body = await readJson(request);
+          const actions = body.authorized_actions;
+          if (!actions || typeof actions !== "object" || Array.isArray(actions)) {
+            throw badRequest("authorized_actions must be an object");
+          }
+          const restrictions = body.restrictions ?? {};
+          if (!restrictions || typeof restrictions !== "object" || Array.isArray(restrictions)) {
+            throw badRequest("restrictions must be an object");
+          }
+          const created = targets.createAuthorization({
+            targetId,
+            authorizedBy: requireString(body, "authorized_by", 300),
+            reference: requireString(body, "authorization_ref", 500),
+            validFrom: requireString(body, "valid_from", 100),
+            validUntil: requireString(body, "valid_until", 100),
+            authorizedActions: actions as AuthorizedActions,
+            restrictions: restrictions as Restrictions,
+            createdBy: current.id,
+          });
+          deps.auth.logAction(current.email, "target.authorization_created", created.id, { target_id: targetId }, ip);
+          return json({ authorization: created }, 201);
+        }
+      }
+
+      const targetIdentitiesMatch = path.match(/^\/api\/targets\/([^/]+)\/identities$/);
+      if (targetIdentitiesMatch) {
+        const targetId = targetIdentitiesMatch[1]!;
+        if (!targets.getTarget(targetId)) throw notFound("Target not found");
+        const identityProject = deps.store.get<{ project_id: string }>(
+          "SELECT project_id FROM project_targets WHERE id = ?",
+          targetId,
+        );
+        if (identityProject) requireProjectScope(identityProject.project_id);
+        if (method === "GET") {
+          requireUser();
+          requireScope("target:read");
+          return json({ identities: targets.listIdentities(targetId) });
+        }
+        if (method === "POST") {
+          const current = requireRole("auditor");
+          requireScope("target:manage");
+          const body = await readJson(request);
+          const authKind = requireString(body, "auth_kind", 20);
+          if (!["none", "header", "cookie", "basic"].includes(authKind)) {
+            throw badRequest("auth_kind must be none, header, cookie, or basic");
+          }
+          const created = targets.createIdentity({
+            targetId,
+            label: requireString(body, "label", 200),
+            role: requireString(body, "role", 100),
+            authKind: authKind as "none" | "header" | "cookie" | "basic",
+            secretRef: optionalString(body, "secret_ref", 200),
+          });
+          deps.auth.logAction(current.email, "target.identity_created", created.id, { target_id: targetId, role: created.role }, ip);
+          return json({ identity: created }, 201);
+        }
+      }
+
       if (path === "/api/repositories" && method === "GET") {
         requireUser();
         const repositories = deps.store.all(
@@ -504,14 +654,30 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
 
       if (path === "/api/audits" && method === "GET") {
         requireUser();
+        requireScope("audit:read");
         const projectId = url.searchParams.get("project_id");
+        const clauses: string[] = [];
+        const params: string[] = [];
+        if (projectId) {
+          requireProjectScope(projectId);
+          clauses.push("a.project_id = ?");
+          params.push(projectId);
+        }
+        if (tokenAuth?.token.projectId) {
+          clauses.push("a.project_id = ?");
+          params.push(tokenAuth.token.projectId);
+        }
+        if (tokenAuth?.token.auditId) {
+          clauses.push("a.id = ?");
+          params.push(tokenAuth.token.auditId);
+        }
         const rows = deps.store.all(
           `SELECT a.*, p.name AS project_name, r.commit_sha,
              (SELECT COUNT(*) FROM findings f WHERE f.audit_id = a.id) AS finding_count,
              (SELECT COUNT(*) FROM tasks t WHERE t.audit_id = a.id AND t.status IN ('running','queued')) AS active_tasks
-           FROM audits a JOIN projects p ON p.id = a.project_id JOIN repositories r ON r.id = a.repository_id
-           ${projectId ? "WHERE a.project_id = ?" : ""} ORDER BY a.created_at DESC LIMIT 100`,
-          ...(projectId ? [projectId] : []),
+           FROM audits a JOIN projects p ON p.id = a.project_id LEFT JOIN repositories r ON r.id = a.repository_id
+           ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""} ORDER BY a.created_at DESC LIMIT 100`,
+          ...params,
         );
         return json({ audits: rows });
       }
@@ -521,6 +687,20 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         const body = await readJson(request);
         const projectId = requireString(body, "project_id", 100);
         const repositoryId = optionalString(body, "repository_id", 100);
+        const mode = optionalString(body, "mode", 20);
+        if (mode && !["static", "dynamic", "hybrid"].includes(mode)) {
+          throw badRequest("mode must be static, dynamic, or hybrid");
+        }
+        const targetId = optionalString(body, "target_id", 100);
+        requireScope(mode === "dynamic" || mode === "hybrid" ? "audit:launch_dynamic" : "audit:launch_static");
+        requireProjectScope(projectId);
+        if (targetId) {
+          const target = deps.store.get<{ project_id: string }>(
+            "SELECT project_id FROM project_targets WHERE id = ?",
+            targetId,
+          );
+          if (!target || target.project_id !== projectId) throw badRequest("target_id must belong to this project");
+        }
         const overrides = (body.overrides ?? {}) as Record<string, unknown>;
         if (overrides && typeof overrides !== "object") throw badRequest("overrides must be an object");
         const id = deps.engine.createAudit({
@@ -528,8 +708,10 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
           repositoryId: repositoryId ?? undefined,
           userId: current.id,
           overrides,
+          mode: (mode as "static" | "dynamic" | "hybrid" | null) ?? undefined,
+          targetId: targetId ?? undefined,
         });
-        deps.auth.logAction(current.email, "audit.created", id, { projectId, repositoryId, overrides }, ip);
+        deps.auth.logAction(current.email, "audit.created", id, { projectId, repositoryId, mode, targetId, overrides }, ip);
         return json({ audit: deps.store.get("SELECT * FROM audits WHERE id = ?", id) }, 201);
       }
 
@@ -540,6 +722,13 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         if (!audit) throw notFound("Audit not found");
         if (method === "GET") {
           requireUser();
+          requireScope("audit:read");
+          requireAuditScope(auditId);
+          const auditProject = deps.store.get<{ project_id: string }>(
+            "SELECT project_id FROM audits WHERE id = ?",
+            auditId,
+          );
+          if (auditProject) requireProjectScope(auditProject.project_id);
           return json(await auditDetail(deps, auditId));
         }
         if (method === "POST") {
@@ -549,16 +738,25 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         }
       }
 
-      const auditActionMatch = path.match(/^\/api\/audits\/([^/]+)\/(start|cancel|tasks|findings|events|stream|evidence|reports|sessions)$/);
+      const auditActionMatch = path.match(/^\/api\/audits\/([^/]+)\/(start|cancel|tasks|findings|events|stream|evidence|reports|sessions|exploration)$/);
       if (auditActionMatch) {
         const auditId = auditActionMatch[1]!;
         const action = auditActionMatch[2]!;
+        if (tokenAuth) requireAuditScope(auditId);
         if (action === "stream" && method === "GET") {
           requireUser();
           return streamEvents(deps, request, auditId, eventCursor(url));
         }
         if (action === "start" && method === "POST") {
           const current = requireRole("auditor");
+          const audit = deps.store.get<{ mode: string; project_id: string }>(
+            "SELECT mode, project_id FROM audits WHERE id = ?",
+            auditId,
+          );
+          if (!audit) throw notFound("Audit not found");
+          requireScope(audit.mode === "static" ? "audit:launch_static" : "audit:launch_dynamic");
+          requireAuditScope(auditId);
+          requireProjectScope(audit.project_id);
           await deps.engine.startAudit(auditId, current.id);
           deps.auth.logAction(current.email, "audit.started", auditId, {}, ip);
           return json({ ok: true, audit: deps.store.get("SELECT * FROM audits WHERE id = ?", auditId) });
@@ -571,6 +769,8 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         }
         if (action === "sessions" && method === "GET") {
           requireUser();
+          requireScope("audit:read");
+          requireAuditScope(auditId);
           const sessions = deps.store.all(
             "SELECT id, task_id, role, harness, model, status, sandbox_mode, harness_session_ref, started_at, ended_at, usage, error FROM agent_sessions WHERE audit_id = ? ORDER BY started_at DESC",
             auditId,
@@ -579,6 +779,8 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         }
         if (action === "tasks" && method === "GET") {
           requireUser();
+          requireScope("audit:read");
+          requireAuditScope(auditId);
           const tasks = deps.store.all(
             `SELECT t.id, t.phase, t.kind, t.task_key, t.title, t.status, t.priority, t.error, t.failure_kind,
                     t.agent_role, t.harness, t.model, t.attempts, t.max_attempts, t.requires_approval,
@@ -589,8 +791,51 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
           );
           return json({ tasks });
         }
+        if (action === "tasks" && method === "POST") {
+          const current = requireRole("auditor");
+          requireScope("task:create");
+          const audit = deps.store.get<{ id: string; project_id: string; mode: string; status: string }>(
+            "SELECT id, project_id, mode, status FROM audits WHERE id = ?",
+            auditId,
+          );
+          if (!audit) throw notFound("Audit not found");
+          requireAuditScope(auditId);
+          requireProjectScope(audit.project_id);
+          if (audit.status !== "running") throw conflict("Tasks can be created only while the audit is running");
+          const body = await readJson(request);
+          const kind = requireString(body, "kind", 100);
+          if (kind === "explore" || kind.startsWith("explore.")) {
+            requireScope("audit:launch_dynamic");
+            if (!["dynamic", "hybrid"].includes(audit.mode)) throw conflict("Audit is not dynamic");
+          }
+          const phase = typeof body.phase === "number" ? body.phase : 2;
+          if (!Number.isInteger(phase) || phase < 1 || phase > 6) throw badRequest("phase must be 1..6");
+          const agentRole = optionalString(body, "agent_role", 100)
+            ?? (kind.startsWith("explore") ? "security_researcher" : null);
+          if (agentRole && !deps.store.get("SELECT role FROM agent_defs WHERE role = ?", agentRole)) {
+            throw badRequest("Unknown agent role");
+          }
+          if (!agentRole) throw badRequest("agent_role is required for this task kind");
+          const payload = body.payload && typeof body.payload === "object" && !Array.isArray(body.payload)
+            ? (body.payload as Record<string, unknown>)
+            : {};
+          const taskId = deps.engine.createTask({
+            auditId,
+            phase,
+            kind,
+            taskKey: `adapter:${kind}:${uid()}`,
+            title: optionalString(body, "title", 300) ?? `${kind} task`,
+            payload,
+            agentRole,
+            priority: 50,
+          });
+          deps.auth.logAction(current.email, "task.created", taskId, { audit_id: auditId, kind }, ip);
+          return json({ task: deps.store.get("SELECT * FROM tasks WHERE id = ?", taskId) }, 201);
+        }
         if (action === "findings" && method === "GET") {
           requireUser();
+          requireScope("finding:read");
+          requireAuditScope(auditId);
           const findings = deps.store.all(
             `SELECT f.*, (SELECT COUNT(*) FROM verifications v WHERE v.finding_id = f.id) AS verification_count
              FROM findings f WHERE f.audit_id = ? ORDER BY f.code`,
@@ -605,6 +850,8 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         }
         if (action === "evidence" && method === "GET") {
           requireUser();
+          requireScope("audit:read");
+          requireAuditScope(auditId);
           const rows = deps.store.all<EvidenceRow>(
             "SELECT * FROM evidence WHERE audit_id = ? ORDER BY rowid",
             auditId,
@@ -612,6 +859,24 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
           return json({
             evidence: rows.map(evidenceJson),
             chain: await deps.evidence.verifyChain(auditId),
+          });
+        }
+        if (action === "exploration" && method === "GET") {
+          requireUser();
+          requireScope("audit:read");
+          requireAuditScope(auditId);
+          const audit = deps.store.get<{ project_id: string }>(
+            "SELECT project_id FROM audits WHERE id = ?",
+            auditId,
+          );
+          if (!audit) throw notFound("Audit not found");
+          const graph = new GraphStore(deps.store);
+          return json({
+            assets: graph.listAssets(audit.project_id),
+            nodes: graph.listNodes(auditId),
+            edges: graph.listEdges(auditId),
+            anchors: graph.listAnchors(auditId),
+            coverage: graph.coverage(auditId),
           });
         }
         if (action === "reports") {
@@ -681,8 +946,10 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
       const taskMatch = path.match(/^\/api\/tasks\/([^/]+)$/);
       if (taskMatch && method === "GET") {
         requireUser();
+        requireScope("audit:read");
         const task = deps.store.get<Record<string, unknown>>("SELECT * FROM tasks WHERE id = ?", taskMatch[1]);
         if (!task) throw notFound("Task not found");
+        requireAuditScope(String(task.audit_id));
         const dependencies = deps.store.all<{ depends_on_task_id: string; status: string; title: string }>(
           `SELECT d.depends_on_task_id, t.status, t.title FROM task_dependencies d JOIN tasks t ON t.id = d.depends_on_task_id WHERE d.task_id = ?`,
           taskMatch[1],
@@ -719,6 +986,15 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
           taskAction[1],
         );
         if (!task) throw notFound("Task not found");
+        if (tokenAuth) {
+          requireScope("task:control");
+          requireAuditScope(task.audit_id);
+          const project = deps.store.get<{ project_id: string }>(
+            "SELECT project_id FROM audits WHERE id = ?",
+            task.audit_id,
+          );
+          if (project) requireProjectScope(project.project_id);
+        }
         if (taskAction[2] === "retry") {
           await deps.engine.retryTask(task.id, current.email);
           deps.auth.logAction(current.email, "task.retried", task.id, {}, ip);
@@ -734,15 +1010,96 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         }
       }
 
+      const auditCandidatesMatch = path.match(/^\/api\/audits\/([^/]+)\/candidates$/);
+      if (auditCandidatesMatch) {
+        const auditId = auditCandidatesMatch[1]!;
+        const audit = deps.store.get<{ id: string; project_id: string; mode: string; status: string }>(
+          "SELECT id, project_id, mode, status FROM audits WHERE id = ?",
+          auditId,
+        );
+        if (!audit) throw notFound("Audit not found");
+        if (audit.mode === "static") throw conflict("Static audits do not accept dynamic candidates");
+        if (audit.status !== "running") throw conflict("Candidates can be proposed only while the audit is running");
+        requireScope("audit:propose_candidate");
+        requireAuditScope(auditId);
+        requireProjectScope(audit.project_id);
+        const current = requireRole("auditor");
+        if (method !== "POST") throw badRequest("Use POST to propose a dynamic candidate");
+        const body = await readJson(request);
+        const manifest = body.manifest;
+        if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
+          throw badRequest("manifest must be an object");
+        }
+        const service = new DynamicProofService(deps.store, deps.evidence, (id, poc) =>
+          runPocChecks(deps.config, deps.store, id, poc),
+        );
+        const proposed = await service.propose({
+          auditId,
+          assetId: requireString(body, "asset_id", 100),
+          title: requireString(body, "title", 300),
+          category: requireString(body, "category", 100),
+          severity: requireString(body, "severity", 20) as never,
+          manifest: manifest as never,
+          script: requireString(body, "script", 100_000),
+          impact: optionalString(body, "impact", 2_000) ?? undefined,
+          remediation: optionalString(body, "remediation", 2_000) ?? undefined,
+          intentNodeId: optionalString(body, "intent_node_id", 100),
+          source: (body.source ?? null) as never,
+          proposedBy: optionalString(body, "proposed_by", 200) ?? current.id,
+        });
+        deps.auth.logAction(current.email, "candidate.proposed", proposed.candidateId, { audit_id: auditId }, ip);
+        return json(proposed, 201);
+      }
+
+      const candidateConfirmMatch = path.match(/^\/api\/candidates\/([^/]+)\/confirm$/);
+      if (candidateConfirmMatch && method === "POST") {
+        const current = requireRole("auditor");
+        requireScope("audit:confirm_candidate");
+        const candidate = deps.store.get<{ audit_id: string }>(
+          "SELECT audit_id FROM candidates WHERE id = ?",
+          candidateConfirmMatch[1]!,
+        );
+        if (!candidate) throw notFound("Candidate not found");
+        const audit = deps.store.get<{ project_id: string }>(
+          "SELECT project_id FROM audits WHERE id = ?",
+          candidate.audit_id,
+        );
+        requireAuditScope(candidate.audit_id);
+        if (audit) requireProjectScope(audit.project_id);
+        const body = request.body === null ? {} : await readJson(request);
+        const service = new DynamicProofService(deps.store, deps.evidence, (id, poc) =>
+          runPocChecks(deps.config, deps.store, id, poc),
+        );
+        const result = await service.confirm(
+          candidateConfirmMatch[1]!,
+          optionalString(body, "confirmed_by", 200) ?? current.id,
+        );
+        deps.auth.logAction(current.email, `candidate.${result.verdict.toLowerCase()}`, result.candidateId, {
+          audit_id: candidate.audit_id,
+          finding_id: result.findingId,
+        }, ip);
+        return json(result);
+      }
+
       if (path === "/api/findings" && method === "GET") {
         requireUser();
+        requireScope("finding:read");
         const auditId = url.searchParams.get("audit_id");
         const status = url.searchParams.get("status");
         const clauses: string[] = [];
         const params: string[] = [];
         if (auditId) {
+          requireAuditScope(auditId);
           clauses.push("audit_id = ?");
           params.push(auditId);
+        }
+        if (tokenAuth?.token.projectId) {
+          clauses.push("project_id = ?");
+          params.push(tokenAuth.token.projectId);
+        }
+        if (tokenAuth?.token.auditId) {
+          clauses.push("audit_id = ?");
+          params.push(tokenAuth.token.auditId);
         }
         if (status) {
           clauses.push("status = ?");
@@ -758,8 +1115,15 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
       const findingMatch = path.match(/^\/api\/findings\/([^/]+)$/);
       if (findingMatch && method === "GET") {
         requireUser();
+        requireScope("finding:read");
         const finding = deps.store.get<Record<string, unknown>>("SELECT * FROM findings WHERE id = ?", findingMatch[1]);
         if (!finding) throw notFound("Finding not found");
+        requireAuditScope(String(finding.audit_id ?? ""));
+        const findingProject = deps.store.get<{ project_id: string }>(
+          "SELECT project_id FROM audits WHERE id = ?",
+          String(finding.audit_id ?? ""),
+        );
+        if (findingProject) requireProjectScope(findingProject.project_id);
         const candidate = finding.candidate_id
           ? deps.store.get("SELECT * FROM candidates WHERE id = ?", String(finding.candidate_id))
           : null;
@@ -769,6 +1133,10 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
           finding.candidate_id ?? "",
         );
         const evidence = deps.store.all<EvidenceRow>("SELECT * FROM evidence WHERE finding_id = ? ORDER BY rowid", finding.id);
+        const retests = deps.store.all<Record<string, unknown>>(
+          "SELECT * FROM retests WHERE finding_id = ? ORDER BY created_at DESC",
+          finding.id,
+        );
         const sessions = deps.store.all(
           `SELECT * FROM agent_sessions WHERE id IN (?, ?, ?)`,
           finding.discovery_session_id ?? "",
@@ -789,6 +1157,10 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
             };
           }),
           evidence: evidence.map(evidenceJson),
+          retests: retests.map((row) => ({
+            ...row,
+            evidence_refs: parseJson(String(row.evidence_refs ?? "[]"), []),
+          })),
           sessions,
         });
       }
@@ -796,7 +1168,21 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
       const retestMatch = path.match(/^\/api\/findings\/([^/]+)\/retest$/);
       if (retestMatch && method === "POST") {
         const current = requireRole("auditor");
-        const taskId = await deps.engine.requestRetest(retestMatch[1]!, current.email);
+        requireScope("audit:retest");
+        const findingRow = deps.store.get<{ audit_id: string }>(
+          "SELECT audit_id FROM findings WHERE id = ?",
+          retestMatch[1]!,
+        );
+        if (!findingRow) throw notFound("Finding not found");
+        requireAuditScope(findingRow.audit_id);
+        const body = request.body === null ? {} : await readJson(request);
+        const taskId = await deps.engine.requestRetest(retestMatch[1]!, current.email, {
+          reason: optionalString(body, "reason", 1_000) ?? undefined,
+          environmentManifest: optionalString(body, "environment_manifest", 4_000) ?? undefined,
+          commitSha: optionalString(body, "commit_sha", 200),
+          buildRef: optionalString(body, "build_ref", 200),
+          environmentMatch: body.environment_match === true,
+        });
         deps.auth.logAction(current.email, "finding.retest_requested", retestMatch[1]!, { task_id: taskId }, ip);
         return json({ ok: true, task_id: taskId }, 201);
       }
@@ -1045,6 +1431,69 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         return json({ ok: true });
       }
 
+      if (path === "/api/tokens") {
+        if (method === "GET") {
+          const current = requireUser();
+          requireRole("auditor");
+          const owned = tokens.listForUser(current.id);
+          return json({
+            tokens: owned
+              .filter((token) => !token.revokedAt)
+              .map((token) => ({
+                id: token.id,
+                label: token.label,
+                scopes: token.scopes,
+                project_id: token.projectId,
+                audit_id: token.auditId,
+                expires_at: token.expiresAt,
+                last_used_at: token.lastUsedAt,
+                created_at: token.createdAt,
+              })),
+          });
+        }
+        if (method === "POST") {
+          const current = requireRole("auditor");
+          const body = await readJson(request);
+          const scopes = requireStringArray(body, "scopes");
+          const auditId = optionalString(body, "audit_id", 100);
+          const projectId = optionalString(body, "project_id", 100);
+          if (auditId) {
+            const audit = deps.store.get<{ project_id: string }>(
+              "SELECT project_id FROM audits WHERE id = ?",
+              auditId,
+            );
+            if (!audit) throw badRequest("audit_id does not exist");
+            requireAuditScope(auditId);
+            requireProjectScope(audit.project_id);
+          }
+          const created = tokens.create({
+            userId: current.id,
+            label: requireString(body, "label", 200),
+            scopes,
+            projectId,
+            auditId,
+            expiresAt: optionalString(body, "expires_at", 100) ?? undefined,
+          });
+          deps.auth.logAction(current.email, "token.created", created.token.id, {
+            scopes,
+            project_id: projectId ?? null,
+            audit_id: auditId ?? null,
+          }, ip);
+          // The raw value is returned once and never stored or listed again.
+          return json({ token: { ...created.token, raw: created.raw } }, 201);
+        }
+      }
+
+      const tokenRevokeMatch = path.match(/^\/api\/tokens\/([^/]+)$/);
+      if (tokenRevokeMatch && method === "DELETE") {
+        const current = requireRole("auditor");
+        const owned = tokens.listForUser(current.id).find((token) => token.id === tokenRevokeMatch[1]);
+        if (!owned) throw notFound("Token not found");
+        tokens.revoke(owned.id);
+        deps.auth.logAction(current.email, "token.revoked", owned.id, {}, ip);
+        return json({ ok: true });
+      }
+
       if (path === "/api/users" && method === "GET") {
         requireRole("admin");
         return json({ users: deps.auth.listUsers() });
@@ -1153,7 +1602,7 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         if (typeof expectedSize !== "number" || !Number.isSafeInteger(expectedSize) || expectedSize < 0) {
           throw conflict("Report file is missing or unreadable");
         }
-        const bytes = await readRegularFile(report.path, expectedSize);
+        const bytes = await readReportFile(report.path, expectedSize);
         if (!report.sha256 || sha256(bytes) !== report.sha256) {
           throw conflict("Report integrity check failed; the stored file does not match its recorded hash");
         }
@@ -1302,44 +1751,18 @@ function fsErrorCode(error: unknown): string | undefined {
   return typeof code === "string" ? code : undefined;
 }
 
-async function readRegularFile(path: string, expectedSize: number): Promise<Uint8Array<ArrayBuffer>> {
-  // Both flags are required for the open below to fail closed. A missing flag
-  // is `undefined`, and `number | undefined` becomes `number | 0`.
-  const noFollow = constants.O_NOFOLLOW;
-  const nonBlock = constants.O_NONBLOCK;
-  if (typeof noFollow !== "number" || typeof nonBlock !== "number" || noFollow === 0 || nonBlock === 0) {
-    throw conflict("Report file is missing or unreadable");
-  }
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
+async function readReportFile(path: string, expectedSize: number): Promise<Uint8Array<ArrayBuffer>> {
   try {
-    // O_NOFOLLOW binds the size check and the read to one inode. O_NONBLOCK
-    // makes a replaced pipe return immediately; opening it for read would
-    // otherwise wait until another process connects a writer.
-    handle = await open(path, constants.O_RDONLY | noFollow | nonBlock);
-    const info = await handle.stat();
-    if (!info.isFile()) throw conflict("Report file is missing or unreadable");
-    if (info.size !== expectedSize) {
+    const read = await readRegularFile(path, { exactBytes: expectedSize });
+    if (read.ok) return new Uint8Array(read.bytes);
+    if (read.reason === "size_mismatch") {
       throw conflict("Report integrity check failed; the stored file does not match its recorded size");
     }
-    // Cap the read at the size just observed. readFile() stats again and would
-    // load a file that grew past the bound after this check.
-    const buffer = Buffer.alloc(expectedSize);
-    let offset = 0;
-    while (offset < expectedSize) {
-      const { bytesRead } = await handle.read(buffer, offset, expectedSize - offset, offset);
-      if (bytesRead === 0) break;
-      offset += bytesRead;
-    }
-    if (offset !== expectedSize) {
-      throw conflict("Report integrity check failed; the stored file does not match its recorded size");
-    }
-    return new Uint8Array(buffer);
+    throw read.error ?? conflict("Report file is missing or unreadable");
   } catch (error) {
     if (error instanceof AppError) throw error;
     if (fsErrorCode(error) === "ENOENT") throw notFound("Report file is not available");
     throw conflict("Report file is missing or unreadable");
-  } finally {
-    await handle?.close().catch(() => undefined);
   }
 }
 

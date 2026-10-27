@@ -15,14 +15,28 @@ export async function createAuditWithSnapshot(input: {
   repositoryId?: string;
   overrides?: Record<string, unknown>;
   startNow: boolean;
+  mode?: "static" | "dynamic" | "hybrid";
+  targetId?: string;
 }): Promise<{ id: string; startError: string | null }> {
+  const mode = input.mode ?? "static";
   let repositoryId = input.repositoryId;
-  if (!repositoryId) {
+  // A dynamic audit may run without a repository; static and hybrid may not.
+  if (!repositoryId && mode !== "dynamic") {
     const { repository } = await api<{ repository: { id: string } }>(`/api/projects/${input.projectId}/import`, { method: "POST", body: {} });
     repositoryId = repository.id;
   }
+  if (mode !== "static" && !input.targetId) {
+    throw new Error("A dynamic or hybrid audit needs an authorized target");
+  }
   const { audit } = await api<{ audit: { id: string } }>("/api/audits", {
-    method: "POST", body: { project_id: input.projectId, repository_id: repositoryId, overrides: input.overrides ?? {} },
+    method: "POST",
+    body: {
+      project_id: input.projectId,
+      ...(repositoryId ? { repository_id: repositoryId } : {}),
+      overrides: input.overrides ?? {},
+      ...(mode !== "static" ? { mode } : {}),
+      ...(input.targetId ? { target_id: input.targetId } : {}),
+    },
   });
   if (input.startNow) {
     try {

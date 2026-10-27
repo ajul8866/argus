@@ -1,0 +1,1206 @@
+<doc>
+  <h1 id="GSI0ZEXy">Lapisan Dinamis Argus — Desain</h1>
+  <p id="YfU51ZER">Status: draf untuk persetujuan. Tanggal: 27 Oktober 2026. Lingkup: v1. Spesifikasi lengkap ada di <code>docs/ryugi/specs/2026-10-27-argus-dynamic-layer-design.md</code>.</p>
+  <alert id="vBreOdZ_" type="note">
+    <p><b>Menyetujui.</b> Koreksi bagian yang salah lewat komentar, atau balas di terminal. Kalau tidak ada koreksi, bilang “desain disetujui”. Setelah itu baru ada kode.</p>
+  </alert>
+  <h2 id="h5Wlb9Bi">1 · Tujuan</h2>
+  <p id="2p_Dk39_">Argus sekarang mengaudit source code secara statis. Repo diimpor sebagai snapshot, enam fase berjalan, dan temuan dikonfirmasi di sesi agen yang independen. Tool default read-only dan kode target tidak dijalankan.</p>
+  <p id="pk5gurmP">Desain ini menambah lapisan dinamis. Planner membaca keadaan, mengusulkan intent, dan worker menjalankan request nyata ke target yang berizin. Hasilnya masuk ke asset graph dan exploration graph. Coverage per aset menentukan arah berikutnya. Temuan menyimpan lineage goal → intent → fact → finding. Kutipan source dan bukti dinamis memakai satu rantai bukti.</p>
+  <p id="CmY3w6Mi">Tujuannya bukan menempel scanner di samping audit statis. Temuan dinamis harus melewati konfirmasi dan gerbang bukti yang sama. Kalau tidak, Argus hanya menambah sumber false positive.</p>
+  <h2 id="qV1YUm2R">2 · Goals, non-goals, anti-goals</h2>
+  <h3 id="DvD-2z4c">Goals</h3>
+  <ul id="2DcIbScw">
+    <li>Loop eksplorasi dinamis di bawah kendali <code>AuditEngine</code>.</li>
+    <li>Aset, lineage, dan coverage tersimpan sebagai data durable.</li>
+    <li>Bukti dinamis yang reproducible: HTTP exchange, skrip PoC, hasil run, manifest lingkungan.</li>
+    <li>Konfirmasi temuan dengan exploit check dan kontrol.</li>
+    <li>Retest dengan verdict ketat dan riwayat immutable.</li>
+    <li>Adapter agen read/write dengan izin per kemampuan.</li>
+    <li>Setiap request dinamis diperiksa terhadap snapshot scope dan otorisasi.</li>
+    <li>Planner memilih hipotesis, subgoal, dan arahnya sendiri, serta mengusulkan kapan goal proven. Engine menjaga batas, bukan menetapkan taksonomi kerentanan.</li>
+  </ul>
+  <h3 id="mSNgzCFv">Non-goals v1</h3>
+  <ul id="1W8JusYb">
+    <li>Menjalankan aplikasi target dari source di dalam Argus.</li>
+    <li>Browser automation di v1. Broker tetap mengakhiri TLS untuk enforcement dan recording.</li>
+    <li>Runtime LLM ketiga. Planner dan worker memakai Pi atau Claude Code.</li>
+    <li>PostgreSQL atau service eksternal baru.</li>
+    <li>Autofix pull request.</li>
+    <li>Playbook kelas kerentanan tetap. Planner memilih hipotesisnya sendiri; engine tidak membatasi eksplorasi berdasarkan kategori.</li>
+  </ul>
+  <h3 id="fY2XYdhY">Anti-goals</h3>
+  <ul id="-P4nPDhu">
+    <li>Worker memperluas scope, metode, target, atau budget sendiri.</li>
+    <li>Grant tulis otomatis membuka eksplorasi dinamis.</li>
+    <li>Temuan CONFIRMED tanpa run yang reproducible.</li>
+    <li>Secret masuk ke prompt, transkrip, log, evidence, atau laporan.</li>
+    <li>Retest bilang <code>fixed</code> padahal target mati atau kredensial kedaluwarsa.</li>
+    <li>Coverage terlihat lengkap padahal target tidak benar-benar diuji.</li>
+    <li>Harness mengirim task atau mengubah rencana di luar <code>AuditEngine</code>.</li>
+  </ul>
+  <h2 id="8F7LOAZe">3 · Keputusan yang sudah tetap</h2>
+  <table id="05lDAU04">
+    <tr>
+      <th>
+        <p>Area</p>
+      </th>
+      <th>
+        <p>Keputusan</p>
+      </th>
+    </tr>
+    <tr>
+      <td>
+        <p>Target</p>
+      </td>
+      <td>
+        <p>URL live yang dideklarasikan berizin, opsional dengan snapshot source. Menjalankan app dari source di luar v1.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Penempatan</p>
+      </td>
+      <td>
+        <p>Task kind <code>explore</code> di fase 2. Fase 3–6 tidak berubah.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Graph</p>
+      </td>
+      <td>
+        <p>Tabel baru asset graph dan exploration graph. Coverage aset dihitung dari anchor.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Eksekusi</p>
+      </td>
+      <td>
+        <p>Pi dan Claude Code dengan profil dinamis. Tidak ada runtime ketiga. Worker dinamis berjalan di container per audit dengan toolkit penuh.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Bukti</p>
+      </td>
+      <td>
+        <p>Request/response, skrip PoC, dan manifest masuk rantai SHA-256.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Otorisasi</p>
+      </td>
+      <td>
+        <p>Authorization record ditegakkan di egress, bukan prompt.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Mode</p>
+      </td>
+      <td>
+        <p><code>static</code>, <code>dynamic</code>, atau <code>hybrid</code> di <code>audits.config</code>. Default static.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Snapshot</p>
+      </td>
+      <td>
+        <p>Mode, target, scope, izin, dan budget dibekukan saat audit mulai. Setiap request dicek ke snapshot.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Slice pertama</p>
+      </td>
+      <td>
+        <p>Bukti pertama: horizontal IDOR di fixture, sebagai uji loop. Ini bukan batas eksplorasi dan bukan roadmap kelas kerentanan.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Kutipan source</p>
+      </td>
+      <td>
+        <p>Wajib hanya kalau lokasi source relevan dan tersedia.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>PoC</p>
+      </td>
+      <td>
+        <p>Wajib punya negative check, bukan satu respons sukses.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Model target</p>
+      </td>
+      <td>
+        <p>Pisahkan <code>project_targets</code>, <code>target_authorizations</code>, <code>test_identities</code>.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Egress</p>
+      </td>
+      <td>
+        <p>Redirect, DNS, metode berisiko, dan rate limit dibatasi.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Kredensial</p>
+      </td>
+      <td>
+        <p>Secret tidak masuk prompt atau log. Agen memakai credential broker.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>UI</p>
+      </td>
+      <td>
+        <p>Tiga layar. Graph bukan prasyarat; backend menyimpan node/edge sejak awal, UI mulai sebagai daftar.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Retest</p>
+      </td>
+      <td>
+        <p>Tabel <code>retests</code> terpisah. <code>fixed</code> butuh PoC lama gagal dan positive control lulus.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Adapter</p>
+      </td>
+      <td>
+        <p>Read/write sejak v1. Scope terpisah: <code>task:create</code>, <code>task:control</code>, <code>audit:launch_static</code>, <code>audit:launch_dynamic</code>.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Otoritas loop</p>
+      </td>
+      <td>
+        <p><code>AuditEngine</code> satu-satunya otoritas lifecycle, scope, budget, dan dispatch.</p>
+      </td>
+    </tr>
+  </table>
+  <h2 id="fOgr70nh">4 · Arsitektur</h2>
+  <h3 id="8cUs5kUg">4.1 Control plane</h3>
+  <p id="Ud4FWbEt"><code>AuditEngine</code> memegang lifecycle, snapshot scope, budget, validasi intent, dispatch, penulisan graph dan evidence, stop condition, dan recovery. Planner dan worker adalah task role lewat <code>HarnessAdapter</code>. Mereka membaca keadaan dan mengusulkan kerja. Mereka tidak bisa enqueue task, mengubah scope, menaikkan budget, atau menyetujui aksi.</p>
+  <p id="rkXrLKpD">Aturan ini berlaku untuk semua pemicu: dashboard, API token, Claude Code, Codex, atau Pi. Tidak ada jalur istimewa yang melewati engine.</p>
+  <h3 id="WdeF0spw">4.1.1 Kontrak otonomi</h3>
+  <p id="waa63DrF">Planner mengendalikan riset: hipotesis, subgoal, hint, urutan dan pengelompokan intent, aset yang diprobe, sinyal yang dianggap penting, kapan goal dianggap proven, dan replan setelah fact atau kegagalan. Engine hanya mengendalikan batas: target dan scope berizin, aksi dan risk policy, budget dan concurrency, dispatch/retry/stop, serta penerimaan bukti dan independensi konfirmasi.</p>
+  <p id="wrl8BKpS">Engine tidak menetapkan taksonomi kerentanan, urutan serangan tetap, atau daftar kelas tes. Proposal planner ditolak hanya karena melanggar batas, duplikat, budget, otorisasi kedaluwarsa, atau schema rusak. Sisanya keputusan planner.</p>
+  <h3 id="cuuKbXP7">4.2 Komponen</h3>
+  <table id="MYBGegQp">
+    <tr>
+      <th>
+        <p>Komponen</p>
+      </th>
+      <th>
+        <p>Tanggung jawab</p>
+      </th>
+      <th>
+        <p>Lokasi</p>
+      </th>
+    </tr>
+    <tr>
+      <td>
+        <p><code>AuditEngine</code></p>
+      </td>
+      <td>
+        <p>Lifecycle, validasi intent, dispatch, stop condition</p>
+      </td>
+      <td>
+        <p><code>src/orchestrator/engine.ts</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>HarnessManager</code></p>
+      </td>
+      <td>
+        <p>Adapter dan profil dinamis per role</p>
+      </td>
+      <td>
+        <p><code>src/harness/manager.ts</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>TargetService</code></p>
+      </td>
+      <td>
+        <p>Target, otorisasi, identitas, snapshot</p>
+      </td>
+      <td>
+        <p><code>src/dynamic/targets.ts</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>EgressBroker</code></p>
+      </td>
+      <td>
+        <p>Scope, DNS, redirect, metode, rate limit, recording</p>
+      </td>
+      <td>
+        <p><code>src/dynamic/egress.ts</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>CredentialBroker</code></p>
+      </td>
+      <td>
+        <p>Inject kredensial di egress, tidak pernah ke model</p>
+      </td>
+      <td>
+        <p><code>src/dynamic/credentials.ts</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>ToolServer</code></p>
+      </td>
+      <td>
+        <p>Tool MCP untuk harness, proxy ke broker host</p>
+      </td>
+      <td>
+        <p><code>src/dynamic/tools.ts</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>CommandRunner</code></p>
+      </td>
+      <td>
+        <p>Perintah host-side di sandbox tanpa jaringan</p>
+      </td>
+      <td>
+        <p><code>src/dynamic/command.ts</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>GraphStore</code></p>
+      </td>
+      <td>
+        <p>Asset, exploration, anchor, coverage</p>
+      </td>
+      <td>
+        <p><code>src/dynamic/graph.ts</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>PoCRunner</code></p>
+      </td>
+      <td>
+        <p>Eksekusi PoC dan tiga check</p>
+      </td>
+      <td>
+        <p><code>src/dynamic/poc.ts</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>RetestService</code></p>
+      </td>
+      <td>
+        <p>Retest dan verdict</p>
+      </td>
+      <td>
+        <p><code>src/dynamic/retest.ts</code></p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>TokenService</code></p>
+      </td>
+      <td>
+        <p>Token, scope, TTL, revocation</p>
+      </td>
+      <td>
+        <p><code>src/auth/tokens.ts</code></p>
+      </td>
+    </tr>
+  </table>
+  <h3 id="PTKriSav">4.3 Alur kontrol</h3>
+  <mermaid id="lyrUvIt9">sequenceDiagram
+  participant E as AuditEngine
+  participant P as Planner
+  participant G as Graph
+  participant W as Worker
+  participant B as Egress broker
+  participant T as Target
+
+  E-&gt;&gt;P: wake planner (budget)
+  P-&gt;&gt;G: baca goal, frontier, coverage
+  P-&gt;&gt;E: usulkan intent (schema)
+  E-&gt;&gt;E: cek snapshot, otorisasi, budget
+  E-&gt;&gt;G: simpan intent
+  E-&gt;&gt;W: dispatch satu intent
+  W-&gt;&gt;B: http_request(identity_id, method, url)
+  B-&gt;&gt;B: cek scope, DNS, redirect, method, rate
+  B-&gt;&gt;T: request + kredensial
+  T--&gt;&gt;B: respons
+  B--&gt;&gt;W: respons teredaksi + exchange id
+  W-&gt;&gt;E: catat fact, asset, candidate
+  E-&gt;&gt;G: simpan node, edge, anchor, evidence
+  G--&gt;&gt;E: graph berubah
+  E-&gt;&gt;P: jadwalkan wake berikutnya</mermaid>
+  <p id="wapxS-ZX">Perubahan graph adalah sinyal penjadwalan, bukan dispatch. <code>AuditEngine</code> memutuskan apakah wake berikutnya diizinkan budget.</p>
+  <h3 id="5AdZLXBg">4.4 Profil eksekusi</h3>
+  <table id="9BATPyEM">
+    <tr>
+      <th>
+        <p>Role</p>
+      </th>
+      <th>
+        <p>Runtime</p>
+      </th>
+      <th>
+        <p>Workspace</p>
+      </th>
+      <th>
+        <p>Tool</p>
+      </th>
+      <th>
+        <p>Jaringan</p>
+      </th>
+    </tr>
+    <tr>
+      <td>
+        <p>Static mapper/researcher/validator</p>
+      </td>
+      <td>
+        <p>bwrap</p>
+      </td>
+      <td>
+        <p>Read-only</p>
+      </td>
+      <td>
+        <p>File read-only</p>
+      </td>
+      <td>
+        <p>Tidak ada</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Dynamic planner</p>
+      </td>
+      <td>
+        <p>Container</p>
+      </td>
+      <td>
+        <p>Repo read-only + scratch</p>
+      </td>
+      <td>
+        <p>Toolkit penuh</p>
+      </td>
+      <td>
+        <p>Hanya broker</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Dynamic worker</p>
+      </td>
+      <td>
+        <p>Container</p>
+      </td>
+      <td>
+        <p>Repo read-only + scratch writable</p>
+      </td>
+      <td>
+        <p>Toolkit penuh</p>
+      </td>
+      <td>
+        <p>Hanya broker</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Dynamic validator</p>
+      </td>
+      <td>
+        <p>Container</p>
+      </td>
+      <td>
+        <p>Repo read-only + scratch</p>
+      </td>
+      <td>
+        <p>Toolkit penuh</p>
+      </td>
+      <td>
+        <p>Hanya broker</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Retester</p>
+      </td>
+      <td>
+        <p>Container</p>
+      </td>
+      <td>
+        <p>Repo read-only + scratch</p>
+      </td>
+      <td>
+        <p>Toolkit penuh</p>
+      </td>
+      <td>
+        <p>Hanya broker</p>
+      </td>
+    </tr>
+  </table>
+  <p id="4xLXly6m">Worker mendapat shell dan toolkit penuh: bash, curl, Python, node, scanner, dan skrip yang ditulisnya sendiri. Tool dari registry yang diizinkan boleh dipasang kalau policy mengizinkan. Tidak ada whitelist tool per API.</p>
+  <p id="VhvQX_0Z">Batasnya jaringan, bukan daftar tool. Container worker hanya terhubung ke jaringan internal yang gateway-nya broker. Tidak ada rute eksternal. HTTP, HTTPS, dan SOCKS lewat broker. Broker menegakkan scope, metode, path, rate, dan approval, menyuntik kredensial, merekam exchange, dan meredaksi secret. Koneksi langsung tidak punya tujuan.</p>
+  <p id="Jhg7sVp_">Ini menggantikan permukaan tool terbatas sebelumnya. Biayanya dependensi Docker atau Podman dan image yang harus dirawat. Hasilnya, planner punya kebebasan yang sama dengan operator manusia di dalam target berizin.</p>
+  <h3 id="0NySKLBm">4.5 Sandbox dan jaringan</h3>
+  <p id="MQ69Rzwu">Mode dinamis mewajibkan Docker atau Podman. Kalau tidak ada, audit dynamic atau hybrid menolak start. Audit statis tetap memakai bwrap dan fallback <code>workspace-copy</code>.</p>
+  <p id="fQoCqhp1">Per audit, Argus membuat jaringan Docker internal tanpa rute eksternal, container worker di jaringan itu saja, dan container broker di jaringan internal plus jaringan egress.</p>
+  <p id="zp68vyj2">Container worker: user non-root; semua capability dilepas kecuali <code>NET_RAW</code> kalau policy mengizinkan scanner mentah; root filesystem read-only dengan tmpfs untuk <code>/tmp</code> dan <code>/run</code>; repo snapshot read-only dan scratch writable; tanpa home host, data Argus, direktori evidence, atau Docker socket; seccomp default; tanpa privileged; <code>HTTP_PROXY</code>, <code>HTTPS_PROXY</code>, dan <code>ALL_PROXY</code> ke broker; hanya CA MITM per audit yang dipercaya.</p>
+  <p id="BtgynQOX">Container broker memegang rute eksternal, credential store, dan recording. Broker mengakhiri TLS untuk HTTP, menegakkan metode dan path, mem-proxy SOCKS5 untuk TCP non-HTTP ke host/port yang dideklarasikan, dan mencatat setiap keputusan. Traffic provider juga lewat broker: worker mendapat placeholder key dan base URL broker; broker menukar key asli untuk host provider yang diizinkan.</p>
+  <h2 id="gNGoEwXc">5 · Model data</h2>
+  <p id="6_ZHWMX5">SQLite. Migrasi bernomor. Tabel baru, kolom nullable baru, dan trigger immutable. Tidak ada perubahan CHECK fase.</p>
+  <table id="_eXG_5CM">
+    <tr>
+      <th>
+        <p>Tabel</p>
+      </th>
+      <th>
+        <p>Isi kunci</p>
+      </th>
+    </tr>
+    <tr>
+      <td>
+        <p><code>audit_scope_snapshots</code></p>
+      </td>
+      <td>
+        <p>audit_id, snapshot JSON, sha256. Trigger menolak update/delete.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>project_targets</code></p>
+      </td>
+      <td>
+        <p>base_url, environment, repository_id, allowed_hosts, allowed_cidrs, allowed_methods, max_rps, tls_required.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>target_authorizations</code></p>
+      </td>
+      <td>
+        <p>authorized_by, reference, valid_from, valid_until, authorized_actions, restrictions, status.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>test_identities</code></p>
+      </td>
+      <td>
+        <p>label, role, auth_kind, secret_ref, status. Secret ref tidak pernah dikembalikan API.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>assets</code></p>
+      </td>
+      <td>
+        <p>kind (root_domain/subdomain/ip/service/app/endpoint), asset_key, parent_id, data, unik per project.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>asset_edges</code></p>
+      </td>
+      <td>
+        <p>from_asset_id, to_asset_id, kind.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>exploration_nodes</code></p>
+      </td>
+      <td>
+        <p>kind (goal/intent/fact/finding/hint), status, task_id, session_id, payload.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>exploration_edges</code></p>
+      </td>
+      <td>
+        <p>spawns, derived_from, yields, proves, rejects.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>anchors</code></p>
+      </td>
+      <td>
+        <p>node_id, asset_id. Dasar coverage.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>http_exchanges</code></p>
+      </td>
+      <td>
+        <p>method, url, header teredaksi, status, evidence request/response, durasi, scope_decision.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>pocs</code></p>
+      </td>
+      <td>
+        <p>language, script_evidence_id, positive_check, negative_check, environment_manifest.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>poc_runs</code></p>
+      </td>
+      <td>
+        <p>status, positive_passed, negative_passed, exploit_passed, output_evidence_id.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>retests</code></p>
+      </td>
+      <td>
+        <p>finding_id, reason, fix_reference, authorization_snapshot, environment_manifest, commit_sha, build_ref, environment_match, executed_by, status, verdict (nullable), evidence_refs.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>api_tokens</code></p>
+      </td>
+      <td>
+        <p>token_hash, scopes, project_id/audit_id, expires_at, revoked_at, last_used_at.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>findings</code></p>
+      </td>
+      <td>
+        <p>Tambah kolom <code>provenance</code>: static, dynamic, hybrid.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>candidates</code></p>
+      </td>
+      <td>
+        <p>Rebuild: <code>area_id</code> nullable, tambah <code>provenance</code> dan <code>link_key</code>.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>audits</code></p>
+      </td>
+      <td>
+        <p>Tambah <code>mode</code>, <code>stop_reason</code>, <code>exploration_status</code>; <code>repository_id</code> nullable untuk mode dynamic.</p>
+      </td>
+    </tr>
+  </table>
+  <p id="t9Dyta61">Coverage adalah query dari anchor, bukan counter. Kalau lambat, tabel materialized bisa ditambahkan nanti. Temuan dynamic-only memakai <code>files = []</code> dan root cause yang menyatakan lokasi source tidak teridentifikasi. Rebuild tabel hanya untuk <code>audits.repository_id</code> dan <code>candidates.area_id</code>.</p>
+  <h2 id="V0GAyvaK">6 · Alur audit</h2>
+  <h3 id="IYkqHzo6">6.1 Create dan start</h3>
+  <p id="7DAdmXe9"><code>POST /api/audits</code> menerima <code>mode</code>, <code>target_id</code>, dan <code>budget</code>. Dynamic atau hybrid wajib punya target aktif dan minimal dua identitas untuk IDOR.</p>
+  <p id="zCEVlGcM"><code>startAudit</code> memeriksa: project berizin; repo wajib untuk static dan hybrid, opsional untuk dynamic; target aktif dan milik project; authorization aktif, tidak dicabut, dan mencakup waktu sekarang; tipe tes diizinkan; budget dalam batas; <code>Docker</code> atau <code>Podman</code> tersedia; identitas cukup. Lalu menulis <code>audit_scope_snapshots</code>, menyetel <code>audits.mode</code>, dan membuat node goal. Kalau ada yang gagal, start ditolak dengan alasan yang bisa dibaca mesin dan dicatat di <code>audit_log</code>.</p>
+  <p id="upKJgCMw">Dynamic tanpa repo melewati fase 1, mengisi aset app dari target, dan menandai fase 1 <code>skipped</code>. Laporan tanpa repo menghilangkan bagian arsitektur source dan menyatakannya. Evidence gate berjalan dalam mode tanpa repo: kutipan tidak bisa diwajibkan, bukti dinamis wajib.</p>
+  <h3 id="rasK1IMY">6.2 Planner</h3>
+  <p id="4-c-lI2f">Planner bangun saat audit mulai, worker selesai atau gagal, fact berubah, timer debounce, atau operator minta replan. Engine menggabungkan wake dan hanya mengirim planner kalau budget mengizinkan.</p>
+  <p id="eVFJ79kW">Input: goal, frontier, fact terbaru, ringkasan coverage, sisa budget, dan snapshot scope. Output: nol atau lebih intent dengan asset id, metode, path, sinyal yang diharapkan, dan alasan. Schema divalidasi. Intent tidak punya field kelas kerentanan; <code>category</code> bebas untuk laporan, bukan gate dispatch. Engine memeriksa asset, metode, host/CIDR, duplikat, validitas otorisasi, dan budget. Intent diterima menjadi node <code>intent</code> berstatus <code>approved</code>; yang ditolak disimpan dengan alasan supaya planner tidak mengulang. Nol intent berarti tidak ada arah baru.</p>
+  <p id="g63QN06X">Fase 2 tetap terbuka selama <code>audits.exploration_status = &apos;open&apos;</code>. Barrier fase 2 menunggu dua hal: semua task <code>discover</code> statis terminal dan eksplorasi <code>closed</code>. Status intent: proposed → approved → claimed → running → completed/failed; satu retry per intent. Asset dianggap teruji hanya kalau punya minimal satu <code>http_exchange</code> allowed dengan respons tercatat, ter-anchor ke intent atau fact yang selesai. Planner mengusulkan <code>prove_goal</code> dengan alasan. Engine menerima kalau semua aset in-scope teruji atau ditandai <code>not_applicable</code>, atau planner mencatat mengapa aset sisanya tidak terjangkau dan ada fact yang mendukungnya. Tidak boleh ada intent approved/claimed/running. Planner juga boleh membuat subgoal dan hint sebagai node dengan edge spawns. Budget dibagi dua pool: <code>exploration_cap_usd</code> dan <code>verification_reserve_usd</code>, default 60/40 dan bisa diatur per audit. <code>max_requests</code> menghitung semua request broker, termasuk validasi, retest, cleanup, dan redirect.</p>
+  <h3 id="_CSYMgaU">6.3 Worker</h3>
+  <p id="ul7xDsOr">Engine mengklaim satu intent dengan conditional update, membuat task <code>explore</code> di fase 2, dan mengirim sesi harness dengan profil worker. Worker menerima intent, konteks aset, id identitas (bukan secret), aturan scope, dan sisa budget request. Semua tulisan lewat tool engine, divalidasi schema, diatribusikan ke task dan sesi, dan menjadi evidence bila relevan. Worker tidak boleh mengonfirmasi kandidatnya sendiri.</p>
+  <h3 id="lLrw-5MN">6.4 Konfirmasi dan findings</h3>
+  <p id="lKdulnxf">Worker mengusulkan kandidat: judul, kategori, severity, aset, evidence id, dan manifest PoC. Engine membuat baris <code>candidates</code> dengan provenance.</p>
+  <p id="6FuGpB8B">Fase 3 memakai sesi baru yang tidak menemukan kandidat. Untuk kandidat dinamis, validator menjalankan positive control, exploit check, dan negative check; memeriksa exchange; dan memverifikasi kutipan source kalau ada. Kandidat dinamis CONFIRMED hanya kalau ketiganya lulus. Kutipan yang tidak ada tidak menurunkan verdict. Kutipan yang ada tetapi gagal dicek tetap menurunkan verdict, karena klaim source-nya salah.</p>
+  <p id="wZ3gRwJ9">Fase 4 deterministik menulis finding dengan <code>provenance</code>, <code>files</code> boleh kosong, dan root cause yang menyatakan apakah lokasi source ditemukan. Fase 5 menjalankan reverifikasi dan aturan retest di bagian 8.</p>
+  <h3 id="Qwh85pjB">6.5 Stop condition</h3>
+  <p id="2QL5FDEU">Engine berhenti mengirim dan menandai audit kalau: otorisasi kedaluwarsa atau dicabut; ada request yang diblokir karena di luar scope; budget USD, task, request, atau waktu habis; target tidak terjangkau; rate limit berulang; atau operator membatalkan. <code>stop_reason</code> diisi, task queued menjadi <code>blocked</code>, evidence yang sudah ada tidak diubah. Audit tidak ditandai selesai kalau coverage terpotong.</p>
+  <h3 id="wnFAeqwi">6.6 Recovery</h3>
+  <p id="xrA0I0HE">Intent, task, sesi, dan evidence adalah baris durable. Saat restart: sesi running digagalkan dengan alasan interrupted; task running di-requeue bila retry tersisa; intent approved dikirim lagi di bawah snapshot yang sama; otorisasi kedaluwarsa memblokir audit, bukan melanjutkan diam-diam.</p>
+  <h2 id="kJ4RGCrh">7 · Scope dan kredensial</h2>
+  <h3 id="pGfKYMaH">7.1 Pemeriksaan egress</h3>
+  <table id="KitZHKB9">
+    <tr>
+      <th>
+        <p>Pemeriksaan</p>
+      </th>
+      <th>
+        <p>Aturan</p>
+      </th>
+    </tr>
+    <tr>
+      <td>
+        <p>Skema</p>
+      </td>
+      <td>
+        <p>HTTPS, kecuali target lokal mendeklarasikan HTTP.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Host</p>
+      </td>
+      <td>
+        <p>Harus cocok <code>allowed_hosts</code>. Wildcard suffix hanya kalau dideklarasikan.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>DNS</p>
+      </td>
+      <td>
+        <p>Resolve A dan AAAA. Tolak loopback, link-local, multicast, 169.254.169.254, dan private range kecuali CIDR dideklarasikan.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>IP</p>
+      </td>
+      <td>
+        <p>Konek ke IP hasil resolve, bukan resolve ulang. Cek ulang setiap redirect.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Redirect</p>
+      </td>
+      <td>
+        <p>Maksimal 3. Redirect ke host atau skema di luar scope diblokir.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Metode</p>
+      </td>
+      <td>
+        <p>GET, HEAD, OPTIONS default. POST, PUT, PATCH, DELETE harus dideklarasikan.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Aksi berisiko</p>
+      </td>
+      <td>
+        <p>Upload, perubahan state massal, brute force, dan metode destruktif lewat approval.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Rate</p>
+      </td>
+      <td>
+        <p>Per target dan identitas, dari snapshot.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Ukuran dan waktu</p>
+      </td>
+      <td>
+        <p>Batas request/response, connect dan read timeout.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Recording</p>
+      </td>
+      <td>
+        <p>Metadata dan body teredaksi menjadi evidence.</p>
+      </td>
+    </tr>
+  </table>
+  <p id="udeMbYq3">Request yang diblokir dicatat dengan <code>scope_decision = &apos;blocked&apos;</code> dan alasannya. Blokir scope menghentikan audit.</p>
+  <p id="JM-oDfIw">Transport: worker ke broker lewat HTTP CONNECT dan SOCKS5. Broker mengakhiri TLS dengan CA per audit untuk menegakkan metode dan path serta merekam exchange. TCP non-HTTP dibatasi host/port yang dideklarasikan. Egress langsung tidak mungkin karena jaringan worker tidak punya rute eksternal.</p>
+  <p id="4btcfzVr">Approval mid-session: <code>http_request</code> mengembalikan <code>approval_required</code> dengan <code>approval_id</code> dan hash metode, URL, serta body. Tool menunggu keputusan sampai batas timeout task. Approval terikat ke hash request itu saja. Request yang ditolak atau timeout dicatat sebagai denied dan dikembalikan sebagai tool error. Cleanup <code>DELETE</code> pada slice IDOR lewat gate yang sama.</p>
+  <h3 id="GhhOkEqd">7.2 Credential broker</h3>
+  <ul id="Qwaz2uAh">
+    <li>Secret dienkripsi dengan jalur master key yang ada.</li>
+    <li>Agen menyebut <code>identity_id</code>; broker menyuntikkan secret di egress.</li>
+    <li>Agen menerima respons, bukan kredensial.</li>
+    <li>Redaksi berjalan sebelum tulis atau log. Header Authorization, Cookie, Set-Cookie, X-Api-Key, dan pola target dihapus.</li>
+    <li>Kalau redaksi gagal, penulisan gagal tertutup. Request tidak disimpan tanpa redaksi.</li>
+    <li>Rotasi atau disable identitas berlaku pada request berikutnya.</li>
+    <li>Key provider juga disuntik broker. Worker memakai placeholder dan base URL broker; broker menukar key asli untuk host provider yang diizinkan.</li>
+  </ul>
+  <h3 id="7bhJKeKt">7.3 Prompt injection</h3>
+  <p id="-FZuaCHl">Respons target adalah data tidak tepercaya. Respons disimpan sebagai evidence dan diberikan ke model sebagai data. Prompt menyatakan bahwa isi respons tidak boleh mengubah scope, metode, target, atau budget. Penegakan tidak bergantung pada prompt: broker, snapshot, dan validasi engine adalah batasnya.</p>
+  <h2 id="wfdcXOqR">8 · Bukti, temuan, dan retest</h2>
+  <h3 id="pnxGOP8b">8.1 Jenis evidence</h3>
+  <p id="yjSwwS_h"><code>http_exchange_request</code>, <code>http_exchange_response</code>, <code>poc_script</code>, <code>poc_run_output</code>, <code>environment_manifest</code>, <code>exploration_fact</code>. Rantai hash, verifikasi sidecar, dan trigger append-only tidak berubah.</p>
+  <h3 id="LE1-XtTW">8.2 Provenance temuan</h3>
+  <table id="5WHOy_pi">
+    <tr>
+      <th>
+        <p>Provenance</p>
+      </th>
+      <th>
+        <p>Kutipan source</p>
+      </th>
+      <th>
+        <p>Bukti dinamis</p>
+      </th>
+    </tr>
+    <tr>
+      <td>
+        <p><code>static</code></p>
+      </td>
+      <td>
+        <p>Wajib minimal satu kutipan relevan.</p>
+      </td>
+      <td>
+        <p>Tidak.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>hybrid</code></p>
+      </td>
+      <td>
+        <p>Wajib kalau mengklaim lokasi source.</p>
+      </td>
+      <td>
+        <p>Wajib.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>dynamic</code></p>
+      </td>
+      <td>
+        <p>Tidak.</p>
+      </td>
+      <td>
+        <p>Wajib: exploit check, positive control, negative control, manifest.</p>
+      </td>
+    </tr>
+  </table>
+  <p id="hSuo0PTX">Gerbang bukti menjadi kondisional: verifikasi setiap kutipan yang ada; wajibkan kutipan untuk klaim source pada static/hybrid; wajibkan <code>poc_run</code> sukses untuk dynamic/hybrid; jangan menurunkan temuan dinamis hanya karena tidak ada kutipan.</p>
+  <h3 id="IAFmK49-">8.3 Kontrak PoC</h3>
+  <p id="QC_vkN9C">PoC adalah skrip plus manifest: <code>positive_check</code>, <code>negative_check</code>, <code>exploit_check</code>, <code>cleanup</code>, dan <code>environment</code> (target, commit, identitas). Runner menjalankan ketiganya dan mencatat hasil terpisah. Run <code>passed</code> hanya kalau ketiganya lulus. Positive control gagal berarti run <code>error</code>, walaupun exploit check lulus, karena lingkungannya tidak tepercaya.</p>
+  <p id="M5VxKUVv">Ketiga check memakai asset yang sama. Positive dan exploit memakai object id yang sama; positive memakai identitas owner, exploit memakai identitas penyerang. Negative memakai object id berbeda yang harus ditolak. Engine mengevaluasi predicate pada exchange yang tercatat, bukan klaim model. Validator boleh menolak atau mengganti PoC; keduanya disimpan dan finding mengutip run final yang lulus tiga check.</p>
+  <h3 id="aRpzgBac">8.4 Retest</h3>
+  <p id="XFuWLie2">Retest dibuat manual atau saat ada fix reference. Retester memakai sesi baru. Urutan verdict:</p>
+  <ol id="fT1lj4zk">
+    <li>Positive control gagal: <code>cannot_confirm</code>.</li>
+    <li>Exploit check PoC lama masih sukses: <code>still_reproducible</code>.</li>
+    <li>Exploit check gagal dan positive control lulus: <code>fixed</code>.</li>
+    <li>PoC tidak bisa jalan, target mati, kredensial kedaluwarsa, atau hasil ambigu: <code>cannot_confirm</code>.</li>
+  </ol>
+  <p id="X2YH-mDs">Setiap retest menyimpan manifest lingkungan, commit atau build, waktu, executor, hasil positive control, dan evidence id. Evidence lama tidak pernah ditimpa.</p>
+  <p id="PruW8DQr">Fase 5 tetap reverifikasi final dan menulis <code>verifications</code>. Retest adalah jalur pasca-audit, punya authorization snapshot sendiri, dan tidak mengubah provenance finding. Retest butuh otorisasi target yang masih valid; snapshot audit lama boleh kedaluwarsa. <code>fixed</code> butuh environment match: target, label environment, role identitas, dan commit/build yang sama kecuali perbaikan yang diuji. Baris retest memakai <code>status</code> (queued/running/completed/failed); <code>verdict</code> nullable sampai selesai.</p>
+  <h2 id="RVtd1pa2">9 · Permission dan integrasi agen</h2>
+  <h3 id="x19zMLFL">9.1 Scope</h3>
+  <table id="tZau2nmO">
+    <tr>
+      <th>
+        <p>Scope</p>
+      </th>
+      <th>
+        <p>Mengizinkan</p>
+      </th>
+    </tr>
+    <tr>
+      <td>
+        <p><code>audit:read</code></p>
+      </td>
+      <td>
+        <p>Baca audit, task, coverage, findings.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>finding:read</code></p>
+      </td>
+      <td>
+        <p>Baca finding dan evidence.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>task:create</code></p>
+      </td>
+      <td>
+        <p>Buat task di audit yang sudah ada, sesuai mode audit.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>task:control</code></p>
+      </td>
+      <td>
+        <p>Pause, resume, cancel task.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>audit:launch_static</code></p>
+      </td>
+      <td>
+        <p>Buat dan mulai audit static.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>audit:launch_dynamic</code></p>
+      </td>
+      <td>
+        <p>Buat dan mulai audit dynamic atau hybrid.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>target:manage</code></p>
+      </td>
+      <td>
+        <p>Kelola target, otorisasi, identitas.</p>
+      </td>
+    </tr>
+  </table>
+  <p id="cl2jOyAk"><code>task:create</code> tidak otomatis memberi <code>audit:launch_dynamic</code>. Membuat task <code>explore</code> butuh scope dynamic dan audit yang sudah berjalan di mode dynamic/hybrid. Engine memeriksa ulang snapshot pada setiap launch, siapa pun pemanggilnya.</p>
+  <h3 id="qPShMj96">9.2 Aturan token</h3>
+  <ul id="FNWPa7U9">
+    <li>Nilai token ditampilkan sekali; yang disimpan hanya hash.</li>
+    <li>Token dibatasi ke project atau audit.</li>
+    <li>Token punya masa berlaku dan bisa dicabut.</li>
+    <li><code>last_used_at</code> diperbarui setiap pemakaian.</li>
+    <li>Setiap write dicatat di <code>audit_log</code> dengan token id, aktor, scope, aksi, dan target.</li>
+    <li>Token kedaluwarsa atau dicabut gagal tertutup.</li>
+  </ul>
+  <h3 id="uosCqytp">9.3 Kontrak adapter</h3>
+  <p id="6u8utT6e">Adapter MCP memakai REST API terautentikasi yang sama dengan dashboard. Tidak ada akses langsung ke database atau engine.</p>
+  <p id="CpeuERUD">Tool baca: <code>health</code>, <code>list_audits</code>, <code>get_audit</code>, <code>get_coverage</code>, <code>list_findings</code>, <code>get_finding</code>. Tool tulis: <code>launch_audit</code> (butuh scope launch), <code>create_task</code> (butuh <code>task:create</code>, dan <code>audit:launch_dynamic</code> untuk task dinamis), <code>control_task</code> (butuh <code>task:control</code>).</p>
+  <p id="lVq3KX_4">Claude Code, Codex, dan Pi memakai adapter yang sama. Tidak ada jalur izin per harness.</p>
+  <h2 id="UcKE7i2t">10 · UI</h2>
+  <h3 id="YPNg_WJF">10.1 Target dan coverage</h3>
+  <p id="4lyq2fak">Daftar target dengan status otorisasi, valid-until, dan environment. Daftar aset dengan status uji: belum diuji, sudah diuji, diuji dengan temuan. Filter per kind dan coverage. Drill-down dari aset ke intent dan finding yang di-anchor.</p>
+  <h3 id="M-sZQyl-">10.2 Exploration</h3>
+  <p id="uXcC31Te">Daftar hierarkis, bukan kanvas: goal → intent → fact → finding. Setiap baris menampilkan status, task, sesi, dan jumlah evidence. Klik membuka task, sesi, atau evidence. Kanvas graph bisa ditambahkan nanti dari node dan edge yang sama.</p>
+  <h3 id="7MrBUHmr">10.3 Bukti temuan</h3>
+  <p id="VHNoiGdd">Kutipan source bila ada; HTTP exchange dengan request/response teredaksi; skrip PoC, riwayat run, hasil positive dan negative; riwayat retest dan verdict; label provenance.</p>
+  <p id="fa0aFz3T">API: <code>GET /api/projects/:id/targets</code>, <code>GET /api/audits/:id/assets</code>, <code>GET /api/audits/:id/exploration?format=list</code>, <code>GET /api/findings/:id</code> yang diperluas. SSE menambah event <code>exploration.node</code>, <code>asset.updated</code>, <code>http.exchange</code>, <code>poc.run</code>, <code>retest.updated</code>.</p>
+  <h2 id="x3Wqe238">11 · Rencana kerja</h2>
+  <p id="SzTnryQe">Urutan mengikuti review: izin dan model target dulu, lalu slice pertama.</p>
+  <table id="OJ-L9VEt">
+    <tr>
+      <th>
+        <p>Tahap</p>
+      </th>
+      <th>
+        <p>Isi</p>
+      </th>
+      <th>
+        <p>Exit</p>
+      </th>
+    </tr>
+    <tr>
+      <td>
+        <p>0. Target, otorisasi, identitas, snapshot</p>
+      </td>
+      <td>
+        <p>Migrasi, <code>TargetService</code>, CRUD, pemeriksaan start, tes kasus kedaluwarsa/dicabut/di luar scope. Termasuk <code>audits.repository_id</code> nullable dan jalur dynamic tanpa repo.</p>
+      </td>
+      <td>
+        <p>Audit dinamis tidak bisa start tanpa target valid, otorisasi aktif, dua identitas, dan Docker/Podman.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>1. Permission dan adapter</p>
+      </td>
+      <td>
+        <p><code>api_tokens</code>, <code>TokenService</code>, cek scope di setiap write, tool launch/create/control, audit log.</p>
+      </td>
+      <td>
+        <p>Dua token dengan scope berbeda berperilaku berbeda; semua launch dinamis lewat pemeriksaan yang sama.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>2. Egress dan credential broker</p>
+      </td>
+      <td>
+        <p>Image worker dengan toolkit penuh; jaringan internal per audit; broker HTTP/SOCKS/MITM; host, CIDR, DNS, redirect, metode, rate, ukuran, timeout; injeksi secret target dan provider; evidence.</p>
+      </td>
+      <td>
+        <p>Worker bebas memakai tool di container dan tetap hanya mencapai target berizin lewat broker; redirect, DNS, TCP mentah, atau shell tidak membuka jalur lain.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>3. Graph dan loop</p>
+      </td>
+      <td>
+        <p>Tabel graph, <code>GraphStore</code>, planner/worker, <code>exploration_status</code> sebagai penanda tutup fase 2, validasi intent, dispatch, debounce, budget, stop, recovery.</p>
+      </td>
+      <td>
+        <p>Run scripted menghasilkan aset, intent, fact, coverage; restart melanjutkan di snapshot yang sama.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>4. Bukti pertama loop: horizontal IDOR di fixture</p>
+      </td>
+      <td>
+        <p>Fixture sebagai target lokal dengan dua identitas; kandidat; konfirmasi tiga check; finding dynamic/hybrid; merge lewat <code>link_key</code>; retest; laporan.</p>
+      </td>
+      <td>
+        <p>Kelemahan ownership invoice ditemukan, dikonfirmasi, disimpan, di-retest, dan diekspor tanpa bergantung pada kutipan source.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>5. UI dan laporan</p>
+      </td>
+      <td>
+        <p>Tiga layar, SSE, bagian laporan coverage/bukti/retest, dokumentasi.</p>
+      </td>
+      <td>
+        <p>Operator bisa menelusuri aset → intent → sesi → exchange → PoC → finding → retest.</p>
+      </td>
+    </tr>
+  </table>
+  <p id="FflWQppw">Setelah v1: browser, API spec import, kanvas graph, dan peningkatan coverage/planner. Tidak ada roadmap kelas kerentanan.</p>
+  <h2 id="g6vSz2oh">12 · Pengujian</h2>
+  <p id="J3YFw4f0">Setiap tahap menjaga <code>bun run typecheck</code> dan suite <code>bun test</code> yang ada tetap hijau, dijalankan sebelum edit pertama dan setelah edit terakhir.</p>
+  <table id="sp8r5NSr">
+    <tr>
+      <th>
+        <p>File</p>
+      </th>
+      <th>
+        <p>Cakupan</p>
+      </th>
+    </tr>
+    <tr>
+      <td>
+        <p><code>test/dynamic-targets.test.ts</code></p>
+      </td>
+      <td>
+        <p>Target, otorisasi, identitas, snapshot immutable.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>test/egress.test.ts</code></p>
+      </td>
+      <td>
+        <p>Host, CIDR, DNS pinning, redirect, metode, rate, redaksi.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>test/permissions.test.ts</code></p>
+      </td>
+      <td>
+        <p>Pemisahan scope, expiry, revocation, audit log.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>test/exploration.test.ts</code></p>
+      </td>
+      <td>
+        <p>Validasi planner, lifecycle intent, coverage, stop, recovery.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>test/idor.test.ts</code></p>
+      </td>
+      <td>
+        <p>Positive, exploit, negative check; verdict retest.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p><code>test/dynamic-e2e.test.ts</code></p>
+      </td>
+      <td>
+        <p>Fixture, dua identitas, audit penuh, laporan.</p>
+      </td>
+    </tr>
+  </table>
+  <p id="LNCbTfhp">Tes keamanan: redirect keluar scope; DNS ke private/metadata; metode terlarang; rate limit; token <code>task:create</code> tanpa <code>audit:launch_dynamic</code>; token project A ke project B; secret tidak bocor; prompt injection tidak mengubah scope; worker tidak bisa dispatch atau menyetujui kandidat sendiri; otorisasi kedaluwarsa menghentikan audit.</p>
+  <p id="4bOYTcUs">Fixture <code>test/fixtures/vulnerable-app</code> sudah punya missing invoice ownership check (CWE-639). Tes dinamis menjalankannya di localhost dengan dua user, mendeklarasikannya sebagai target berizin, dan memakai snapshot serta broker. Tes otomatis memakai harness deterministik dengan respons planner dan worker yang ter-script; tidak memanggil model asli.</p>
+  <h2 id="RbOTBHk7">13 · Risiko dan tradeoff</h2>
+  <table id="uilPZRPy">
+    <tr>
+      <th>
+        <p>Risiko</p>
+      </th>
+      <th>
+        <p>Mitigasi</p>
+      </th>
+    </tr>
+    <tr>
+      <td>
+        <p>Prompt injection mencoba melewati scope</p>
+      </td>
+      <td>
+        <p>Worker tanpa rute eksternal; semua traffic target lewat broker; cek snapshot per request.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Harness masih punya jaringan provider</p>
+      </td>
+      <td>
+        <p>Traffic provider juga lewat broker; worker memegang placeholder key.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>SQLite contention dari update graph</p>
+      </td>
+      <td>
+        <p>WAL, queue serial per audit, transaksi kecil.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Biaya planner</p>
+      </td>
+      <td>
+        <p>Debounce, model murah, cap budget, nol intent diperbolehkan.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>False positive</p>
+      </td>
+      <td>
+        <p>Exploit check plus positive/negative control; konfirmasi independen.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Otorisasi kedaluwarsa di tengah audit</p>
+      </td>
+      <td>
+        <p>Stop condition; task dinamis diblokir; audit tidak ditandai selesai.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>DNS rebinding</p>
+      </td>
+      <td>
+        <p>Resolve sekali, validasi semua jawaban, pin IP, cek ulang redirect.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Temuan dinamis tanpa root cause source</p>
+      </td>
+      <td>
+        <p>Provenance eksplisit dan label laporan; tidak mengarang lokasi.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Container runtime tidak tersedia</p>
+      </td>
+      <td>
+        <p>Audit dynamic/hybrid menolak start; jalur statis tetap memakai bwrap.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Docker atau Podman jadi dependensi</p>
+      </td>
+      <td>
+        <p>Hanya mode dinamis; installer mendeteksi dan menjelaskan; mode statis tidak berubah.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Container escape atau supply chain image</p>
+      </td>
+      <td>
+        <p>Non-root, capability dilepas, root read-only, tanpa host mount, image dipin digest.</p>
+      </td>
+    </tr>
+    <tr>
+      <td>
+        <p>Penyalahgunaan CA MITM</p>
+      </td>
+      <td>
+        <p>CA per audit, hanya di trust store worker, dihapus bersama jaringan audit.</p>
+      </td>
+    </tr>
+  </table>
+  <h2 id="jHEwc5FP">14 · Definition of done</h2>
+  <ul id="O9ZvV7V6" type="check">
+    <li checked="false">Horizontal IDOR di fixture ditemukan worker, dikonfirmasi di sesi baru, disimpan dengan bukti dinamis, dan diekspor dalam semua format laporan.</li>
+    <li checked="false">Finding punya exploit check, positive control, dan negative control yang lulus.</li>
+    <li checked="false">Kutipan source dilampirkan kalau handler ditemukan; kalau tidak, laporan menyatakannya.</li>
+    <li checked="false">Retest mengembalikan <code>still_reproducible</code>, <code>fixed</code>, atau <code>cannot_confirm</code>; <code>fixed</code> butuh positive control lulus.</li>
+    <li checked="false">Token <code>task:create</code> tanpa <code>audit:launch_dynamic</code> tidak bisa launch atau memperluas audit dinamis.</li>
+    <li checked="false">Request di luar snapshot diblokir sebelum keluar dan menghentikan audit.</li>
+    <li checked="false">Otorisasi kedaluwarsa menghentikan audit.</li>
+    <li checked="false">Tidak ada secret di prompt, transkrip, evidence, atau laporan.</li>
+    <li checked="false"><code>bun run typecheck</code> dan <code>bun test</code> lulus, termasuk tes baru.</li>
+    <li checked="false">Jalur audit statis tetap lulus e2e yang ada.</li>
+  </ul>
+  <p id="1FpUcnCG">Gerbang otomatis memakai harness deterministik. <code>bun run e2e:dynamic</code> dengan Pi dan Claude Code asli adalah acceptance manual dan bukan bagian CI. Host tanpa bwrap atau container runtime melewati tes dinamis dengan alasan tercatat; suite statis tetap jalan.</p>
+  <h2 id="JAcvCcKS">15 · Yang diserahkan ke builder</h2>
+  <ul id="EclvQ0r9">
+    <li>TTL token default dan nilai budget default.</li>
+    <li>Interval debounce planner.</li>
+    <li>Batas ukuran request dan response.</li>
+    <li>Bentuk baris daftar exploration.</li>
+    <li>Coverage sebagai query atau tabel materialized di rilis pertama.</li>
+    <li>Daftar pola redaksi per target.</li>
+  </ul>
+  <h2 id="AdMLzfTn">16 · Satu item terbuka</h2>
+  <p id="NfZYj5XI">Definisi gagal dari putaran 1 belum dijawab. Usulan untuk disetujui bersama desain:</p>
+  <blockquote id="KfFZtJU2">
+    <p>Proyek ini gagal kalau worker otonom bisa keluar dari scope berizin; kalau grant tulis sendiri membuka eksplorasi dinamis; kalau temuan bisa CONFIRMED tanpa run dan kontrol yang reproducible; kalau coverage dilaporkan lengkap padahal target tidak benar-benar diuji; atau kalau secret sampai ke prompt, log, evidence, atau laporan.</p>
+  </blockquote>
+  <p id="qVez7JFw">Kalau salah, koreksi sebelum persetujuan. Ini menjadi aturan penerimaan untuk setiap tahap berikutnya.</p>
+  <h2 id="9PHtu4--">17 · Jawaban review builder</h2>
+  <p id="yey2wt2U">Reviewer baru membaca desain ini terhadap kode. Sebelas pertanyaannya dijawab di bawah; bagian di atas sudah diperbarui.</p>
+  <ol id="apROh7ZZ">
+    <li><b>Repo wajib?</b> Dynamic boleh tanpa repo; static dan hybrid wajib. <code>audits.repository_id</code> menjadi nullable. Dynamic tanpa repo melewati fase 1 dan memakai mode laporan tanpa source.</li>
+    <li><b>Kapan fase 2 selesai?</b> <code>audits.exploration_status</code> tetap open sampai engine menutupnya. Barrier menunggu task discover statis dan eksplorasi closed. Satu retry per intent.</li>
+    <li><b>Budget dibagi?</b> Dua pool: exploration cap dan verification reserve, default 60/40. <code>max_requests</code> menghitung semua request broker.</li>
+    <li><b>Goal proven dan asset tested?</b> Asset teruji hanya dengan minimal satu exchange allowed ber-respons, ter-anchor ke intent atau fact selesai. Goal proven kalau semua aset in-scope teruji atau not_applicable dan tidak ada intent terbuka.</li>
+    <li><b>Retest dan fase 5?</b> Fase 5 tetap final. Retest pasca-audit, punya authorization snapshot sendiri, butuh otorisasi valid, dan tidak mengubah provenance. <code>fixed</code> butuh environment match. Verdict nullable sampai selesai.</li>
+    <li><b>Check PoC bermakna?</b> Positive dan exploit memakai object id yang sama; positive memakai owner, exploit memakai penyerang; negative memakai object lain. Engine mengevaluasi predicate, bukan klaim model.</li>
+    <li><b>Worker melihat repo?</b> Mount repo read-only bila ada, plus scratch writable terpisah. Dynamic-only tanpa repo.</li>
+    <li><b>Merge hybrid?</b> Lewat <code>link_key</code> eksplisit; judul tidak dipakai. Satu finding dengan provenance hybrid, atau dua finding.</li>
+    <li><b>Authorized actions dan restrictions?</b> JSON terstruktur untuk metode, path, state change, upload, brute force, dan approval. Tidak ada whitelist kelas kerentanan atau <code>test_class</code>; planner bebas memilih hipotesis di dalam target. <code>category</code> hanya label laporan.</li>
+    <li><b>Approval mid-session?</b> <code>http_request</code> mengembalikan <code>approval_required</code>; tool menunggu, approval terikat hash request.</li>
+    <li><b>Harness asli di tes?</b> CI memakai harness deterministik; <code>bun run e2e:dynamic</code> dengan harness asli manual. Host tanpa bwrap atau container runtime melewati tes dinamis.</li>
+  </ol>
+  <p id="UJ4Kyqz8">Panggilanku saat menjawab: kebijakan repo dynamic; split budget 60/40; predikat coverage dari exchange; retest butuh otorisasi baru dan environment match; pasangan struktural PoC; harness deterministik di CI; penanda tutup fase 2 dan satu retry per intent.</p>
+  <h2 id="Fwgpnslh">Lampiran · Artefak dan keputusan</h2>
+  <p id="i9XERVQW">Dokumen ini menggantikan putaran 1 dan 2. Keputusan yang dipakai: target live opsional dengan snapshot source; <code>explore</code> di fase 2; tabel graph baru; Pi dan Claude Code; rantai evidence; otorisasi di egress; mode di <code>audits.config</code>; snapshot scope; bukti pertama IDOR horizontal, bukan roadmap kelas; kutipan source opsional; PoC dengan negative check; pemisahan target/otorisasi/identitas; batas egress; credential broker; UI daftar; verdict retest ketat; permission terpisah; <code>AuditEngine</code> sebagai otoritas tunggal.</p>
+  <p id="i78UFLUI">Fakta repo yang dipakai: enam fase di <code>src/orchestrator/engine.ts</code>; <code>HarnessAdapter</code> di <code>src/harness/types.ts</code>; sandbox di <code>src/harness/sandbox.ts</code>; skema di <code>src/db/migrations.ts</code>; evidence gate di <code>src/orchestrator/evidence-gate.ts</code>; redaksi di <code>src/security/redact.ts</code>; route di <code>src/api/api.ts</code>; fixture di <code>test/fixtures/vulnerable-app</code>.</p>
+</doc>
+

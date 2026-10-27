@@ -82,7 +82,7 @@ test("upgrading runtime tool inheritance preserves custom role restrictions and 
     expect(upgraded.get("SELECT inherit_tools FROM agent_defs WHERE role = 'independent_validator'")).toEqual({ inherit_tools: 1 });
     expect(upgraded.get("SELECT inherit_tools, allowed_tools FROM agent_defs WHERE role = 'security_researcher'")).toEqual({ inherit_tools: 0, allowed_tools: '["read"]' });
     expect(upgraded.get("SELECT inherit_tools, allow_shell FROM agent_defs WHERE role = 'retest_auditor'")).toEqual({ inherit_tools: 0, allow_shell: 1 });
-    expect(upgraded.all("SELECT version FROM schema_migrations ORDER BY version")).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+    expect(upgraded.all("SELECT version FROM schema_migrations ORDER BY version")).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }]);
   } finally {
     upgraded.close();
     rmSync(directory, { recursive: true, force: true });
@@ -420,7 +420,7 @@ describe("repository import", () => {
       name: "Fixture",
       source_path: fixture,
       scope_include: JSON.stringify(["**/*.js", "**/*.json", "README.md"]),
-      scope_exclude: JSON.stringify(["src/routes/media.js"]),
+      scope_exclude: JSON.stringify(["src/routes/media.js", "node_modules/**"]),
     };
     store.run(
       `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
@@ -475,7 +475,7 @@ describe("repository import", () => {
   });
 
   test("workspaces are read-only by default and owner-writable only on explicit request", async () => {
-    const scope = { include: ["**/*.js", "**/*.json", "README.md"], exclude: ["src/routes/media.js"] };
+    const scope = { include: ["**/*.js", "**/*.json", "README.md"], exclude: ["src/routes/media.js", "node_modules/**"] };
     const inventory = await buildInventory(fixture, { scope, maxFiles: 100, maxFileBytes: 1_000_000 });
     const readOnly = join(dir, "workspace-read-only");
     const writable = join(dir, "workspace-writable");
@@ -670,6 +670,45 @@ describe("evidence chain", () => {
       reason: "Evidence file is larger than the recorded content",
     });
   });
+
+  for (const truncate of [false, true]) {
+    test(`evidence content ${truncate ? "rejects EOF" : "reassembles partial reads"} after opening the sidecar`, async () => {
+      const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "partial", content: "alpha" });
+      const probe = await open(row.content_path, "r");
+      const proto = Object.getPrototypeOf(probe) as {
+        read: (
+          this: unknown,
+          buffer: Buffer,
+          offset: number,
+          length: number,
+          position: number,
+        ) => Promise<{ bytesRead: number }>;
+      };
+      await probe.close();
+      const originalRead = proto.read;
+      let reads = 0;
+      proto.read = async function (buffer, offset, length, position) {
+        reads += 1;
+        const result = await originalRead.call(this, buffer, offset, Math.min(length, 7), position);
+        if (truncate && reads === 1) writeFileSync(row.content_path, "");
+        return result;
+      };
+      try {
+        if (truncate) {
+          await expect(evidence.content(row.id)).rejects.toMatchObject({
+            status: 409,
+            code: "conflict",
+            message: "Evidence integrity check failed; Evidence file is missing or unreadable",
+          });
+        } else {
+          expect((await evidence.content(row.id))?.content).toBe("alpha");
+        }
+        expect(reads).toBeGreaterThan(1);
+      } finally {
+        proto.read = originalRead;
+      }
+    });
+  }
 
   test("reports omit a code excerpt whose sidecar does not match the database record", async () => {
     store.run(

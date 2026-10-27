@@ -1,4 +1,4 @@
-export type Migration = { version: number; name: string; sql: string };
+export type Migration = { version: number; name: string; sql: string; foreignKeysOff?: boolean };
 
 export const migrations: Migration[] = [
   {
@@ -418,6 +418,282 @@ WHERE role IN ('codebase_mapper','security_researcher','independent_validator','
   AND allow_shell = 0
   AND ((harness = 'pi' AND json(allowed_tools) = '["read","grep","find","ls"]')
     OR (harness = 'claude-code' AND json(allowed_tools) = '["Read","Grep","Glob","LS"]'));
+`,
+  },
+  {
+    version: 4,
+    name: "dynamic_targets_and_identities",
+    sql: `
+CREATE TABLE project_targets (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  label TEXT NOT NULL,
+  base_url TEXT NOT NULL,
+  environment TEXT NOT NULL,
+  repository_id TEXT REFERENCES repositories(id),
+  allowed_hosts TEXT NOT NULL,
+  allowed_cidrs TEXT NOT NULL,
+  allowed_methods TEXT NOT NULL,
+  max_rps REAL NOT NULL DEFAULT 5,
+  tls_required INTEGER NOT NULL DEFAULT 1 CHECK (tls_required IN (0,1)),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','disabled')),
+  created_by TEXT REFERENCES users(id),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_project_targets_project ON project_targets(project_id, status);
+
+CREATE TABLE target_authorizations (
+  id TEXT PRIMARY KEY,
+  target_id TEXT NOT NULL REFERENCES project_targets(id) ON DELETE CASCADE,
+  authorized_by TEXT NOT NULL,
+  authorization_ref TEXT NOT NULL,
+  valid_from TEXT NOT NULL,
+  valid_until TEXT NOT NULL,
+  authorized_actions TEXT NOT NULL,
+  restrictions TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','expired','revoked')),
+  created_by TEXT REFERENCES users(id),
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_target_authorizations_target ON target_authorizations(target_id, status, valid_until);
+
+CREATE TABLE test_identities (
+  id TEXT PRIMARY KEY,
+  target_id TEXT NOT NULL REFERENCES project_targets(id) ON DELETE CASCADE,
+  label TEXT NOT NULL,
+  role TEXT NOT NULL,
+  auth_kind TEXT NOT NULL CHECK (auth_kind IN ('none','header','cookie','basic')),
+  secret_ref TEXT,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','expired','disabled')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_test_identities_target ON test_identities(target_id, status);
+`,
+  },
+  {
+    version: 5,
+    name: "audit_mode_and_nullable_repository",
+    foreignKeysOff: true,
+    sql: `
+CREATE TABLE audits_new (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  repository_id TEXT REFERENCES repositories(id),
+  status TEXT NOT NULL CHECK (status IN ('queued','running','completed','completed_with_errors','failed','cancelling','cancelled')),
+  current_phase INTEGER NOT NULL DEFAULT 1,
+  config TEXT NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'static' CHECK (mode IN ('static','dynamic','hybrid')),
+  stop_reason TEXT,
+  exploration_status TEXT CHECK (exploration_status IN ('not_applicable','open','closing','closed')),
+  created_by TEXT REFERENCES users(id),
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  error TEXT
+);
+INSERT INTO audits_new
+  (id, project_id, repository_id, status, current_phase, config, created_by, created_at, started_at, finished_at, error)
+SELECT id, project_id, repository_id, status, current_phase, config, created_by, created_at, started_at, finished_at, error
+FROM audits;
+DROP TABLE audits;
+ALTER TABLE audits_new RENAME TO audits;
+CREATE INDEX idx_audits_project ON audits(project_id);
+CREATE INDEX idx_audits_status ON audits(status);
+`,
+  },
+  {
+    version: 6,
+    name: "audit_scope_snapshots",
+    sql: `
+CREATE TABLE audit_scope_snapshots (
+  audit_id TEXT PRIMARY KEY REFERENCES audits(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL,
+  snapshot TEXT NOT NULL,
+  sha256 TEXT NOT NULL
+);
+CREATE TRIGGER audit_scope_snapshots_no_update
+BEFORE UPDATE ON audit_scope_snapshots
+BEGIN SELECT RAISE(ABORT, 'audit scope snapshot is immutable'); END;
+CREATE TRIGGER audit_scope_snapshots_no_delete
+BEFORE DELETE ON audit_scope_snapshots
+BEGIN SELECT RAISE(ABORT, 'audit scope snapshot is immutable'); END;
+`,
+  },
+  {
+    version: 7,
+    name: "api_tokens",
+    sql: `
+CREATE TABLE api_tokens (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  label TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  scopes TEXT NOT NULL,
+  project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
+  audit_id TEXT REFERENCES audits(id) ON DELETE CASCADE,
+  expires_at TEXT,
+  revoked_at TEXT,
+  last_used_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_api_tokens_user ON api_tokens(user_id);
+`,
+  },
+  {
+    version: 8,
+    name: "asset_and_exploration_graphs",
+    sql: `
+CREATE TABLE assets (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('root_domain','subdomain','ip','service','app','endpoint')),
+  asset_key TEXT NOT NULL,
+  parent_id TEXT REFERENCES assets(id),
+  data TEXT NOT NULL,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  UNIQUE (project_id, kind, asset_key)
+);
+CREATE INDEX idx_assets_project ON assets(project_id);
+
+CREATE TABLE asset_edges (
+  from_asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  to_asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  PRIMARY KEY (from_asset_id, to_asset_id, kind)
+);
+
+CREATE TABLE exploration_nodes (
+  id TEXT PRIMARY KEY,
+  audit_id TEXT NOT NULL REFERENCES audits(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('goal','intent','fact','finding','hint')),
+  status TEXT NOT NULL CHECK (status IN ('proposed','approved','claimed','running','completed','failed','rejected')),
+  task_id TEXT REFERENCES tasks(id),
+  session_id TEXT REFERENCES agent_sessions(id),
+  payload TEXT NOT NULL,
+  retry_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_exploration_audit ON exploration_nodes(audit_id, status, kind);
+
+CREATE TABLE exploration_edges (
+  from_node_id TEXT NOT NULL REFERENCES exploration_nodes(id) ON DELETE CASCADE,
+  to_node_id TEXT NOT NULL REFERENCES exploration_nodes(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('spawns','derived_from','yields','proves','rejects')),
+  PRIMARY KEY (from_node_id, to_node_id, kind)
+);
+
+CREATE TABLE anchors (
+  node_id TEXT NOT NULL REFERENCES exploration_nodes(id) ON DELETE CASCADE,
+  asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  PRIMARY KEY (node_id, asset_id)
+);
+CREATE INDEX idx_anchors_asset ON anchors(asset_id);
+`,
+  },
+  {
+    version: 9,
+    name: "finding_retests",
+    sql: `
+CREATE TABLE retests (
+  id TEXT PRIMARY KEY,
+  finding_id TEXT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+  audit_id TEXT NOT NULL REFERENCES audits(id) ON DELETE CASCADE,
+  requested_by TEXT REFERENCES users(id),
+  reason TEXT NOT NULL,
+  fix_reference TEXT,
+  authorization_snapshot TEXT NOT NULL,
+  environment_manifest TEXT NOT NULL,
+  commit_sha TEXT,
+  build_ref TEXT,
+  environment_match INTEGER CHECK (environment_match IN (0,1)),
+  executed_by TEXT,
+  positive_check TEXT,
+  status TEXT NOT NULL CHECK (status IN ('queued','running','completed','failed')),
+  verdict TEXT CHECK (verdict IN ('still_reproducible','fixed','cannot_confirm')),
+  evidence_refs TEXT,
+  started_at TEXT,
+  ended_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_retests_finding ON retests(finding_id, created_at);
+`,
+  },
+  {
+    version: 10,
+    name: "audit_exploration_cost",
+    sql: `
+ALTER TABLE audits ADD COLUMN exploration_cost_usd REAL NOT NULL DEFAULT 0;
+`,
+  },
+  {
+    version: 11,
+    name: "dynamic_candidates",
+    foreignKeysOff: true,
+    sql: `
+CREATE TABLE candidates_new (
+  id TEXT PRIMARY KEY,
+  audit_id TEXT NOT NULL REFERENCES audits(id) ON DELETE CASCADE,
+  area_id TEXT,
+  discovery_task_id TEXT REFERENCES tasks(id),
+  discovery_session_id TEXT REFERENCES agent_sessions(id),
+  title TEXT NOT NULL,
+  category TEXT NOT NULL,
+  cwe TEXT,
+  severity TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('discovered','confirming','confirmed','refuted','inconclusive','duplicate','persisted')),
+  finding_id TEXT,
+  provenance TEXT NOT NULL DEFAULT 'static' CHECK (provenance IN ('static','dynamic','hybrid')),
+  link_key TEXT,
+  payload TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+INSERT INTO candidates_new
+  (id, audit_id, area_id, discovery_task_id, discovery_session_id, title, category, cwe, severity,
+   status, finding_id, provenance, link_key, payload, created_at)
+SELECT id, audit_id, area_id, discovery_task_id, discovery_session_id, title, category, cwe, severity,
+       status, finding_id, 'static', NULL, payload, created_at
+FROM candidates;
+DROP TABLE candidates;
+ALTER TABLE candidates_new RENAME TO candidates;
+CREATE INDEX idx_candidates_audit ON candidates(audit_id);
+CREATE INDEX idx_candidates_status ON candidates(status);
+CREATE INDEX idx_candidates_link ON candidates(audit_id, link_key);
+`,
+  },
+  {
+    version: 12,
+    name: "verification_session_optional",
+    foreignKeysOff: true,
+    sql: `
+CREATE TABLE verifications_new (
+  id TEXT PRIMARY KEY,
+  audit_id TEXT NOT NULL REFERENCES audits(id) ON DELETE CASCADE,
+  candidate_id TEXT REFERENCES candidates(id),
+  finding_id TEXT REFERENCES findings(id),
+  kind TEXT NOT NULL CHECK (kind IN ('confirmation','reverification')),
+  agent_session_id TEXT REFERENCES agent_sessions(id),
+  discovery_session_id TEXT,
+  verdict TEXT NOT NULL CHECK (verdict IN ('CONFIRMED','REFUTED','INCONCLUSIVE','DUPLICATE','REVERIFIED','REJECTED','NEEDS_CORRECTION','UNRESOLVED')),
+  rationale TEXT NOT NULL,
+  evidence_check TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+INSERT INTO verifications_new
+  (id, audit_id, candidate_id, finding_id, kind, agent_session_id, discovery_session_id, verdict,
+   rationale, evidence_check, payload, created_at)
+SELECT id, audit_id, candidate_id, finding_id, kind, agent_session_id, discovery_session_id, verdict,
+       rationale, evidence_check, payload, created_at
+FROM verifications;
+DROP TABLE verifications;
+ALTER TABLE verifications_new RENAME TO verifications;
+CREATE INDEX idx_verifications_audit ON verifications(audit_id);
+CREATE INDEX idx_verifications_candidate ON verifications(candidate_id);
+CREATE INDEX idx_verifications_finding ON verifications(finding_id);
 `,
   },
 ];

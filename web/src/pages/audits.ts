@@ -32,6 +32,7 @@ type Audit = {
   current_phase: number;
   phase_name: string;
   config: Record<string, unknown>;
+  mode?: "static" | "dynamic" | "hybrid";
   created_at: string;
   started_at: string | null;
   finished_at: string | null;

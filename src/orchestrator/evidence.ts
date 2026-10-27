@@ -1,5 +1,4 @@
-import { constants } from "node:fs";
-import { mkdir, open, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Config } from "../config.ts";
 import { KeyedSerialQueue } from "../concurrency.ts";
@@ -7,6 +6,7 @@ import { EVIDENCE_DIR } from "../config.ts";
 import type { Store } from "../db/index.ts";
 import { AppError, now, sha256, toJson, uid } from "../util.ts";
 import { redactSecrets } from "../security/redact.ts";
+import { readRegularFile } from "../security/regular-file.ts";
 
 export type EvidenceRow = {
   id: string;
@@ -200,37 +200,17 @@ export class EvidenceStore {
 
   private async readVerified(row: EvidenceRow): Promise<{ ok: true; text: string } | { ok: false; reason: string }> {
     const limit = this.maxSidecarBytes(row);
-    let handle: Awaited<ReturnType<typeof open>> | undefined;
-    // Both flags are required for the open below to fail closed. A missing
-    // flag is `undefined`, and `number | undefined` becomes `number | 0`.
-    const noFollow = constants.O_NOFOLLOW;
-    const nonBlock = constants.O_NONBLOCK;
-    if (typeof noFollow !== "number" || typeof nonBlock !== "number" || noFollow === 0 || nonBlock === 0) {
-      return { ok: false, reason: "Evidence file is missing or unreadable" };
-    }
     try {
-      // O_NOFOLLOW binds the size check and the read to one inode. O_NONBLOCK
-      // makes a replaced pipe return immediately; opening it for read would
-      // otherwise wait until another process connects a writer.
-      handle = await open(row.content_path, constants.O_RDONLY | noFollow | nonBlock);
-      const info = await handle.stat();
-      if (!info.isFile()) return { ok: false, reason: "Evidence file is missing or unreadable" };
-      // Cap the read at the size just observed. readFile() stats again and would
-      // load a file that grew past the bound after this check.
-      const expected = info.size;
-      if (!Number.isSafeInteger(expected) || expected < 0) {
-        return { ok: false, reason: "Evidence file is missing or unreadable" };
+      const read = await readRegularFile(row.content_path, { maxBytes: limit });
+      if (!read.ok) {
+        return {
+          ok: false,
+          reason: read.reason === "too_large"
+            ? "Evidence file is larger than the recorded content"
+            : "Evidence file is missing or unreadable",
+        };
       }
-      if (expected > limit) return { ok: false, reason: "Evidence file is larger than the recorded content" };
-      const buffer = Buffer.alloc(expected);
-      let offset = 0;
-      while (offset < expected) {
-        const { bytesRead } = await handle.read(buffer, offset, expected - offset, offset);
-        if (bytesRead === 0) break;
-        offset += bytesRead;
-      }
-      if (offset !== expected) return { ok: false, reason: "Evidence file is missing or unreadable" };
-      const raw = buffer.toString("utf8");
+      const raw = read.bytes.toString("utf8");
       if (Buffer.byteLength(raw) > limit) {
         return { ok: false, reason: "Evidence file is larger than the recorded content" };
       }
@@ -276,8 +256,6 @@ export class EvidenceStore {
       return { ok: true, text };
     } catch {
       return { ok: false, reason: "Evidence file is missing or unreadable" };
-    } finally {
-      await handle?.close().catch(() => undefined);
     }
   }
 

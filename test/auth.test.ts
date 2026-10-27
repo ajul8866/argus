@@ -14,6 +14,9 @@ import { EvidenceStore } from "../src/orchestrator/evidence.ts";
 import { DEFAULT_EXCLUDES } from "../src/repo/inventory.ts";
 import { ReportService } from "../src/reports/generator.ts";
 import { getSetting, harnessConfig, saveHarnessConfig, seedDefaults, setSetting } from "../src/settings.ts";
+import { TokenService } from "../src/auth/tokens.ts";
+import { GraphStore } from "../src/dynamic/graph.ts";
+import { now } from "../src/util.ts";
 
 function config(dataDir: string): Config {
   return {
@@ -638,4 +641,352 @@ test("sensitive settings require confirmation only when newly enabled", async ()
   expect((await update({ "reports.organization": "My team" })).status).toBe(200);
   expect((await update({ "security.allow_shell_tools": false, "security.allow_writable_workspace": false })).status).toBe(200);
   expect((await update(settings)).status).toBe(400);
+});
+
+test("dynamic target, authorization, and identity routes enforce roles and hide secrets", async () => {
+  const { api, headers } = await projectClient();
+  const projectResponse = await api(new Request("http://localhost/api/projects", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ name: "Targets", source_path: dir, scope_include: ["**/*"] }),
+  }));
+  expect(projectResponse.status).toBe(201);
+  const projectId = (await projectResponse.json()).project.id;
+
+  const targetResponse = await api(new Request(`http://localhost/api/projects/${projectId}/targets`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      label: "Staging",
+      base_url: "https://app.example.test",
+      environment: "staging",
+      allowed_hosts: ["app.example.test"],
+      allowed_methods: ["GET"],
+    }),
+  }));
+  expect(targetResponse.status).toBe(201);
+  const target = (await targetResponse.json()).target;
+  expect(target.allowedHosts).toEqual(["app.example.test"]);
+
+  const authorizationResponse = await api(new Request(`http://localhost/api/targets/${target.id}/authorizations`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      authorized_by: "Tester",
+      authorization_ref: "AUTH-1",
+      valid_from: "2020-01-01T00:00:00.000Z",
+      valid_until: "2099-01-01T00:00:00.000Z",
+      authorized_actions: { methods: ["GET"] },
+      restrictions: {},
+    }),
+  }));
+  expect(authorizationResponse.status).toBe(201);
+
+  const identityResponse = await api(new Request(`http://localhost/api/targets/${target.id}/identities`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ label: "User A", role: "user_a", auth_kind: "header", secret_ref: "cred_a" }),
+  }));
+  expect(identityResponse.status).toBe(201);
+  const identity = (await identityResponse.json()).identity;
+  expect(identity).not.toHaveProperty("secretRef");
+  expect(identity).not.toHaveProperty("secret_ref");
+
+  const list = await api(new Request(`http://localhost/api/projects/${projectId}/targets`, { headers }));
+  expect(list.status).toBe(200);
+  expect((await list.json()).targets).toHaveLength(1);
+
+  await auth.createUser("viewer@test.local", "Viewer", "viewer-password", "viewer");
+  const viewerLogin = await auth.login("viewer@test.local", "viewer-password", "local", "test");
+  const viewerHeaders = {
+    cookie: `argus_session=${viewerLogin.token}`,
+    "x-csrf-token": viewerLogin.csrf,
+    "content-type": "application/json",
+  };
+  const forbiddenResponse = await api(new Request(`http://localhost/api/projects/${projectId}/targets`, {
+    method: "POST",
+    headers: viewerHeaders,
+    body: JSON.stringify({
+      label: "Nope",
+      base_url: "https://nope.example.test",
+      environment: "staging",
+      allowed_hosts: ["nope.example.test"],
+    }),
+  }));
+  expect(forbiddenResponse.status).toBe(403);
+  expect(store.all("SELECT action FROM audit_log WHERE action LIKE 'target.%' ORDER BY id")).toHaveLength(3);
+});
+
+test("token scopes gate dynamic launches independently of task:create", async () => {
+  const { api, headers, userId } = await projectClient();
+  const tokens = new TokenService(store);
+
+  const createProject = async (name: string): Promise<string> => {
+    const response = await api(new Request("http://localhost/api/projects", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name, source_path: dir, scope_include: ["**/*"] }),
+    }));
+    expect(response.status).toBe(201);
+    return (await response.json()).project.id;
+  };
+
+  const projectId = await createProject("Scoped project");
+  const otherProjectId = await createProject("Other project");
+  store.run(
+    `INSERT INTO repositories (id, project_id, path, commit_sha, branch, languages, frameworks, inventory, graph, file_count, total_bytes, imported_at)
+     VALUES ('repo_scoped', ?, ?, NULL, 'test', '[]', '[]', '[]', '{}', 0, 0, ?)`,
+    projectId,
+    dir,
+    now(),
+  );
+
+  const targetResponse = await api(new Request(`http://localhost/api/projects/${projectId}/targets`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      label: "Staging",
+      base_url: "https://app.example.test",
+      environment: "staging",
+      allowed_hosts: ["app.example.test"],
+      allowed_methods: ["GET"],
+    }),
+  }));
+  expect(targetResponse.status).toBe(201);
+  const targetId = (await targetResponse.json()).target.id;
+
+  const staticToken = tokens.create({
+    userId,
+    label: "static",
+    scopes: ["task:create", "audit:launch_static"],
+    projectId,
+  });
+  const staticHeaders = { authorization: `Bearer ${staticToken.raw}`, "content-type": "application/json" };
+
+  const dynamicWithStaticScope = await api(new Request("http://localhost/api/audits", {
+    method: "POST",
+    headers: staticHeaders,
+    body: JSON.stringify({ project_id: projectId, mode: "dynamic", target_id: targetId }),
+  }));
+  expect(dynamicWithStaticScope.status).toBe(403);
+
+  const staticAudit = await api(new Request("http://localhost/api/audits", {
+    method: "POST",
+    headers: staticHeaders,
+    body: JSON.stringify({ project_id: projectId, mode: "static" }),
+  }));
+  expect(staticAudit.status).toBe(201);
+
+  const dynamicToken = tokens.create({
+    userId,
+    label: "dynamic",
+    scopes: ["audit:launch_dynamic"],
+    projectId,
+  });
+  const dynamicHeaders = { authorization: `Bearer ${dynamicToken.raw}`, "content-type": "application/json" };
+  const dynamicAudit = await api(new Request("http://localhost/api/audits", {
+    method: "POST",
+    headers: dynamicHeaders,
+    body: JSON.stringify({ project_id: projectId, mode: "dynamic", target_id: targetId }),
+  }));
+  expect(dynamicAudit.status).toBe(201);
+
+  const otherToken = tokens.create({
+    userId,
+    label: "other",
+    scopes: ["audit:launch_dynamic"],
+    projectId: otherProjectId,
+  });
+  const otherHeaders = { authorization: `Bearer ${otherToken.raw}`, "content-type": "application/json" };
+  const crossProject = await api(new Request("http://localhost/api/audits", {
+    method: "POST",
+    headers: otherHeaders,
+    body: JSON.stringify({ project_id: projectId, mode: "dynamic", target_id: targetId }),
+  }));
+  expect(crossProject.status).toBe(403);
+
+  store.run(
+    "INSERT INTO audits (id, project_id, repository_id, status, current_phase, config, mode, created_at) VALUES ('a_task', ?, NULL, 'running', 1, '{}', 'static', ?)",
+    projectId,
+    now(),
+  );
+  store.run(
+    "INSERT INTO tasks (id, audit_id, phase, kind, task_key, title, status, payload, attempts, max_attempts, created_at) VALUES ('t1','a_task',1,'phase1.map','phase1:map','Map','failed','{}',1,2,?)",
+    now(),
+  );
+  const taskToken = tokens.create({
+    userId,
+    label: "task only",
+    scopes: ["task:create"],
+    projectId,
+  });
+  const taskHeaders = { authorization: `Bearer ${taskToken.raw}`, "content-type": "application/json" };
+  const deniedControl = await api(new Request("http://localhost/api/tasks/t1/retry", {
+    method: "POST",
+    headers: taskHeaders,
+    body: "{}",
+  }));
+  expect(deniedControl.status).toBe(403);
+});
+
+test("adapter routes create tasks and read findings under token scopes", async () => {
+  const { api, userId } = await projectClient();
+  const tokens = new TokenService(store);
+  store.run(
+    `INSERT INTO projects (id, name, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+     VALUES ('p_adapter','Adapter', ?, '**/*', '', 'Tester', 'AUTH', ?, ?)`,
+    dir,
+    now(),
+    now(),
+  );
+  store.run(
+    "INSERT INTO audits (id, project_id, repository_id, status, current_phase, config, mode, created_at) VALUES ('a_adapter','p_adapter',NULL,'running',1,'{}','dynamic',?)",
+    now(),
+  );
+  store.run(
+    `INSERT INTO findings
+     (id, code, audit_id, project_id, title, category, cwe, severity, status, repository_commit, files,
+      root_cause, preconditions, reproduction, expected, observed, impact, remediation, created_at, updated_at)
+     VALUES ('f1','F-1','a_adapter','p_adapter','Test','idor',NULL,'high','confirmed',NULL,'[]',
+      'root','none','steps','expected','observed','impact','fix',?,?)`,
+    now(),
+    now(),
+  );
+
+  const headersFor = (raw: string) => ({ authorization: `Bearer ${raw}`, "content-type": "application/json" });
+  const onlyCreate = tokens.create({
+    userId,
+    label: "adapter",
+    scopes: ["task:create"],
+    projectId: "p_adapter",
+  });
+  const denied = await api(new Request("http://localhost/api/audits/a_adapter/tasks", {
+    method: "POST",
+    headers: headersFor(onlyCreate.raw),
+    body: JSON.stringify({ kind: "explore", payload: {}, agent_role: "security_researcher" }),
+  }));
+  expect(denied.status).toBe(403);
+
+  const both = tokens.create({
+    userId,
+    label: "adapter dynamic",
+    scopes: ["task:create", "audit:launch_dynamic"],
+    projectId: "p_adapter",
+  });
+  const created = await api(new Request("http://localhost/api/audits/a_adapter/tasks", {
+    method: "POST",
+    headers: headersFor(both.raw),
+    body: JSON.stringify({ kind: "explore", payload: {}, agent_role: "security_researcher" }),
+  }));
+  expect(created.status).toBe(201);
+  expect((await created.json()).task.audit_id).toBe("a_adapter");
+
+  const reader = tokens.create({
+    userId,
+    label: "reader",
+    scopes: ["finding:read"],
+    projectId: "p_adapter",
+  });
+  const finding = await api(new Request("http://localhost/api/findings/f1", {
+    headers: { authorization: `Bearer ${reader.raw}` },
+  }));
+  expect(finding.status).toBe(200);
+  expect((await finding.json()).finding.id).toBe("f1");
+
+  const missing = await api(new Request("http://localhost/api/findings/missing", {
+    headers: { authorization: `Bearer ${reader.raw}` },
+  }));
+  expect(missing.status).toBe(404);
+});
+
+test("exploration route returns assets, nodes, edges, anchors, and coverage", async () => {
+  const { api, headers } = await projectClient();
+  store.run(
+    `INSERT INTO projects (id, name, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+     VALUES ('p_graph','Graph', ?, '**/*', '', 'Tester', 'AUTH-GRAPH', ?, ?)`,
+    dir,
+    now(),
+    now(),
+  );
+  store.run(
+    `INSERT INTO audits (id, project_id, repository_id, status, current_phase, config, mode, exploration_status, created_at)
+     VALUES ('a_graph','p_graph',NULL,'running',2,'{}','dynamic','open',?)`,
+    now(),
+  );
+  const graph = new GraphStore(store);
+  const asset = graph.upsertAsset({ projectId: "p_graph", kind: "app", assetKey: "https://graph.test" });
+  const goal = graph.createNode({ auditId: "a_graph", kind: "goal", payload: { text: "Find access issues" } });
+  const intent = graph.createNode({
+    auditId: "a_graph",
+    kind: "intent",
+    status: "completed",
+    payload: { title: "Read another identity invoice" },
+  });
+  const fact = graph.createNode({ auditId: "a_graph", kind: "fact", status: "completed", payload: { status: 200 } });
+  graph.anchor(goal.id, asset.id);
+  graph.anchor(intent.id, asset.id);
+  graph.anchor(fact.id, asset.id);
+  graph.linkNodes(goal.id, intent.id, "spawns");
+  graph.linkNodes(intent.id, fact.id, "yields");
+
+  const response = await api(new Request("http://localhost/api/audits/a_graph/exploration", { headers }));
+  expect(response.status).toBe(200);
+  const body = await response.json();
+  expect(body.assets).toHaveLength(1);
+  expect(body.assets[0]).toMatchObject({ id: asset.id, assetKey: "https://graph.test" });
+  expect(body.nodes).toHaveLength(3);
+  expect(body.edges).toHaveLength(2);
+  expect(body.edges).toEqual(
+    expect.arrayContaining([
+      { fromNodeId: goal.id, toNodeId: intent.id, kind: "spawns" },
+      { fromNodeId: intent.id, toNodeId: fact.id, kind: "yields" },
+    ]),
+  );
+  expect(body.anchors).toHaveLength(3);
+  expect(body.coverage).toEqual([
+    expect.objectContaining({ assetId: asset.id, assetKey: "https://graph.test", tested: true }),
+  ]);
+});
+
+test("a user can issue and revoke an API token for a worker", async () => {
+  const { api, headers } = await projectClient();
+  const created = await api(new Request("http://localhost/api/tokens", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ label: "worker", scopes: ["audit:propose_candidate"], audit_id: "a_missing" }),
+  }));
+  expect(created.status).toBe(400);
+
+  store.run(
+    `INSERT INTO projects (id, name, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+     VALUES ('p_tok','Tokens', ?, '**/*', '', 'Tester', 'AUTH-TOK', ?, ?)`,
+    dir,
+    now(),
+    now(),
+  );
+  store.run(
+    `INSERT INTO audits (id, project_id, repository_id, status, current_phase, config, mode, created_at)
+     VALUES ('a_tok','p_tok',NULL,'running',2,'{}','dynamic',?)`,
+    now(),
+  );
+  const issued = await api(new Request("http://localhost/api/tokens", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ label: "worker", scopes: ["audit:propose_candidate"], audit_id: "a_tok" }),
+  }));
+  expect(issued.status).toBe(201);
+  const body = await issued.json();
+  expect(body.token.raw).toStartWith("argus_");
+  expect(body.token.scopes).toEqual(["audit:propose_candidate"]);
+  const listed = await api(new Request("http://localhost/api/tokens", { headers }));
+  expect(listed.status).toBe(200);
+  const listedBody = await listed.json();
+  expect(listedBody.tokens).toHaveLength(1);
+  // The raw value is returned once and must never be readable again.
+  expect(JSON.stringify(listedBody)).not.toContain(body.token.raw);
+
+  const revoked = await api(new Request(`http://localhost/api/tokens/${body.token.id}`, { method: "DELETE", headers }));
+  expect(revoked.status).toBe(200);
+  const after = await api(new Request("http://localhost/api/tokens", { headers }));
+  expect((await after.json()).tokens).toEqual([]);
 });

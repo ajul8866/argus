@@ -4,6 +4,8 @@ import { classifyExplorerPath } from "../web/src/pages/explorer.ts";
 import { createLiveRefresh, LIVE_REFRESH_DEBOUNCE_MS } from "../web/src/live-refresh.ts";
 import { shouldDeferRefresh, shouldRefreshOnReturn } from "../web/src/refresh-policy.ts";
 import { createAuditWithSnapshot, createProjectWithSnapshot } from "../web/src/components/audit-setup.ts";
+import { coverageRows, type ExplorationPayload } from "../web/src/pages/coverage.ts";
+import { explorationRows } from "../web/src/pages/exploration.ts";
 
 type Dispatched = { type: string };
 
@@ -449,5 +451,105 @@ describe("deferred refresh while a dialog is open", () => {
     page.refresh.dispose();
     page.timer.fire();
     expect(page.renders()).toBe(0);
+  });
+});
+
+describe("dynamic exploration views", () => {
+  const payload: ExplorationPayload = {
+    assets: [
+      { id: "a1", kind: "app", assetKey: "https://app.test" },
+      { id: "a2", kind: "endpoint", assetKey: "/api/invoices/inv-1" },
+    ],
+    nodes: [
+      { id: "n1", kind: "goal", status: "completed", payload: { text: "Find access control issues" }, taskId: null, sessionId: null },
+      { id: "n2", kind: "intent", status: "completed", payload: { title: "Cross-tenant invoice read" }, taskId: "t1", sessionId: "s1" },
+      { id: "n3", kind: "finding", status: "completed", payload: { finding_id: "f1", title: "IDOR" }, taskId: null, sessionId: null },
+      { id: "n4", kind: "fact", status: "completed", payload: { summary: "200" }, taskId: null, sessionId: null },
+    ],
+    edges: [
+      { fromNodeId: "n1", toNodeId: "n2", kind: "spawns" },
+      { fromNodeId: "n2", toNodeId: "n3", kind: "proves" },
+    ],
+    anchors: [
+      { nodeId: "n1", assetId: "a1" },
+      { nodeId: "n2", assetId: "a1" },
+      { nodeId: "n3", assetId: "a1" },
+      { nodeId: "n4", assetId: "a2" },
+    ],
+    coverage: [
+      { assetId: "a1", kind: "app", assetKey: "https://app.test", tested: true },
+      { assetId: "a2", kind: "endpoint", assetKey: "/api/invoices/inv-1", tested: false },
+    ],
+  };
+
+  test("coverage counts anchored nodes and findings, untested assets first", () => {
+    expect(coverageRows(payload)).toEqual([
+      { assetId: "a2", kind: "endpoint", assetKey: "/api/invoices/inv-1", tested: false, nodes: 1, findings: 0 },
+      { assetId: "a1", kind: "app", assetKey: "https://app.test", tested: true, nodes: 3, findings: 1 },
+    ]);
+  });
+
+  test("exploration rows expose the hypothesis, assets, and finding link", () => {
+    const rows = explorationRows(payload);
+    expect(rows).toHaveLength(4);
+    expect(rows.find((row) => row.id === "n2")).toMatchObject({
+      label: "Cross-tenant invoice read",
+      taskId: "t1",
+      sessionId: "s1",
+      assets: ["https://app.test"],
+    });
+    expect(rows.find((row) => row.id === "n3")?.findingId).toBe("f1");
+    expect(rows.find((row) => row.id === "n1")?.label).toBe("Find access control issues");
+  });
+});
+
+describe("dynamic audit setup", () => {
+  function script(results: Array<{ status?: number; body: unknown }>) {
+    const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ path: String(input), body: init?.body ? JSON.parse(String(init.body)) : {} });
+      const next = results.shift();
+      if (!next) throw new Error("Unexpected extra request");
+      return response(next.status ?? 200, next.body);
+    }) as typeof fetch;
+    return calls;
+  }
+
+  test("a dynamic audit is created without importing a repository", async () => {
+    const calls = script([{ body: { audit: { id: "a1" } } }]);
+    const result = await createAuditWithSnapshot({
+      projectId: "p1",
+      startNow: false,
+      mode: "dynamic",
+      targetId: "t1",
+    });
+    expect(result).toEqual({ id: "a1", startError: null });
+    expect(calls.map((call) => call.path)).toEqual(["/api/audits"]);
+    expect(calls[0]!.body).toMatchObject({ project_id: "p1", mode: "dynamic", target_id: "t1" });
+    expect(calls[0]!.body.repository_id).toBeUndefined();
+  });
+
+  test("a dynamic audit without a target is refused before any request", async () => {
+    const calls = script([]);
+    await expect(
+      createAuditWithSnapshot({ projectId: "p1", startNow: false, mode: "dynamic" }),
+    ).rejects.toThrow(/target/i);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("a hybrid audit still imports the repository when none is selected", async () => {
+    const calls = script([
+      { body: { repository: { id: "r1" } } },
+      { body: { audit: { id: "a2" } } },
+    ]);
+    const result = await createAuditWithSnapshot({
+      projectId: "p1",
+      startNow: false,
+      mode: "hybrid",
+      targetId: "t1",
+    });
+    expect(result.id).toBe("a2");
+    expect(calls.map((call) => call.path)).toEqual(["/api/projects/p1/import", "/api/audits"]);
+    expect(calls[1]!.body).toMatchObject({ repository_id: "r1", mode: "hybrid", target_id: "t1" });
   });
 });

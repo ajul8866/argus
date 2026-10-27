@@ -1634,6 +1634,41 @@ describe("repository import", () => {
     insert("p-main-worktree-linked", mainWorktreeChild);
     expect(await attempt("p-main-worktree-linked", mainWorktreeChild, null)).toBe("invalid_repository");
 
+    const symrefPlain = prepare("symref-plain");
+    writeFileSync(join(symrefPlain, ".git", "refs", "tags", "master"), "ref: main-worktree/ORIG_HEAD\n");
+    rmSync(join(symrefPlain, ".git", "ORIG_HEAD"), { force: true });
+    fifo(join(symrefPlain, ".git", "ORIG_HEAD"));
+    insert("p-symref-plain", symrefPlain);
+    expect(await attempt("p-symref-plain", symrefPlain, null)).toBe("invalid_repository");
+
+    const symrefPrivateMain = prepare("symref-private-main");
+    const symrefPrivateChild = join(dir, "symref-private-child");
+    git(symrefPrivateMain, ["worktree", "add", "-q", "-b", "wt", symrefPrivateChild, "master"]);
+    const symrefPrivateGitdir = readFileSync(join(symrefPrivateChild, ".git"), "utf8").trim();
+    const symrefPrivateDeclared = symrefPrivateGitdir.startsWith("gitdir: ") ? symrefPrivateGitdir.slice("gitdir: ".length).trim() : "";
+    const symrefPrivateGit = symrefPrivateDeclared.startsWith("/") ? symrefPrivateDeclared : join(symrefPrivateChild, symrefPrivateDeclared);
+    mkdirSync(join(symrefPrivateGit, "refs", "bisect"), { recursive: true });
+    mkdirSync(join(symrefPrivateMain, ".git", "refs", "bisect"), { recursive: true });
+    writeFileSync(join(symrefPrivateMain, ".git", "refs", "tags", "wt"), "ref: refs/bisect/bad\n");
+    writeFileSync(join(symrefPrivateMain, ".git", "refs", "bisect", "bad"), "ref: refs/heads/master\n");
+    fifo(join(symrefPrivateGit, "refs", "bisect", "bad"));
+    insert("p-symref-private", symrefPrivateChild);
+    expect(await attempt("p-symref-private", symrefPrivateChild, null)).toBe("invalid_repository");
+
+    const symrefCrossMain = prepare("symref-cross-main");
+    git(symrefCrossMain, ["checkout", "-q", "-b", "holder"]);
+    const symrefCrossChild = join(dir, "symref-cross-child");
+    git(symrefCrossMain, ["worktree", "add", "-q", symrefCrossChild, "master"]);
+    const symrefCrossGitdir = readFileSync(join(symrefCrossChild, ".git"), "utf8").trim();
+    const symrefCrossDeclared = symrefCrossGitdir.startsWith("gitdir: ") ? symrefCrossGitdir.slice("gitdir: ".length).trim() : "";
+    const symrefCrossGit = symrefCrossDeclared.startsWith("/") ? symrefCrossDeclared : join(symrefCrossChild, symrefCrossDeclared);
+    writeFileSync(join(symrefCrossGit, "ORIG_HEAD"), "ref: refs/heads/master\n");
+    writeFileSync(join(symrefCrossMain, ".git", "refs", "tags", "master"), "ref: main-worktree/ORIG_HEAD\n");
+    rmSync(join(symrefCrossMain, ".git", "ORIG_HEAD"), { force: true });
+    fifo(join(symrefCrossMain, ".git", "ORIG_HEAD"));
+    insert("p-symref-cross", symrefCrossChild);
+    expect(await attempt("p-symref-cross", symrefCrossChild, null)).toBe("invalid_repository");
+
     const healthy = prepare("branch-healthy");
     insert("p-branch-healthy", healthy);
     const imported = await importRepository({ config, store }, projectFor("p-branch-healthy", healthy), null, "tester");
@@ -1677,6 +1712,41 @@ describe("repository import", () => {
     insert("p-main-worktree-linked-healthy", healthyLinked);
     const linkedImported = await importRepository({ config, store }, projectFor("p-main-worktree-linked-healthy", healthyLinked), null, "tester");
     expect(await Bun.file(join(linkedImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const healthySymref = prepare("symref-healthy");
+    writeFileSync(join(healthySymref, ".git", "ORIG_HEAD"), "ref: refs/heads/master\n");
+    writeFileSync(join(healthySymref, ".git", "refs", "tags", "master"), "ref: main-worktree/ORIG_HEAD\n");
+    insert("p-symref-healthy", healthySymref);
+    const symrefImported = await importRepository({ config, store }, projectFor("p-symref-healthy", healthySymref), null, "tester");
+    expect(await Bun.file(join(symrefImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const healthyPrivateMain = prepare("symref-private-healthy-main");
+    const healthyPrivateChild = join(dir, "symref-private-healthy-child");
+    git(healthyPrivateMain, ["worktree", "add", "-q", "-b", "wt-ok", healthyPrivateChild, "master"]);
+    const healthyPrivateGitdir = readFileSync(join(healthyPrivateChild, ".git"), "utf8").trim();
+    const healthyPrivateDeclared = healthyPrivateGitdir.startsWith("gitdir: ") ? healthyPrivateGitdir.slice("gitdir: ".length).trim() : "";
+    const healthyPrivateGit = healthyPrivateDeclared.startsWith("/") ? healthyPrivateDeclared : join(healthyPrivateChild, healthyPrivateDeclared);
+    mkdirSync(join(healthyPrivateGit, "refs", "bisect"), { recursive: true });
+    writeFileSync(join(healthyPrivateMain, ".git", "refs", "tags", "wt-ok"), "ref: refs/bisect/bad\n");
+    writeFileSync(join(healthyPrivateGit, "refs", "bisect", "bad"), "ref: refs/heads/master\n");
+    insert("p-symref-private-healthy", healthyPrivateChild);
+    const privateImported = await importRepository({ config, store }, projectFor("p-symref-private-healthy", healthyPrivateChild), null, "tester");
+    expect(await Bun.file(join(privateImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+
+    const healthyCrossMain = prepare("symref-cross-healthy-main");
+    git(healthyCrossMain, ["checkout", "-q", "-b", "holder-ok"]);
+    const healthyCrossChild = join(dir, "symref-cross-healthy-child");
+    git(healthyCrossMain, ["worktree", "add", "-q", healthyCrossChild, "master"]);
+    const healthyCrossGitdir = readFileSync(join(healthyCrossChild, ".git"), "utf8").trim();
+    const healthyCrossDeclared = healthyCrossGitdir.startsWith("gitdir: ") ? healthyCrossGitdir.slice("gitdir: ".length).trim() : "";
+    const healthyCrossGit = healthyCrossDeclared.startsWith("/") ? healthyCrossDeclared : join(healthyCrossChild, healthyCrossDeclared);
+    writeFileSync(join(healthyCrossMain, ".git", "ORIG_HEAD"), "ref: refs/heads/master\n");
+    writeFileSync(join(healthyCrossMain, ".git", "refs", "tags", "master"), "ref: main-worktree/ORIG_HEAD\n");
+    rmSync(join(healthyCrossGit, "ORIG_HEAD"), { force: true });
+    fifo(join(healthyCrossGit, "ORIG_HEAD"));
+    insert("p-symref-cross-healthy", healthyCrossChild);
+    const crossImported = await importRepository({ config, store }, projectFor("p-symref-cross-healthy", healthyCrossChild), null, "tester");
+    expect(await Bun.file(join(crossImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
   });
 
   test("workspaces are read-only by default and owner-writable only on explicit request", async () => {

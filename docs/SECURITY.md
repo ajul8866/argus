@@ -62,7 +62,9 @@ LLM agents. Use it only on repositories you are authorized to assess.
   common directory too. A private ref in that chain, such as `refs/bisect/`, is read
   from the worktree git directory rather than the common directory. The same private
   name prefixed with `main-worktree/` is the main worktree's copy and is read from
-  the common directory under the bare name. A config `include` or
+  the common directory under the bare name. A symref found while probing an
+  abbreviation uses that same mapping, so a pipe on the private ref or pseudoref
+  it names is rejected before Git opens it. A config `include` or
   `includeIf` is rejected wherever Git would start that section, including
   after another section on the same line. The directory named by a gitfile or
   `commondir` is the path Git opens: trailing CR and LF are removed, spaces

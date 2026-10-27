@@ -125,11 +125,15 @@ function gitRefParts(refName: string): string[] {
 
 // Follow a symref chain without opening a pipe or a symlink. Git opens the
 // same path while resolving HEAD and while resolving the requested revision,
-// and a fifo there waits until another process connects a writer.
-async function assertLooseRef(gitDir: string, refName: string, depth: number): Promise<void> {
+// and a fifo there waits until another process connects a writer. The next hop
+// is not always another file in this directory: private names live beside the
+// current worktree HEAD, and `main-worktree/<private>` lives in the common
+// directory under the bare name.
+async function assertLooseRef(headDir: string, refRoot: string, refName: string, depth: number): Promise<void> {
   if (depth > 8) throw invalidGitMetadata();
-  const parts = gitRefParts(refName);
-  let current = gitDir;
+  const located = gitRefLocation(headDir, refRoot, refName);
+  const parts = gitRefParts(located.name);
+  let current = located.base;
   for (let index = 0; index < parts.length; index += 1) {
     const part = parts[index];
     if (!part) throw invalidGitMetadata();
@@ -151,7 +155,7 @@ async function assertLooseRef(gitDir: string, refName: string, depth: number): P
   const text = await readSmallGitText(current);
   const line = text?.split("\n", 1)[0] ?? "";
   if (!line.startsWith("ref:")) return;
-  await assertLooseRef(gitDir, line.slice("ref:".length).trim(), depth + 1);
+  await assertLooseRef(headDir, refRoot, line.slice("ref:".length).trim(), depth + 1);
 }
 
 // "name~3" and "name^2" select an ancestor. Git opens the loose ref for the
@@ -184,10 +188,11 @@ function revisionRefName(ref: string): string {
 // longer probe cannot be opened as a directory, so that one probe stops.
 // A symlink can be followed into a pipe, and the final file can be a symref
 // to a pipe outside refs/.
-async function assertProbedRef(gitDir: string, refName: string): Promise<void> {
+async function assertProbedRef(headDir: string, refRoot: string, refName: string): Promise<void> {
   if (!refName) return;
-  const parts = gitRefParts(refName);
-  let current = gitDir;
+  const located = gitRefLocation(headDir, refRoot, refName);
+  const parts = gitRefParts(located.name);
+  let current = located.base;
   for (let index = 0; index < parts.length; index += 1) {
     const part = parts[index];
     if (!part) throw invalidGitMetadata();
@@ -207,13 +212,13 @@ async function assertProbedRef(gitDir: string, refName: string): Promise<void> {
     if (entry.isDirectory()) return;
     if (!entry.isFile()) throw invalidGitMetadata();
   }
-  await assertLooseRef(gitDir, refName, 0);
+  await assertLooseRef(headDir, refRoot, refName, 0);
 }
 
 // repo_dwim_ref tries these six shapes and, when ambiguous-ref warnings are
 // on, opens every one of them. A pipe at refs/tags/<name> blocks verification
 // of the branch <name> before Git reaches refs/heads/<name>.
-async function assertRequestedRevision(gitDir: string, ref: string): Promise<void> {
+async function assertRequestedRevision(headDir: string, refRoot: string, ref: string): Promise<void> {
   const name = revisionRefName(ref);
   if (!name) return;
   const probes = [
@@ -224,7 +229,7 @@ async function assertRequestedRevision(gitDir: string, ref: string): Promise<voi
     `refs/remotes/${name}`,
     `refs/remotes/${name}/HEAD`,
   ];
-  for (const probe of probes) await assertProbedRef(gitDir, probe);
+  for (const probe of probes) await assertProbedRef(headDir, refRoot, probe);
 }
 
 // Git walks these abbreviations from the most specific rule. Strict mode
@@ -286,6 +291,17 @@ function mainWorktreeRefName(refName: string): string | null {
   return isWorktreePrivateRef(bare) ? bare : null;
 }
 
+// Git's files backend maps a ref name to one loose path. Private names and
+// pseudorefs are beside this worktree's HEAD. `main-worktree/<private>` is
+// the main worktree's copy and drops the prefix. Anything else, including
+// `worktrees/<id>/<private>`, is a path under the common directory.
+function gitRefLocation(headDir: string, refRoot: string, refName: string): { base: string; name: string } {
+  const main = mainWorktreeRefName(refName);
+  if (main) return { base: refRoot, name: main };
+  if (isWorktreePrivateRef(refName)) return { base: headDir, name: refName };
+  return { base: refRoot, name: refName };
+}
+
 // `--abbrev-ref HEAD` follows the symref chain and shortens the final ref.
 // A linked worktree stores shared refs in the common directory. The next hop
 // of a private ref is still the file next to HEAD.
@@ -300,8 +316,8 @@ async function finalHeadRef(headDir: string, refRoot: string): Promise<string | 
     if (!target || seen.has(target)) throw invalidGitMetadata();
     seen.add(target);
     full = target;
-    const bare = mainWorktreeRefName(target);
-    const next = await looseRefLine(bare ? refRoot : isWorktreePrivateRef(target) ? headDir : refRoot, bare ?? target);
+    const located = gitRefLocation(headDir, refRoot, target);
+    const next = await looseRefLine(located.base, located.name);
     if (next === null) break;
     line = next;
   }
@@ -310,8 +326,9 @@ async function finalHeadRef(headDir: string, refRoot: string): Promise<string | 
 
 // Every import runs `rev-parse HEAD` and `--abbrev-ref HEAD` before the
 // requested revision is verified. Those commands open the six candidates for
-// HEAD and for every abbreviation of the final branch. A linked worktree
-// stores the branch refs in the common directory, so that directory is probed too.
+// HEAD and for every abbreviation of the final branch, and they follow a
+// symref found there to the path Git opens next. A linked worktree stores the
+// branch refs in the common directory, so that directory is probed too.
 async function assertGitLookups(
   gitDir: string,
   ref: string | null,
@@ -334,12 +351,13 @@ async function assertGitLookups(
     if (base) names.add(base);
   }
   const common = await linkedGitDirectory(gitDir);
-  const finalRef = await finalHeadRef(gitDir, common ?? gitDir);
+  const refRoot = common ?? gitDir;
+  const finalRef = await finalHeadRef(gitDir, refRoot);
   if (finalRef) {
     names.add(finalRef);
     for (const shortName of gitShortRefNames(finalRef)) names.add(shortName);
   }
-  for (const name of names) await assertRequestedRevision(gitDir, name);
+  for (const name of names) await assertRequestedRevision(gitDir, refRoot, name);
   if (common) await assertGitLookups(common, ref, [...names], seen);
 }
 
@@ -586,8 +604,8 @@ async function assertGitDirectoryMetadata(gitDir: string, seen = new Set<string>
   await assertConfigHasNoInclude(join(gitDir, "config.worktree"));
   const head = await readSmallGitText(join(gitDir, "HEAD"));
   const headLine = head?.split("\n", 1)[0] ?? "";
-  if (headLine.startsWith("ref:")) await assertLooseRef(gitDir, headLine.slice("ref:".length).trim(), 0);
   const common = await linkedGitDirectory(gitDir);
+  if (headLine.startsWith("ref:")) await assertLooseRef(gitDir, common ?? gitDir, headLine.slice("ref:".length).trim(), 0);
   if (common) await assertGitDirectoryMetadata(common, seen);
 }
 

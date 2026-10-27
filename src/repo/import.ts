@@ -527,6 +527,63 @@ async function distinctGitDirectory(left: string, right: string): Promise<boolea
   if (common) await assertGitLookups(common, ref, [...names], seen);
 }
 
+// abbrev-ref follows the symref chain and probes the final short name.
+// A worktree import does not pass a revision, but gitInfo still runs that
+// command. The loose refs may live in a linked common directory.
+function symrefShortName(full: string): string | null {
+  if (full.startsWith("refs/heads/") && full.length > "refs/heads/".length) {
+    return full.slice("refs/heads/".length);
+  }
+  if (full.startsWith("refs/tags/") && full.length > "refs/tags/".length) {
+    return full.slice("refs/tags/".length);
+  }
+  if (full.startsWith("refs/remotes/") && full.endsWith("/HEAD")) {
+    const remote = full.slice("refs/remotes/".length, -"/HEAD".length);
+    return remote.length > 0 ? remote : null;
+  }
+  if (full.startsWith("refs/remotes/") && full.length > "refs/remotes/".length) {
+    return full.slice("refs/remotes/".length);
+  }
+  return null;
+}
+
+async function readLooseRefLine(gitDir: string, refName: string): Promise<string | null> {
+  const parts = gitRefParts(refName);
+  let path = gitDir;
+  for (const part of parts) path = join(path, part);
+  const text = await readSmallGitText(path);
+  return text?.split("\n", 1)[0] ?? null;
+}
+
+async function resolvedBranchName(headDir: string, refRoot: string): Promise<string | null> {
+  const head = await readSmallGitText(join(headDir, "HEAD"));
+  let line = head?.split("\n", 1)[0] ?? "";
+  let short: string | null = null;
+  const seen = new Set<string>();
+  for (let depth = 0; depth < 8 && line.startsWith("ref:"); depth += 1) {
+    const full = line.slice("ref:".length).trim();
+    if (!full || seen.has(full)) break;
+    seen.add(full);
+    const nextShort = symrefShortName(full);
+    if (nextShort) short = nextShort;
+    const next = await readLooseRefLine(refRoot, full);
+    line = next ?? "";
+  }
+  return short;
+}
+
+async function assertResolvedHeadProbes(gitDir: string): Promise<void> {
+  const common = await linkedGitDirectory(gitDir);
+  const refRoot = common ?? gitDir;
+  const names = ["HEAD"];
+  const branch = await resolvedBranchName(gitDir, refRoot);
+  if (branch) names.push(branch);
+  const roots = common && common !== gitDir ? [gitDir, common] : [gitDir];
+  for (const root of roots) {
+    for (const name of names) await assertRequestedRevision(root, name);
+  }
+}
+
 // Git opens include.path while parsing config, before a command-line -c
 // override exists. Section headers are recognized wherever the parser is
 // between values, including after another header on the same line. A comment
@@ -930,6 +987,8 @@ export async function importRepository(
     throw badRequest("Invalid git ref");
   }
   const gitDirectory = await assertLocalGitReadable(sourceRoot);
+  if (gitDirectory) await assertResolvedHeadProbes(gitDirectory);
+  if (ref && gitDirectory) await assertRequestedRevision(gitDirectory, ref);
   if (gitDirectory) await assertGitLookups(gitDirectory, ref);
   const refArchive = ref ? await prepareRefArchive(sourceRoot) : null;
   const git = await gitInfo(sourceRoot);

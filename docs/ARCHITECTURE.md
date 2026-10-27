@@ -206,8 +206,10 @@ route handles HTTP authorization and audit logging. Inventory and workspace
 copying reuse a local scope matcher so each reached glob is compiled once per
 operation, preserving include/exclude short-circuit behavior.
 
-1. Project source path is resolved with `realpath` and must be under
-   `ARGUS_ALLOWED_ROOTS`.
+1. Project source path is pinned by walking each component without following
+   a symlink and must be under `ARGUS_ALLOWED_ROOTS`. A symlink is rejected
+   even when its target remains inside an allowed location. `realpath` is not
+   used here, because it would follow that symlink and authorize the target.
 2. Import builds an inventory using include/exclude globs. Only regular files
    (no symlinks) within scope and size caps are included. The repository path
    is pinned by walking each component without following a symlink. Each read

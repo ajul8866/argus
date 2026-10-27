@@ -13,7 +13,7 @@ import { EvidenceStore } from "../src/orchestrator/evidence.ts";
 import { ReportService } from "../src/reports/generator.ts";
 import { buildInventory, gitInfo } from "../src/repo/inventory.ts";
 import { importRepository } from "../src/repo/import.ts";
-import { canonicalDirectory, createWorkspace, readCappedRegularFile, readScopedFile, verifyQuote } from "../src/repo/workspace.ts";
+import { assertAuthorizedRoot, canonicalDirectory, createWorkspace, readCappedRegularFile, readScopedFile, verifyQuote } from "../src/repo/workspace.ts";
 import { createScopeMatcher, globToRegExp, matchesScope, extractJson, sha256 } from "../src/util.ts";
 import { redactSecrets } from "../src/security/redact.ts";
 import { credentialEnvironment, decryptSecret, encryptSecret, type StoredCredential } from "../src/security/credentials.ts";
@@ -187,7 +187,7 @@ describe("host repository folders", () => {
       expect(JSON.stringify(first)).not.toContain("outside-link");
       expect(JSON.stringify(first)).not.toContain(".private");
       expect(JSON.stringify(first)).not.toContain("node_modules");
-      await expect(listRepositoryFolders(roots, { path: join(directory, "outside-link") })).rejects.toMatchObject({ code: "repository_not_authorized" });
+      await expect(listRepositoryFolders(roots, { path: join(directory, "outside-link") })).rejects.toMatchObject({ code: "invalid_repository" });
       await expect(listRepositoryFolders(roots, { path: join(directory, "missing") })).rejects.toMatchObject({ code: "invalid_repository" });
       await expect(listRepositoryFolders(roots, { path: join(directory, "secret.txt") })).rejects.toMatchObject({ code: "invalid_repository" });
       await expect(listRepositoryFolders(roots, { offset: "-1" })).rejects.toMatchObject({ code: "bad_request" });
@@ -836,6 +836,69 @@ describe("repository import", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("authorization and import reject a symlink whose target remains inside an allowed root", async () => {
+    const allowed = dir;
+    const source = join(allowed, "proj", "app");
+    const outside = join(allowed, "other", "app");
+    const scope = { include: ["**/*"], exclude: [] };
+    mkdirSync(source, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(source, "a.js"), "INSIDE_CONTENT");
+    writeFileSync(join(outside, "a.js"), "SECRET_ANCESTOR_SENTINEL");
+
+    const before = await assertAuthorizedRoot(source, [allowed]);
+    expect(before).toBe(realpathSync(source));
+    expect((await readScopedFile(before, "a.js", scope)).content).toBe("INSIDE_CONTENT");
+
+    renameSync(join(allowed, "proj"), join(allowed, "proj.bak"));
+    symlinkSync(join(allowed, "other"), join(allowed, "proj"));
+
+    await expect(canonicalDirectory(source)).rejects.toMatchObject({ code: "out_of_scope" });
+    await expect(assertAuthorizedRoot(source, [allowed])).rejects.toMatchObject({ code: "invalid_repository" });
+    const swapped = {
+      id: "p-ancestor",
+      name: "Swapped",
+      source_path: source,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    };
+    store.run(
+      `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+       VALUES (?, ?, '', ?, ?, ?, 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+      swapped.id, swapped.name, swapped.source_path, swapped.scope_include, swapped.scope_exclude,
+    );
+    await expect(importRepository({ config: { ...config, allowedRoots: [allowed] }, store }, swapped, null, "tester"))
+      .rejects.toMatchObject({ code: "invalid_repository" });
+    expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+    expect(existsSync(join(dir, "repos"))).toBe(false);
+
+    const leaf = join(allowed, "leaf");
+    const leafOutside = join(allowed, "leaf-out");
+    mkdirSync(leaf, { recursive: true });
+    mkdirSync(leafOutside, { recursive: true });
+    writeFileSync(join(leaf, "a.js"), "LEAF_INSIDE");
+    writeFileSync(join(leafOutside, "a.js"), "SECRET_LEAF_SENTINEL");
+    const leafBefore = await assertAuthorizedRoot(leaf, [allowed]);
+    expect((await readScopedFile(leafBefore, "a.js", scope)).content).toBe("LEAF_INSIDE");
+    renameSync(leaf, `${leaf}.bak`);
+    symlinkSync(leafOutside, leaf);
+    await expect(assertAuthorizedRoot(leaf, [allowed])).rejects.toMatchObject({ code: "invalid_repository" });
+    await expect(readScopedFile(leaf, "a.js", scope)).rejects.toMatchObject({ code: "out_of_scope" });
+  });
+
+  test("a symlink used as an allowed root does not authorize its target", async () => {
+    const real = join(dir, "real-root");
+    const alias = join(dir, "alias-root");
+    const app = join(real, "app");
+    mkdirSync(app, { recursive: true });
+    writeFileSync(join(app, "a.js"), "SECRET_BOUNDARY_SENTINEL");
+    symlinkSync(real, alias);
+    await expect(assertAuthorizedRoot(app, [alias])).rejects.toMatchObject({ code: "repository_not_authorized" });
+    const authorized = await assertAuthorizedRoot(app, [real]);
+    expect(authorized).toBe(realpathSync(app));
+    expect((await readScopedFile(authorized, "a.js", { include: ["**/*"], exclude: [] })).content).toBe("SECRET_BOUNDARY_SENTINEL");
   });
 });
 

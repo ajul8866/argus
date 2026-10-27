@@ -4,6 +4,8 @@ import { classifyExplorerPath } from "../web/src/pages/explorer.ts";
 import { createLiveRefresh, LIVE_REFRESH_DEBOUNCE_MS } from "../web/src/live-refresh.ts";
 import { shouldDeferRefresh, shouldRefreshOnReturn } from "../web/src/refresh-policy.ts";
 import { createAuditWithSnapshot, createProjectWithSnapshot } from "../web/src/components/audit-setup.ts";
+import { coverageRows, type ExplorationPayload } from "../web/src/pages/coverage.ts";
+import { explorationRows } from "../web/src/pages/exploration.ts";
 
 type Dispatched = { type: string };
 
@@ -449,5 +451,54 @@ describe("deferred refresh while a dialog is open", () => {
     page.refresh.dispose();
     page.timer.fire();
     expect(page.renders()).toBe(0);
+  });
+});
+
+describe("dynamic exploration views", () => {
+  const payload: ExplorationPayload = {
+    assets: [
+      { id: "a1", kind: "app", assetKey: "https://app.test" },
+      { id: "a2", kind: "endpoint", assetKey: "/api/invoices/inv-1" },
+    ],
+    nodes: [
+      { id: "n1", kind: "goal", status: "completed", payload: { text: "Find access control issues" }, taskId: null, sessionId: null },
+      { id: "n2", kind: "intent", status: "completed", payload: { title: "Cross-tenant invoice read" }, taskId: "t1", sessionId: "s1" },
+      { id: "n3", kind: "finding", status: "completed", payload: { finding_id: "f1", title: "IDOR" }, taskId: null, sessionId: null },
+      { id: "n4", kind: "fact", status: "completed", payload: { summary: "200" }, taskId: null, sessionId: null },
+    ],
+    edges: [
+      { fromNodeId: "n1", toNodeId: "n2", kind: "spawns" },
+      { fromNodeId: "n2", toNodeId: "n3", kind: "proves" },
+    ],
+    anchors: [
+      { nodeId: "n1", assetId: "a1" },
+      { nodeId: "n2", assetId: "a1" },
+      { nodeId: "n3", assetId: "a1" },
+      { nodeId: "n4", assetId: "a2" },
+    ],
+    coverage: [
+      { assetId: "a1", kind: "app", assetKey: "https://app.test", tested: true },
+      { assetId: "a2", kind: "endpoint", assetKey: "/api/invoices/inv-1", tested: false },
+    ],
+  };
+
+  test("coverage counts anchored nodes and findings, untested assets first", () => {
+    expect(coverageRows(payload)).toEqual([
+      { assetId: "a2", kind: "endpoint", assetKey: "/api/invoices/inv-1", tested: false, nodes: 1, findings: 0 },
+      { assetId: "a1", kind: "app", assetKey: "https://app.test", tested: true, nodes: 3, findings: 1 },
+    ]);
+  });
+
+  test("exploration rows expose the hypothesis, assets, and finding link", () => {
+    const rows = explorationRows(payload);
+    expect(rows).toHaveLength(4);
+    expect(rows.find((row) => row.id === "n2")).toMatchObject({
+      label: "Cross-tenant invoice read",
+      taskId: "t1",
+      sessionId: "s1",
+      assets: ["https://app.test"],
+    });
+    expect(rows.find((row) => row.id === "n3")?.findingId).toBe("f1");
+    expect(rows.find((row) => row.id === "n1")?.label).toBe("Find access control issues");
   });
 });

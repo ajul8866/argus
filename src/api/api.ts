@@ -41,6 +41,7 @@ import { sseResponse } from "./sse.ts";
 import { LocalCatalog } from "../local/catalog.ts";
 import { localResourceRoutes } from "./local-resources.ts";
 import { TargetService, type AuthorizedActions, type Restrictions } from "../dynamic/targets.ts";
+import { GraphStore } from "../dynamic/graph.ts";
 import { TokenService } from "../auth/tokens.ts";
 
 type ApiDeps = {
@@ -693,7 +694,7 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         }
       }
 
-      const auditActionMatch = path.match(/^\/api\/audits\/([^/]+)\/(start|cancel|tasks|findings|events|stream|evidence|reports|sessions)$/);
+      const auditActionMatch = path.match(/^\/api\/audits\/([^/]+)\/(start|cancel|tasks|findings|events|stream|evidence|reports|sessions|exploration)$/);
       if (auditActionMatch) {
         const auditId = auditActionMatch[1]!;
         const action = auditActionMatch[2]!;
@@ -805,6 +806,22 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
           return json({
             evidence: rows.map(evidenceJson),
             chain: await deps.evidence.verifyChain(auditId),
+          });
+        }
+        if (action === "exploration" && method === "GET") {
+          requireUser();
+          const audit = deps.store.get<{ project_id: string }>(
+            "SELECT project_id FROM audits WHERE id = ?",
+            auditId,
+          );
+          if (!audit) throw notFound("Audit not found");
+          const graph = new GraphStore(deps.store);
+          return json({
+            assets: graph.listAssets(audit.project_id),
+            nodes: graph.listNodes(auditId),
+            edges: graph.listEdges(auditId),
+            anchors: graph.listAnchors(auditId),
+            coverage: graph.coverage(auditId),
           });
         }
         if (action === "reports") {
@@ -971,6 +988,10 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
           finding.candidate_id ?? "",
         );
         const evidence = deps.store.all<EvidenceRow>("SELECT * FROM evidence WHERE finding_id = ? ORDER BY rowid", finding.id);
+        const retests = deps.store.all<Record<string, unknown>>(
+          "SELECT * FROM retests WHERE finding_id = ? ORDER BY created_at DESC",
+          finding.id,
+        );
         const sessions = deps.store.all(
           `SELECT * FROM agent_sessions WHERE id IN (?, ?, ?)`,
           finding.discovery_session_id ?? "",
@@ -991,6 +1012,10 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
             };
           }),
           evidence: evidence.map(evidenceJson),
+          retests: retests.map((row) => ({
+            ...row,
+            evidence_refs: parseJson(String(row.evidence_refs ?? "[]"), []),
+          })),
           sessions,
         });
       }

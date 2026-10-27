@@ -251,8 +251,38 @@ export class GraphStore {
     this.store.run("INSERT OR IGNORE INTO anchors (node_id, asset_id) VALUES (?, ?)", nodeId, assetId);
   }
 
-  listGoal(auditId: string): ExplorationNode | null {
-    const row = this.store.get<NodeRow>(
+  listNodes(auditId: string): ExplorationNode[] {
+    return this.store
+      .all<NodeRow>(
+        "SELECT * FROM exploration_nodes WHERE audit_id = ? ORDER BY created_at, id",
+        auditId,
+      )
+      .map(nodeFromRow);
+  }
+
+  listEdges(auditId: string): Array<{ fromNodeId: string; toNodeId: string; kind: EdgeKind }> {
+    return this.store
+      .all<{ from_node_id: string; to_node_id: string; kind: EdgeKind }>(
+        `SELECT e.from_node_id, e.to_node_id, e.kind
+         FROM exploration_edges e JOIN exploration_nodes n ON n.id = e.from_node_id
+         WHERE n.audit_id = ? ORDER BY e.from_node_id, e.to_node_id, e.kind`,
+        auditId,
+      )
+      .map((row) => ({ fromNodeId: row.from_node_id, toNodeId: row.to_node_id, kind: row.kind }));
+  }
+
+  listAnchors(auditId: string): Array<{ nodeId: string; assetId: string }> {
+    return this.store
+      .all<{ node_id: string; asset_id: string }>(
+        `SELECT an.node_id, an.asset_id
+         FROM anchors an JOIN exploration_nodes n ON n.id = an.node_id
+         WHERE n.audit_id = ? ORDER BY an.node_id, an.asset_id`,
+        auditId,
+      )
+      .map((row) => ({ nodeId: row.node_id, assetId: row.asset_id }));
+  }
+
+  listGoal(auditId: string): ExplorationNode | null {    const row = this.store.get<NodeRow>(
       "SELECT * FROM exploration_nodes WHERE audit_id = ? AND kind = 'goal' ORDER BY created_at, id LIMIT 1",
       auditId,
     );

@@ -19,6 +19,9 @@ import { renderHarnesses } from "./pages/harnesses.ts";
 import { renderAgents } from "./pages/agents.ts";
 import { renderTasks } from "./pages/tasks.ts";
 import { renderFindings } from "./pages/findings.ts";
+import { renderCoverage } from "./pages/coverage.ts";
+import { renderExploration } from "./pages/exploration.ts";
+import { renderEvidence } from "./pages/evidence.ts";
 import { renderReports } from "./pages/reports.ts";
 import { renderSettings } from "./pages/settings.ts";
 import { renderApprovals } from "./pages/approvals.ts";
@@ -32,6 +35,7 @@ const NAV_GROUPS: Array<{ label: string; advanced?: boolean; items: Array<{ rout
     { route: "projects", label: "Projects", icon: "projects" },
     { route: "audits", label: "Audits", icon: "audits" },
     { route: "findings", label: "Findings", icon: "findings" },
+    { route: "coverage", label: "Coverage", icon: "overview" },
     { route: "reports", label: "Reports", icon: "reports" },
     { route: "settings", label: "Settings", icon: "settings" },
   ] },
@@ -41,6 +45,7 @@ const NAV_GROUPS: Array<{ label: string; advanced?: boolean; items: Array<{ rout
     { route: "skills", label: "Skills", icon: "skills" },
     { route: "mcp", label: "MCP servers", icon: "mcp" },
     { route: "explorer", label: "Explorer", icon: "explorer" },
+    { route: "exploration", label: "Exploration", icon: "explorer" },
     { route: "tasks", label: "Tasks", icon: "tasks" },
     { route: "approvals", label: "Approvals", icon: "approvals" },
   ] },
@@ -295,6 +300,15 @@ async function renderRoute(): Promise<void> {
         break;
       case "findings":
         await renderFindings(target, parsed.params);
+        break;
+      case "coverage":
+        await renderCoverage(target, parsed.params);
+        break;
+      case "exploration":
+        await renderExploration(target, parsed.params);
+        break;
+      case "evidence":
+        await renderEvidence(target, parsed.id);
         break;
       case "reports":
         await renderReports(target, parsed.params);

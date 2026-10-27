@@ -15,6 +15,7 @@ import { DEFAULT_EXCLUDES } from "../src/repo/inventory.ts";
 import { ReportService } from "../src/reports/generator.ts";
 import { getSetting, harnessConfig, saveHarnessConfig, seedDefaults, setSetting } from "../src/settings.ts";
 import { TokenService } from "../src/auth/tokens.ts";
+import { GraphStore } from "../src/dynamic/graph.ts";
 import { now } from "../src/util.ts";
 
 function config(dataDir: string): Config {
@@ -896,4 +897,44 @@ test("adapter routes create tasks and read findings under token scopes", async (
     headers: { authorization: `Bearer ${reader.raw}` },
   }));
   expect(missing.status).toBe(404);
+});
+
+test("exploration route returns assets, nodes, edges, anchors, and coverage", async () => {
+  const { api, headers } = await projectClient();
+  store.run(
+    `INSERT INTO projects (id, name, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+     VALUES ('p_graph','Graph', ?, '**/*', '', 'Tester', 'AUTH-GRAPH', ?, ?)`,
+    dir,
+    now(),
+    now(),
+  );
+  store.run(
+    `INSERT INTO audits (id, project_id, repository_id, status, current_phase, config, mode, exploration_status, created_at)
+     VALUES ('a_graph','p_graph',NULL,'running',2,'{}','dynamic','open',?)`,
+    now(),
+  );
+  const graph = new GraphStore(store);
+  const asset = graph.upsertAsset({ projectId: "p_graph", kind: "app", assetKey: "https://graph.test" });
+  const goal = graph.createNode({ auditId: "a_graph", kind: "goal", payload: { text: "Find access issues" } });
+  const intent = graph.createNode({
+    auditId: "a_graph",
+    kind: "intent",
+    status: "completed",
+    payload: { title: "Read another identity invoice" },
+  });
+  graph.anchor(goal.id, asset.id);
+  graph.anchor(intent.id, asset.id);
+  graph.linkNodes(goal.id, intent.id, "spawns");
+
+  const response = await api(new Request("http://localhost/api/audits/a_graph/exploration", { headers }));
+  expect(response.status).toBe(200);
+  const body = await response.json();
+  expect(body.assets).toHaveLength(1);
+  expect(body.assets[0]).toMatchObject({ id: asset.id, assetKey: "https://graph.test" });
+  expect(body.nodes).toHaveLength(2);
+  expect(body.edges).toEqual([{ fromNodeId: goal.id, toNodeId: intent.id, kind: "spawns" }]);
+  expect(body.anchors).toHaveLength(2);
+  expect(body.coverage).toEqual([
+    expect.objectContaining({ assetId: asset.id, assetKey: "https://graph.test", tested: true }),
+  ]);
 });

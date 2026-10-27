@@ -6,6 +6,9 @@ import type { Config } from "../src/config.ts";
 import { Store } from "../src/db/index.ts";
 import { TokenService } from "../src/auth/tokens.ts";
 import { callTool } from "../scripts/mcp-adapter.ts";
+import { TargetService } from "../src/dynamic/targets.ts";
+import { CredentialBroker } from "../src/dynamic/credentials.ts";
+import { encryptSecret } from "../src/security/credentials.ts";
 
 let dir: string;
 let store: Store;
@@ -161,5 +164,50 @@ describe("MCP adapter", () => {
       callTool("health", {}, { baseUrl: "http://argus.test", token: "" }, fetchImpl),
     ).rejects.toThrow(/token/i);
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe("CredentialBroker", () => {
+  test("injects identity headers and redacts them from exchanges", () => {
+    const targets = new TargetService(store);
+    const target = targets.createTarget({
+      projectId: "p1",
+      label: "App",
+      baseUrl: "https://app.example.test",
+      environment: "test",
+      allowedHosts: ["app.example.test"],
+    });
+    const identity = targets.createIdentity({
+      targetId: target.id,
+      label: "User A",
+      role: "user_a",
+      authKind: "header",
+      secretRef: "cred_a",
+    });
+    const config = { dataDir: dir, masterKey: "test-master-key" } as Config;
+    const encrypted = encryptSecret(config, "super-secret-token");
+    store.run(
+      `INSERT INTO provider_credentials
+       (id, provider, env_var, ciphertext, iv, tag, last4, created_at, updated_at)
+       VALUES ('c1','test-identity','cred_a',?,?,?,?,?,?)`,
+      encrypted.ciphertext,
+      encrypted.iv,
+      encrypted.tag,
+      encrypted.last4,
+      "2026-10-27T00:00:00.000Z",
+      "2026-10-27T00:00:00.000Z",
+    );
+
+    const broker = new CredentialBroker(config, store);
+    expect(broker.inject(identity.id)).toEqual({ authorization: "Bearer super-secret-token" });
+
+    const exchange = broker.redactExchange(
+      { Authorization: "Bearer super-secret-token", "content-type": "application/json" },
+      "token=super-secret-token",
+      ["super-secret-token"],
+    );
+    expect(exchange.headers.authorization).toBe("[REDACTED]");
+    expect(exchange.body).not.toContain("super-secret-token");
+    expect(() => broker.assertNoSecrets("leak super-secret-token", ["super-secret-token"])).toThrow(/secret/i);
   });
 });

@@ -45,7 +45,10 @@ subagent mechanism and never sends the whole workflow as one prompt.
 - Tasks are durable rows with a unique `(audit_id, task_key)`, dependencies,
   attempt counters, deadlines, and an assigned role/harness/model.
 - One scheduler tick every 1.5s reconciles phase barriers and claims eligible
-  queued tasks. Claims use a conditional `UPDATE ... WHERE status='queued'`, so
+  queued tasks. A task waits only while a dependency is still queued, running,
+  or waiting for approval. A failed, cancelled, or blocked dependency releases
+  the successor so committed candidate, verification, and report work is not
+  stranded. Claims use a conditional `UPDATE ... WHERE status='queued'`, so
   duplicate execution is prevented even if reconciliation races.
 - Concurrency is bounded by the global setting, the audit config, the project
   ceiling, and each role's `concurrency_limit`. A configured project ceiling is

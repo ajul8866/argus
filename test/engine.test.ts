@@ -841,6 +841,32 @@ test("provider diagnostics are redacted before they are returned as session erro
   expect(session.metadata).not.toContain("must-not-be-returned");
 });
 
+test("a committed confirmation still persists its finding after that task exhausts retries", async () => {
+  store.run("UPDATE agent_defs SET max_retries = 0 WHERE role = 'independent_validator'");
+  const append = workflowEvidence.append.bind(workflowEvidence);
+  workflowEvidence.append = async (input) => {
+    if (input.kind === "verification_result") throw new Error("Injected verification evidence failure");
+    return append(input);
+  };
+
+  await engine.startAudit(auditId, "u1");
+  await waitFor(() => {
+    const findings = store.all("SELECT id FROM findings WHERE audit_id = ?", auditId);
+    const persist = store.all<{ status: string }>(
+      "SELECT status FROM tasks WHERE audit_id = ? AND kind = 'phase4.persist'",
+      auditId,
+    );
+    return findings.length === 2 && persist.length === 2 && persist.every((task) => task.status === "completed");
+  }, 20_000);
+
+  expect(store.all(
+    "SELECT id FROM tasks WHERE audit_id = ? AND kind = 'phase3.confirm' AND status = 'failed'",
+    auditId,
+  ).length).toBeGreaterThan(0);
+  const status = store.get<{ status: string }>("SELECT status FROM audits WHERE id = ?", auditId)?.status;
+  if (status === "running" || status === "cancelling") await engine.cancelAudit(auditId, "u1");
+}, 30_000);
+
 test("a persistence retry repairs evidence for a finding created by the failed attempt", async () => {
   const append = workflowEvidence.append.bind(workflowEvidence);
   let failed = false;

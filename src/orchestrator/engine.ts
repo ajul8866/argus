@@ -981,7 +981,10 @@ export class AuditEngine {
          AND NOT EXISTS (
            SELECT 1 FROM task_dependencies d
            JOIN tasks dep ON dep.id = d.depends_on_task_id
-           WHERE d.task_id = t.id AND dep.status != 'completed'
+           WHERE d.task_id = t.id
+             -- Terminal predecessors never become completed. Keep the successor
+             -- queued only while the dependency can still finish successfully.
+             AND dep.status NOT IN ('completed', 'failed', 'cancelled', 'blocked')
          )
        ORDER BY t.phase ASC, t.priority DESC, t.created_at ASC
        LIMIT 50`,

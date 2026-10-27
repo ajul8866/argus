@@ -168,8 +168,11 @@ async function prepareRefArchive(sourceRoot: string): Promise<{ subpath: string 
 
 // `git archive` runs smudge and process filters named by attributes. The
 // command is taken from the repository config, the system Git config, or the
-// user's global Git config. Archive through a Git directory we created and
-// the object store checked above, with those config sources replaced.
+// user's global Git config. Global and system attribute files can also rewrite
+// archived bytes. Archive through a Git directory we created and the object
+// store checked above, with those config and attribute sources replaced.
+// The new directory has to use the source object format; a SHA-256 store is
+// not readable from a SHA-1 Git directory.
 async function archivePinnedCommit(
   gitDir: string,
   treeish: string,
@@ -177,17 +180,32 @@ async function archivePinnedCommit(
   staging: string,
 ): Promise<{ code: number; stdout: string; stderr: string; timedOut: boolean }> {
   const archiveGit = join(staging, "archive.git");
+  const privateHome = join(staging, "home");
   await mkdir(join(archiveGit, "objects"), { recursive: true, mode: 0o700 });
   await mkdir(join(archiveGit, "refs"), { mode: 0o700 });
-  await writeFile(join(archiveGit, "config"), "[core]\n\trepositoryformatversion = 0\n", { mode: 0o600 });
-  await writeFile(join(archiveGit, "HEAD"), "ref: refs/heads/argus\n", { mode: 0o600 });
+  await mkdir(privateHome, { mode: 0o700 });
   const globalConfig = join(staging, "gitconfig");
   await writeFile(globalConfig, "", { mode: 0o600 });
   const env = gitCommandEnv();
-  env.GIT_DIR = archiveGit;
-  env.GIT_OBJECT_DIRECTORY = join(gitDir, "objects");
+  env.HOME = privateHome;
+  delete env.XDG_CONFIG_HOME;
   env.GIT_CONFIG_NOSYSTEM = "1";
   env.GIT_CONFIG_GLOBAL = globalConfig;
+  env.GIT_ATTR_NOSYSTEM = "1";
+  const format = await runCommand(
+    ["git", "--git-dir", gitDir, "rev-parse", "--show-object-format"],
+    { env, timeoutMs: 20_000 },
+  );
+  if (format.timedOut) throw badRequest("Failed to read the git object format");
+  // Any other answer keeps the historical SHA-1 Git directory. A SHA-256
+  // repository then fails the archive instead of being read as SHA-1.
+  const repositoryConfig = format.code === 0 && format.stdout.trim() === "sha256"
+    ? "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectFormat = sha256\n"
+    : "[core]\n\trepositoryformatversion = 0\n";
+  await writeFile(join(archiveGit, "config"), repositoryConfig, { mode: 0o600 });
+  await writeFile(join(archiveGit, "HEAD"), "ref: refs/heads/argus\n", { mode: 0o600 });
+  env.GIT_DIR = archiveGit;
+  env.GIT_OBJECT_DIRECTORY = join(gitDir, "objects");
   return runCommand(
     ["git", "archive", "--format=tar", "--output", archivePath, treeish],
     { env, timeoutMs: 180_000 },

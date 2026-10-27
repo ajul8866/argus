@@ -66,8 +66,10 @@ that work tree and ignores `GIT_*` overrides. Metadata that points at another
 object store, including a different Git common directory, is rejected instead
 of being copied into the snapshot. That archive does not load repository,
 system, or global Git configuration, so filter commands do not run and
-`core.autocrlf` is not applied. Committed attributes can still request
-line-ending conversion.
+`core.autocrlf` is not applied. System and global attribute files are not
+read. The archive Git directory uses the pinned repository's object format,
+including SHA-256. Committed attributes can still request line-ending
+conversion.
 
 **Scope is a platform boundary.** The prompt tells the agent what it is doing,
 but the workspace, explorer, and evidence checker independently enforce scope.

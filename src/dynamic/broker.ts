@@ -5,6 +5,11 @@ import type { ClientRequest } from "node:http";
 import { checkRequest, checkTunnel, isLoopbackHost, RateLimiter, resolveAndValidate, type EgressPolicy } from "./egress.ts";
 import type { CredentialBroker } from "./credentials.ts";
 
+/** The only capability the broker needs from a credential source. */
+export type CredentialSource = {
+  inject(identityId: string): Record<string, string>;
+};
+
 export type ExchangeRecord = {
   method: string;
   url: string;
@@ -18,8 +23,10 @@ export type ExchangeRecord = {
 
 export type BrokerOptions = {
   policy: EgressPolicy;
-  credentials?: CredentialBroker;
+  credentials?: CredentialSource;
   onExchange?: (record: ExchangeRecord) => void | Promise<void>;
+  /** Health checks report whether the broker is ready to serve traffic. */
+  isReady?: () => boolean;
   rateLimiter?: RateLimiter;
 };
 
@@ -35,7 +42,7 @@ export class BrokerServer {
     this.limiter = options.rateLimiter ?? new RateLimiter();
   }
 
-  start(port = 0): Promise<{ port: number }> {
+  start(port = 0, host = "127.0.0.1"): Promise<{ port: number }> {
     this.server = createServer((request, response) => {
       void this.handleHttp(request, response).catch((error) => {
         if (!response.headersSent) {
@@ -49,7 +56,7 @@ export class BrokerServer {
     });
     return new Promise((resolve, reject) => {
       this.server!.once("error", reject);
-      this.server!.listen(port, "127.0.0.1", () => {
+      this.server!.listen(port, host, () => {
         const address = this.server!.address();
         resolve({ port: typeof address === "object" && address ? address.port : port });
       });
@@ -70,6 +77,12 @@ export class BrokerServer {
     const started = Date.now();
     const method = (request.method ?? "GET").toUpperCase();
     const url = request.url ?? "";
+    // Container health checks must not be treated as proxied traffic.
+    if (url === "/__argus/health" && (method === "GET" || method === "HEAD")) {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ ok: this.options.isReady?.() ?? true }));
+      return;
+    }
     const decision = checkRequest(this.options.policy, { method, url });
     if (!decision.allowed) {
       await this.reject(response, "scope_blocked", decision.reason ?? "request blocked", method, url, started);

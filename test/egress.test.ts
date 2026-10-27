@@ -349,3 +349,42 @@ describe("address pinning", () => {
     }
   });
 });
+
+describe("broker container handshake", () => {
+  test("identity tokens arrive once and never through the environment", async () => {
+    const { startBrokerProcess } = await import("../src/dynamic/broker-process.ts");
+    const process_ = await startBrokerProcess({
+      port: 0,
+      env: {
+        ARGUS_TARGET_BASE_URL: "http://127.0.0.1:9",
+        ARGUS_ALLOWED_HOSTS: "127.0.0.1",
+        ARGUS_ALLOWED_CIDRS: "127.0.0.1/32",
+        ARGUS_ALLOWED_METHODS: "GET",
+        ARGUS_TARGET_TLS: "0",
+      },
+    });
+    try {
+      expect(process_.ready()).toBe(false);
+      process_.handshake({ "id-a": "token-a" });
+      expect(process_.ready()).toBe(true);
+      expect(() => process_.handshake({ "id-a": "token-b" })).toThrow(/already/i);
+    } finally {
+      await process_.stop();
+    }
+  });
+
+  test("the runtime writes the handshake into the broker container", async () => {
+    const { calls, executor } = fakeExecutor();
+    const runtime = new ContainerRuntime({
+      executor,
+      which: async () => "/usr/bin/docker",
+      ...images,
+    });
+    await runtime.create("a1");
+    await runtime.handshake("a1", { "id-a": "token-a" });
+    const call = calls.find((argv) => argv.includes("exec") && argv.join(" ").includes("handshake.json"));
+    expect(call).toBeDefined();
+    expect(call!.join(" ")).toContain("argus-broker-a1");
+    expect(call!.join(" ")).toContain("token-a");
+  });
+});

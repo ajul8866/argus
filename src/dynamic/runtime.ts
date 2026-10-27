@@ -18,6 +18,8 @@ export type RuntimePlan = {
   /** Address the worker must use for every request, set as http(s)_proxy. */
   brokerUrl: string;
   brokerPort: number;
+  /** Where the orchestrator writes the one-time identity handshake. */
+  handshakePath: string;
 };
 
 export type CreateRuntimeOptions = {
@@ -87,6 +89,7 @@ export class ContainerRuntime {
       brokerImage: options.brokerImage ?? this.brokerImage,
       brokerUrl: `http://${nameFor("argus-broker", auditId)}:${brokerPort}`,
       brokerPort,
+      handshakePath: "/run/argus/handshake.json",
     };
     await this.run(kind, ["network", "create", "--internal", plan.network]);
     try {
@@ -133,6 +136,10 @@ export class ContainerRuntime {
         "-e",
         `https_proxy=${plan.brokerUrl}`,
         "-e",
+        `http_proxy=${plan.brokerUrl}`,
+        "-e",
+        `https_proxy=${plan.brokerUrl}`,
+        "-e",
         "NO_PROXY=",
         "-e",
         "no_proxy=",
@@ -153,6 +160,24 @@ export class ContainerRuntime {
     if (!plan) return;
     await this.destroyPlan(plan);
     this.plans.delete(auditId);
+  }
+
+  /**
+   * Writes the identity handshake into the broker container. The file lives on
+   * the container filesystem only long enough for the broker to consume it.
+   */
+  async handshake(auditId: string, tokens: Record<string, string>): Promise<void> {
+    const plan = this.plans.get(auditId);
+    if (!plan) throw new Error(`No dynamic runtime for audit ${auditId}`);
+    const payload = JSON.stringify({ type: "identities", tokens });
+    await this.executor([
+      plan.kind,
+      "exec",
+      plan.brokerName,
+      "sh",
+      "-c",
+      `umask 077; printf '%s' '${payload.replace(/'/g, "'\\''")}' > ${plan.handshakePath}`,
+    ]);
   }
 
   async exec(auditId: string, argv: string[]): Promise<CommandResult> {

@@ -1,0 +1,28 @@
+# The broker is the only container with a route to the target. It holds no
+# database: the scope policy arrives as environment, and identity tokens
+# arrive once over stdin.
+FROM oven/bun:1.3.14-debian
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY package.json bun.lock tsconfig.json ./
+RUN bun install --frozen-lockfile --production
+
+COPY src ./src
+COPY deploy/broker-entry.ts ./deploy/broker-entry.ts
+
+ENV ARGUS_BROKER_PORT=8080 \
+    ARGUS_BROKER_HOST=0.0.0.0 \
+    ARGUS_HANDSHAKE_PATH=/run/argus/handshake.json
+# The handshake directory is a tmpfs owned by the unprivileged user.
+RUN mkdir -p /run/argus && chown 1000:1000 /run/argus && chmod 700 /run/argus
+USER 1000:1000
+EXPOSE 8080
+
+HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
+  CMD bun -e 'fetch("http://127.0.0.1:8080/__argus/health").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'
+
+CMD ["bun", "run", "deploy/broker-entry.ts"]

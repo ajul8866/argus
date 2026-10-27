@@ -1316,7 +1316,25 @@ describe("repository import", () => {
       gitExec(raw, ["update-ref", "HEAD", outsideCommit]);
       expect(archiveNames(raw)).toContain("secret.js");
 
-      for (const source of [dotdot, nested, linked, quoted, raw]) {
+      const crlf = join(dir, "crlf-repo");
+      initRepo(crlf, { "local.js": "LOCAL_ONLY\n" });
+      mkdirSync(join(crlf, ".git/objects/inside"), { recursive: true });
+      symlinkSync(join(outsideRepo, ".git/objects"), join(crlf, ".git/objects/inside\r"));
+      mkdirSync(join(crlf, ".git/objects/info"), { recursive: true });
+      writeFileSync(join(crlf, ".git/objects/info/alternates"), "inside\r\n");
+      gitExec(crlf, ["update-ref", "HEAD", outsideCommit]);
+      expect(archiveNames(crlf)).toContain("secret.js");
+
+      const spaced = join(dir, "space-repo");
+      initRepo(spaced, { "local.js": "LOCAL_ONLY\n" });
+      mkdirSync(join(spaced, ".git/objects/inside"), { recursive: true });
+      symlinkSync(join(outsideRepo, ".git/objects"), join(spaced, ".git/objects/inside "));
+      mkdirSync(join(spaced, ".git/objects/info"), { recursive: true });
+      writeFileSync(join(spaced, ".git/objects/info/alternates"), "inside \n");
+      gitExec(spaced, ["update-ref", "HEAD", outsideCommit]);
+      expect(archiveNames(spaced)).toContain("secret.js");
+
+      for (const source of [dotdot, nested, linked, quoted, raw, crlf, spaced]) {
         await expect(importRepository({ config: limited, store }, requested(source), "HEAD", "tester"))
           .rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
       }

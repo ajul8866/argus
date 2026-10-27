@@ -7,17 +7,24 @@ export type CommandExecutor = (argv: string[]) => Promise<CommandResult>;
 
 export type RuntimePlan = {
   kind: RuntimeKind;
+  /** Holds the worker and the broker; no route to the outside world. */
   network: string;
+  /** Egress network the broker is attached to so it can reach the target. */
+  egressNetwork: string;
   workerName: string;
   brokerName: string;
   workerImage: string;
   brokerImage: string;
+  /** Address the worker must use for every request, set as http(s)_proxy. */
+  brokerUrl: string;
+  brokerPort: number;
 };
 
 export type CreateRuntimeOptions = {
   workspacePath?: string;
   workerImage?: string;
   brokerImage?: string;
+  brokerPort?: number;
 };
 
 export type ContainerRuntimeOptions = {
@@ -69,16 +76,22 @@ export class ContainerRuntime {
   async create(auditId: string, options: CreateRuntimeOptions = {}): Promise<RuntimePlan> {
     const kind = await this.detect();
     if (!kind) throw new Error("Docker or Podman is required for dynamic audits");
+    const brokerPort = options.brokerPort ?? 8080;
     const plan: RuntimePlan = {
       kind,
       network: nameFor("argus-audit", auditId),
+      egressNetwork: nameFor("argus-egress", auditId),
       workerName: nameFor("argus-worker", auditId),
       brokerName: nameFor("argus-broker", auditId),
       workerImage: options.workerImage ?? this.workerImage,
       brokerImage: options.brokerImage ?? this.brokerImage,
+      brokerUrl: `http://${nameFor("argus-broker", auditId)}:${brokerPort}`,
+      brokerPort,
     };
     await this.run(kind, ["network", "create", "--internal", plan.network]);
     try {
+      // The broker needs a route to the target; the worker never gets one.
+      await this.run(kind, ["network", "create", plan.egressNetwork]);
       await this.run(kind, [
         "run",
         "-d",
@@ -92,6 +105,7 @@ export class ContainerRuntime {
         "no-new-privileges",
         plan.brokerImage,
       ]);
+      await this.run(kind, ["network", "connect", plan.egressNetwork, plan.brokerName]);
       const workerArgs = [
         "run",
         "-d",
@@ -108,10 +122,20 @@ export class ContainerRuntime {
         "/run",
         "--cap-drop",
         "ALL",
-        "--cap-add",
-        "NET_RAW",
         "--security-opt",
         "no-new-privileges",
+        "-e",
+        `HTTP_PROXY=${plan.brokerUrl}`,
+        "-e",
+        `HTTPS_PROXY=${plan.brokerUrl}`,
+        "-e",
+        `http_proxy=${plan.brokerUrl}`,
+        "-e",
+        `https_proxy=${plan.brokerUrl}`,
+        "-e",
+        "NO_PROXY=",
+        "-e",
+        "no_proxy=",
       ];
       if (options.workspacePath) workerArgs.push("-v", `${options.workspacePath}:/workspace:rw`);
       workerArgs.push(plan.workerImage, "sleep", "infinity");
@@ -161,5 +185,6 @@ export class ContainerRuntime {
     await this.tryRun([plan.kind, "rm", "-f", plan.workerName]);
     await this.tryRun([plan.kind, "rm", "-f", plan.brokerName]);
     await this.tryRun([plan.kind, "network", "rm", plan.network]);
+    await this.tryRun([plan.kind, "network", "rm", plan.egressNetwork]);
   }
 }

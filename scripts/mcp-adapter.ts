@@ -79,6 +79,44 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
   {
+    name: "get_exploration",
+    description: "Read assets, exploration nodes, edges, anchors, and asset coverage for one audit.",
+    inputSchema: { type: "object", properties: { audit_id: { type: "string" } }, required: ["audit_id"] },
+  },
+  {
+    name: "propose_candidate",
+    description:
+      "Propose a dynamic candidate with a PoC manifest. The broker replays it only when a separate run confirms it. Requires audit:propose_candidate.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        audit_id: { type: "string" },
+        asset_id: { type: "string" },
+        title: { type: "string" },
+        category: { type: "string" },
+        severity: { type: "string", enum: ["critical", "high", "medium", "low", "info"] },
+        manifest: { type: "object" },
+        script: { type: "string" },
+        proposed_by: { type: "string" },
+        impact: { type: "string" },
+        remediation: { type: "string" },
+        intent_node_id: { type: "string" },
+        source: { type: "object" },
+      },
+      required: ["audit_id", "asset_id", "title", "category", "severity", "manifest", "script"],
+    },
+  },
+  {
+    name: "confirm_candidate",
+    description:
+      "Confirm a proposed dynamic candidate by replaying its PoC through the broker. Requires audit:confirm_candidate and a different proposer.",
+    inputSchema: {
+      type: "object",
+      properties: { candidate_id: { type: "string" }, confirmed_by: { type: "string" } },
+      required: ["candidate_id"],
+    },
+  },
+  {
     name: "control_task",
     description: "Cancel or retry a task.",
     inputSchema: {
@@ -177,6 +215,40 @@ export async function callTool(
           agent_role: stringArg(args, "agent_role", false) || undefined,
           phase: typeof args.phase === "number" ? args.phase : undefined,
         }),
+      });
+    }
+    case "get_exploration":
+      return request(`/api/audits/${encodeURIComponent(stringArg(args, "audit_id"))}/exploration`);
+    case "propose_candidate": {
+      const auditId = stringArg(args, "audit_id");
+      const manifest = args.manifest;
+      if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
+        throw new Error("manifest must be an object");
+      }
+      return request(`/api/audits/${encodeURIComponent(auditId)}/candidates`, {
+        method: "POST",
+        body: JSON.stringify({
+          asset_id: stringArg(args, "asset_id"),
+          title: stringArg(args, "title"),
+          category: stringArg(args, "category"),
+          severity: stringArg(args, "severity"),
+          manifest,
+          script: stringArg(args, "script"),
+          proposed_by: stringArg(args, "proposed_by", false) || undefined,
+          impact: stringArg(args, "impact", false) || undefined,
+          remediation: stringArg(args, "remediation", false) || undefined,
+          intent_node_id: stringArg(args, "intent_node_id", false) || undefined,
+          source: args.source && typeof args.source === "object" ? args.source : undefined,
+        }),
+      });
+    }
+    case "confirm_candidate": {
+      const body: Record<string, unknown> = {};
+      const confirmedBy = stringArg(args, "confirmed_by", false);
+      if (confirmedBy) body.confirmed_by = confirmedBy;
+      return request(`/api/candidates/${encodeURIComponent(stringArg(args, "candidate_id"))}/confirm`, {
+        method: "POST",
+        body: JSON.stringify(body),
       });
     }
     case "control_task": {

@@ -148,6 +148,38 @@ describe("MCP adapter", () => {
     expect(result).toMatchObject({ audit: { id: "a1" } });
   });
 
+  test("the worker tools propose and confirm through the same REST API", async () => {
+    const { calls, fetchImpl } = fakeApi(() => ({ candidateId: "c1", verdict: "CONFIRMED" }));
+    await callTool("get_exploration", { audit_id: "a1" }, config, fetchImpl);
+    await callTool(
+      "propose_candidate",
+      {
+        audit_id: "a1",
+        asset_id: "as1",
+        title: "Cross-tenant read",
+        category: "idor",
+        severity: "high",
+        manifest: { language: "typescript", checks: {} },
+        script: "print('poc')",
+        proposed_by: "worker-1",
+      },
+      config,
+      fetchImpl,
+    );
+    await callTool("confirm_candidate", { candidate_id: "c1", confirmed_by: "validator-1" }, config, fetchImpl);
+    expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual([
+      "GET http://argus.test/api/audits/a1/exploration",
+      "POST http://argus.test/api/audits/a1/candidates",
+      "POST http://argus.test/api/candidates/c1/confirm",
+    ]);
+    expect(JSON.parse(calls[1]!.body!)).toMatchObject({
+      asset_id: "as1",
+      proposed_by: "worker-1",
+      category: "idor",
+    });
+    expect(JSON.parse(calls[2]!.body!)).toEqual({ confirmed_by: "validator-1" });
+  });
+
   test("create_task and control_task map to their routes", async () => {
     const { calls, fetchImpl } = fakeApi(() => ({ ok: true }));
     await callTool("create_task", { audit_id: "a1", kind: "explore", payload: {} }, config, fetchImpl);

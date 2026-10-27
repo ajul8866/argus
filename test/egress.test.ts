@@ -31,14 +31,25 @@ describe("ContainerRuntime", () => {
 
     expect(plan.network).toBe("argus-audit-a1");
     expect(calls[0]).toEqual(["docker", "network", "create", "--internal", "argus-audit-a1"]);
-    expect(calls[1]).toContain("argus/broker:test");
-    expect(calls[1]).toContain("argus-audit-a1");
-    expect(calls[2]).toContain("argus/worker:test");
+    expect(calls[1]).toEqual(["docker", "network", "create", "argus-egress-a1"]);
+    expect(calls[2]).toContain("argus/broker:test");
     expect(calls[2]).toContain("argus-audit-a1");
-    expect(calls[2]!.join(" ")).toContain("/tmp/ws:/workspace:rw");
+    expect(calls[4]).toContain("argus/worker:test");
+    expect(calls[4]).toContain("argus-audit-a1");
+    expect(calls[4]!.join(" ")).toContain("/tmp/ws:/workspace:rw");
+
+    // The worker gets no route except the broker, which is its proxy.
+    const worker = calls[4]!.join(" ");
+    expect(worker).toContain("HTTP_PROXY=http://argus-broker-a1:8080");
+    expect(worker).not.toContain("NET_RAW");
+    expect(calls.some((argv) => argv.join(" ") === "docker network connect argus-egress-a1 argus-broker-a1")).toBe(true);
 
     await runtime.destroy("a1");
-    expect(calls.at(-1)).toEqual(["docker", "network", "rm", "argus-audit-a1"]);
+    const removed = calls.slice(-2).map((argv) => argv.join(" "));
+    expect(removed).toEqual([
+      "docker network rm argus-audit-a1",
+      "docker network rm argus-egress-a1",
+    ]);
   });
 
   test("cleans up when a container fails to start", async () => {
@@ -51,7 +62,8 @@ describe("ContainerRuntime", () => {
 
     await expect(runtime.create("a2")).rejects.toThrow(/failed|boom/i);
     expect(calls.some((argv) => argv.includes("rm"))).toBe(true);
-    expect(calls.at(-1)).toEqual(["docker", "network", "rm", "argus-audit-a2"]);
+    expect(calls.at(-2)).toEqual(["docker", "network", "rm", "argus-audit-a2"]);
+    expect(calls.at(-1)).toEqual(["docker", "network", "rm", "argus-egress-a2"]);
   });
 
   test("refuses to create when no runtime is installed", async () => {

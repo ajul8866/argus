@@ -156,7 +156,7 @@ async function assertLooseRef(gitDir: string, refName: string, depth: number): P
 
 // "name~3" and "name^2" select an ancestor. Git opens the loose ref for the
 // prefix, not for the suffix. A "~" or "^" earlier in the name is part of the
-// ref. Braced peels are not accepted in a requested ref.
+// ref. The requested ref cannot contain "{"; the verifier appends "^{commit}".
 function ancestorPrefix(name: string): string | null {
   let index = name.length - 1;
   while (index >= 0) {
@@ -170,14 +170,47 @@ function ancestorPrefix(name: string): string | null {
   return name.slice(0, index);
 }
 
-function revisionRefName(ref: string): string {
-  let name = ref;
-  while (name.length > 0) {
-    const ancestor = ancestorPrefix(name);
+function ancestorBase(name: string): string {
+  let current = name;
+  while (current.length > 0) {
+    const ancestor = ancestorPrefix(current);
     if (ancestor === null) break;
-    name = ancestor;
+    current = ancestor;
   }
-  return name;
+  return current;
+}
+
+const COMMIT_PEEL = "^{commit}";
+
+// rev-parse --verify receives "<ref>^{commit}". A ":" path and a ".." or "..."
+// range are parsed before the loose ref is opened, so the dwim name is not the
+// raw request. A range opens each side when the left side resolves; both sides
+// are checked so a pipe on the right cannot block that resolution.
+function revisionBeforePath(name: string): string {
+  const peeled = name.endsWith(COMMIT_PEEL) ? name.slice(0, -COMMIT_PEEL.length) : name;
+  const colon = peeled.indexOf(":");
+  const selected = colon === -1 ? peeled : peeled.slice(0, colon);
+  return ancestorBase(selected);
+}
+
+function revisionProbeNames(ref: string): string[] {
+  const spec = `${ref}${COMMIT_PEEL}`;
+  const names: string[] = [];
+  const add = (raw: string): void => {
+    const name = revisionBeforePath(raw);
+    if (!name || names.includes(name)) return;
+    names.push(name);
+  };
+  const dot = spec.indexOf("..");
+  if (dot === -1) {
+    add(spec);
+    return names;
+  }
+  let end = spec.slice(dot + 2);
+  if (end.startsWith(".")) end = end.slice(1);
+  add(spec.slice(0, dot));
+  add(end);
+  return names;
 }
 
 // A directory is a dwim miss, not a pipe. A file or fifo in the middle of a
@@ -214,17 +247,17 @@ async function assertProbedRef(gitDir: string, refName: string): Promise<void> {
 // on, opens every one of them. A pipe at refs/tags/<name> blocks verification
 // of the branch <name> before Git reaches refs/heads/<name>.
 async function assertRequestedRevision(gitDir: string, ref: string): Promise<void> {
-  const name = revisionRefName(ref);
-  if (!name) return;
-  const probes = [
-    name,
-    `refs/${name}`,
-    `refs/tags/${name}`,
-    `refs/heads/${name}`,
-    `refs/remotes/${name}`,
-    `refs/remotes/${name}/HEAD`,
-  ];
-  for (const probe of probes) await assertProbedRef(gitDir, probe);
+  for (const name of revisionProbeNames(ref)) {
+    const probes = [
+      name,
+      `refs/${name}`,
+      `refs/tags/${name}`,
+      `refs/heads/${name}`,
+      `refs/remotes/${name}`,
+      `refs/remotes/${name}/HEAD`,
+    ];
+    for (const probe of probes) await assertProbedRef(gitDir, probe);
+  }
 }
 
 // Git walks these abbreviations from the most specific rule. Strict mode

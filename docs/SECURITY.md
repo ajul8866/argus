@@ -73,6 +73,11 @@ LLM agents. Use it only on repositories you are authorized to assess.
   from the worktree git directory rather than the common directory. The same private
   name prefixed with `main-worktree/` is the main worktree's copy and is read from
   the common directory under the bare name. A config `include` or
+  `refs/remotes/<name>/HEAD`. That name is the revision Git opens for
+  `rev-parse --verify <ref>^{commit}`: a trailing `~` or `^` ancestor suffix
+  is removed, a `:` path keeps the revision before the colon, and each side
+  of `..` or `...` is checked. A symref target of one of those files is checked
+  the same way. A config `include` or
   `includeIf` is rejected wherever Git would start that section, including
   after another section on the same line. The directory named by a gitfile or
   `commondir` is the path Git opens: trailing CR and LF are removed, spaces

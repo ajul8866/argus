@@ -579,6 +579,202 @@ test("a retest refuses a tampered code excerpt instead of quoting it", async () 
     .toMatchObject({ status: "failed" });
 }, 20_000);
 
+test("a repository path containing a colon stays intact through persistence and reverification", async () => {
+  const source = join(dir, "colon-repo");
+  mkdirSync(join(source, "src"), { recursive: true });
+  const loginQuote = 'const token = "hardcoded-login-secret-value";';
+  const resetQuote = 'const token = "hardcoded-reset-secret-value";';
+  writeFileSync(join(source, "src/auth:login.js"), `${loginQuote}\n`);
+  writeFileSync(join(source, "src/auth:reset.js"), `${resetQuote}\n`);
+  const timestamp = now();
+  store.run(
+    `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, max_concurrent_agents, created_at, updated_at)
+     VALUES ('p-colon','Colon paths','', ?, ?, '[]', 'Tester','TEST-AUTH',1,?,?)`,
+    source,
+    toJson(["**/*.js"]),
+    timestamp,
+    timestamp,
+  );
+  const inventory = await buildInventory(source, {
+    scope: { include: ["**/*.js"], exclude: [] },
+    maxFiles: 20,
+    maxFileBytes: 100_000,
+  });
+  store.run(
+    `INSERT INTO repositories (id, project_id, path, commit_sha, branch, languages, frameworks, inventory, graph, file_count, total_bytes, imported_at)
+     VALUES ('r-colon','p-colon',?,NULL,'test',?,?,?,?,?,?,?)`,
+    source,
+    toJson(inventory.languages),
+    toJson(inventory.frameworks),
+    toJson(inventory),
+    toJson({}),
+    inventory.files.length,
+    inventory.total_bytes,
+    timestamp,
+  );
+  const colonAudit = engine.createAudit({
+    projectId: "p-colon",
+    repositoryId: "r-colon",
+    userId: "u1",
+    overrides: { max_concurrent_agents: 1, max_reverifications: 2, require_distinct_harness_for_retest: false },
+  });
+  const discoveryTask = uid();
+  const discoverySession = uid();
+  const verifySession = uid();
+  store.run(
+    `INSERT INTO tasks (id, audit_id, phase, kind, task_key, title, status, priority, payload, agent_role, harness, model, attempts, max_attempts, requires_approval, created_at, finished_at)
+     VALUES (?, ?, 2, 'phase2.discover', 'phase2:area:api', 'discover', 'completed', 0, '{}', 'security_researcher', 'pi', NULL, 1, 2, 0, ?, ?)`,
+    discoveryTask, colonAudit, timestamp, timestamp,
+  );
+  store.run(
+    `INSERT INTO agent_sessions (id, audit_id, task_id, role, harness, model, status, workspace, sandbox_mode, started_at, ended_at)
+     VALUES (?, ?, ?, 'security_researcher', 'pi', NULL, 'completed', ?, 'none', ?, ?)`,
+    discoverySession, colonAudit, discoveryTask, join(dir, "colon-ws"), timestamp, timestamp,
+  );
+  store.run(
+    `INSERT INTO agent_sessions (id, audit_id, task_id, role, harness, model, status, workspace, sandbox_mode, started_at, ended_at)
+     VALUES (?, ?, NULL, 'independent_validator', 'pi', NULL, 'completed', ?, 'none', ?, ?)`,
+    verifySession, colonAudit, join(dir, "colon-ws-verify"), timestamp, timestamp,
+  );
+  const cases = [
+    { id: "c-login", title: "Hardcoded login secret", path: "src/auth:login.js", quote: loginQuote, repeatCheck: true },
+    { id: "c-reset", title: "Hardcoded reset secret", path: "src/auth:reset.js", quote: resetQuote, repeatCheck: false },
+  ];
+  for (const item of cases) {
+    const candidate = {
+      title: item.title,
+      category: "Hardcoded secret",
+      cwe: "CWE-798",
+      severity: "high",
+      files: [{ path: item.path, start_line: 1, end_line: 1 }],
+      hypothesis: "A credential is embedded in source.",
+      source_to_sink: "source literal -> authentication check",
+      preconditions: ["Source is deployed"],
+      evidence_excerpts: [{ path: item.path, start_line: 1, end_line: 1, quote: item.quote }],
+      reproduction_notes: "Read the source file.",
+      expected: "Secrets come from a protected store.",
+      observed: "The secret is present in the repository file.",
+      impact: "Anyone with the repository can reuse the credential.",
+      remediation: "Remove the literal and rotate the credential.",
+    };
+    store.run(
+      `INSERT INTO candidates (id, audit_id, area_id, discovery_task_id, discovery_session_id, title, category, cwe, severity, status, payload, created_at)
+       VALUES (?, ?, 'api', ?, ?, ?, 'Hardcoded secret', 'CWE-798', 'high', 'confirmed', ?, ?)`,
+      item.id, colonAudit, discoveryTask, discoverySession, item.title, toJson(candidate), timestamp,
+    );
+    const verificationId = uid();
+    const check = { found: true, path: item.path, line_start: 1, line_end: 1 };
+    store.run(
+      `INSERT INTO verifications (id, audit_id, candidate_id, kind, agent_session_id, discovery_session_id, verdict, rationale, evidence_check, payload, created_at)
+       VALUES (?, ?, ?, 'confirmation', ?, ?, 'CONFIRMED', 'Verified against the snapshot.', ?, ?, ?)`,
+      verificationId,
+      colonAudit,
+      item.id,
+      verifySession,
+      discoverySession,
+      toJson({ verified_count: 1, checks: item.repeatCheck ? [check, check] : [check] }),
+      toJson({
+        raw: {
+          verdict: "CONFIRMED",
+          rationale: "Verified against the snapshot.",
+          verified_excerpts: [{ path: item.path, start_line: 1, end_line: 1, quote: item.quote }],
+          reproduction_steps: ["Open the file."],
+          severity_assessment: "high",
+          impact_assessment: "Anyone with the repository can reuse the credential.",
+        },
+      }),
+      timestamp,
+    );
+    engine.createTask({
+      auditId: colonAudit,
+      phase: 4,
+      kind: "phase4.persist",
+      taskKey: `phase4:candidate:${item.id}`,
+      title: `Persist ${item.title}`,
+      payload: { candidate_id: item.id, verification_id: verificationId },
+      agentRole: null,
+    });
+  }
+  manager.run = async (kind, task, hooks) => {
+    const startedAt = now();
+    hooks.onEvent({ type: "session_start", at: startedAt, meta: { sandbox: "test", harness: kind } });
+    const data = {
+      decision: "REVERIFIED",
+      rationale: "The affected code still matches the finding and impact is supported.",
+      verified_excerpts: cases.map((item) => ({ path: item.path, start_line: 1, end_line: 1, quote: item.quote })),
+      impact_assessment: "The impact remains supported by the source code.",
+      reproduction_consistency: "The recorded reasoning follows directly from the verified source.",
+      completeness_issues: [],
+      unsupported_claims: [],
+      severity_assessment: "high",
+      notes: ["No runtime exploitation was performed."],
+    };
+    hooks.onEvent({ type: "session_end", at: now(), meta: { sandbox: "test" } });
+    return {
+      status: "completed" as const,
+      text: JSON.stringify(data),
+      structured: data,
+      sessionRef: `scripted-${task.runId}`,
+      model: task.model,
+      usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2, cache_read_tokens: 0, cost_usd: 0, turns: 1, duration_ms: 1 },
+      events: [],
+      startedAt,
+      endedAt: now(),
+      exitCode: 0,
+      metadata: { harness: kind, sandbox: "test" },
+    };
+  };
+  store.run("UPDATE audits SET status = 'running', started_at = ? WHERE id = ?", timestamp, colonAudit);
+
+  await waitFor(() => {
+    const findings = store.all<{ status: string }>("SELECT status FROM findings WHERE audit_id = ?", colonAudit);
+    return findings.length === 2 && findings.every((finding) => finding.status === "reverified");
+  }, 20_000);
+
+  const findings = store.all<{ title: string; status: string; files: string; retest_decision: string | null }>(
+    "SELECT title, status, files, retest_decision FROM findings WHERE audit_id = ? ORDER BY title",
+    colonAudit,
+  );
+  expect(findings.map((finding) => ({
+    title: finding.title,
+    status: finding.status,
+    retest_decision: finding.retest_decision,
+    files: JSON.parse(finding.files),
+  }))).toEqual([
+    {
+      title: "Hardcoded login secret",
+      status: "reverified",
+      retest_decision: "REVERIFIED",
+      files: [{ path: "src/auth:login.js", start_line: 1, end_line: 1 }],
+    },
+    {
+      title: "Hardcoded reset secret",
+      status: "reverified",
+      retest_decision: "REVERIFIED",
+      files: [{ path: "src/auth:reset.js", start_line: 1, end_line: 1 }],
+    },
+  ]);
+  expect(store.all<{ status: string }>("SELECT status FROM candidates WHERE audit_id = ? ORDER BY title", colonAudit))
+    .toEqual([{ status: "persisted" }, { status: "persisted" }]);
+  const persisted = store.all<{ result: string | null }>(
+    "SELECT result FROM tasks WHERE audit_id = ? AND kind = 'phase4.persist'",
+    colonAudit,
+  );
+  expect(persisted).toHaveLength(2);
+  expect(persisted.every((task) => task.result?.includes("duplicate_of") !== true)).toBe(true);
+  const excerpts = store.all<{ id: string }>(
+    "SELECT id FROM evidence WHERE audit_id = ? AND kind = 'code_excerpt' ORDER BY title",
+    colonAudit,
+  );
+  const excerptPaths: string[] = [];
+  for (const excerpt of excerpts) {
+    const verified = await workflowEvidence.content(excerpt.id);
+    excerptPaths.push((JSON.parse(verified!.content) as { path: string }).path);
+  }
+  expect(excerptPaths).toEqual(["src/auth:login.js", "src/auth:reset.js"]);
+  await engine.cancelAudit(colonAudit, "u1");
+}, 25_000);
+
 test("invalid audit overrides are rejected before an audit is saved", () => {
   for (const overrides of [
     { max_areas: "invalid" }, { max_concurrent_agents: 1.5 }, { max_confirmations: -1 },

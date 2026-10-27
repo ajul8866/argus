@@ -2958,16 +2958,23 @@ export class AuditEngine {
     if (verifiedChecks.length === 0) {
       throw new Error("Cannot persist a finding without platform-verified code evidence on an affected file");
     }
-    const files = [...new Set(verifiedChecks.map((check) => `${check.path}:${check.line_start ?? 1}:${check.line_end ?? check.line_start ?? 1}`))]
-      .map((entry) => {
-        const [path, start, end] = entry.split(":");
-        return { path: path!, start_line: Number(start), end_line: Number(end) };
-      })
-      .sort((left, right) =>
-        left.path.localeCompare(right.path) ||
-        left.start_line - right.start_line ||
-        left.end_line - right.end_line,
-      );
+    // Path and line numbers stay separate fields. Encoding them in one
+    // colon-separated string truncates a repository path that contains ":".
+    const files: Array<{ path: string; start_line: number; end_line: number }> = [];
+    const seenLocations = new Set<string>();
+    for (const check of verifiedChecks) {
+      const start = check.line_start ?? 1;
+      const end = check.line_end ?? start;
+      const key = JSON.stringify([check.path, start, end]);
+      if (seenLocations.has(key)) continue;
+      seenLocations.add(key);
+      files.push({ path: check.path, start_line: start, end_line: end });
+    }
+    files.sort((left, right) =>
+      left.path.localeCompare(right.path) ||
+      left.start_line - right.start_line ||
+      left.end_line - right.end_line,
+    );
     // Deduplicate only when the title, category, and exact affected locations
     // all match. Title equality alone would drop a separate issue that happens
     // to share a generic title in a different file.

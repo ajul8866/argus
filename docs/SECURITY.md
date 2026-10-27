@@ -119,6 +119,28 @@ LLM agents. Use it only on repositories you are authorized to assess.
   forced to `/dev/null` for these Git commands. A `.git` symlink discovered
   while walking parent directories is rejected. A subdirectory of a repository
   archives only that subdirectory.
+  reads a git directory opened without following a symlink, and that directory
+  must stay inside an allowed source location. A `.git` symlink or `gitdir:`
+  file is not followed. A symlink anywhere under the object store is rejected,
+  including a pack or loose-object directory. An alternate object directory is
+  resolved the way Git resolves it, following a symlink before `..` and keeping
+  the raw path bytes. That directory, its symlinks, and its nested alternates
+  must stay inside an allowed location. A path that enters `/proc` or `/dev/fd`
+  is rejected: those locations describe the checking process, not the git
+  process that reads the object store. A `commondir` file is rejected, as is an
+  alternate path that contains quotes or backslashes. When the source is a
+  subdirectory of a repository, the archive contains only that subdirectory.
+  file is not followed. The git common directory must resolve to that same git
+  directory, following a symlink before `..`. A symlinked object store or a
+  symlink inside an object store is rejected, including a directory entry that
+  is not valid UTF-8. Each multi-pack-index pack name must be one file name in
+  that object store, with no path separator. An alternate object directory is
+  resolved the way Git resolves it, including a raw byte in a symlink name, and
+  that directory, its symlinks, and its nested alternates must stay inside an
+  allowed location. A path that enters `/proc` or `/dev/fd` is rejected: those
+  locations describe the checking process, not the git process that reads the
+  object store. When the source is a subdirectory of a repository, the
+  archive contains only that subdirectory.
 
 ## Execution isolation
 

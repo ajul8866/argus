@@ -1,7 +1,8 @@
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readdir, realpath } from "node:fs/promises";
 import { extname, join, relative } from "node:path";
 import { createScopeMatcher, normalizePath, sha256, toJson, truncate } from "../util.ts";
 import type { Scope } from "../util.ts";
+import { readCappedRegularFile } from "./workspace.ts";
 
 export const DEFAULT_EXCLUDES = [
   ".git/**",
@@ -165,9 +166,11 @@ export type InventoryOptions = {
 
 export async function buildInventory(root: string, options: InventoryOptions): Promise<Inventory> {
   const scopeMatcher = createScopeMatcher(options.scope);
+  const rootReal = await realpath(root);
   const files: RepoFile[] = [];
   const skipped: Array<{ path: string; reason: string }> = [];
   const languages: Record<string, number> = {};
+  const textByPath = new Map<string, string>();
   let totalBytes = 0;
   let truncated = false;
 
@@ -181,7 +184,7 @@ export async function buildInventory(root: string, options: InventoryOptions): P
     for (const entry of entries) {
       if (entry.name === ".git") continue;
       const absolute = join(directory, entry.name);
-      const rel = normalizePath(relative(root, absolute));
+      const rel = normalizePath(relative(rootReal, absolute));
       if (entry.isSymbolicLink()) {
         skipped.push({ path: rel, reason: "symlink" });
         continue;
@@ -198,43 +201,38 @@ export async function buildInventory(root: string, options: InventoryOptions): P
         truncated = true;
         break;
       }
-      const stats = await stat(absolute);
-      if (stats.size > options.maxFileBytes) {
-        skipped.push({ path: rel, reason: `larger than ${options.maxFileBytes} bytes` });
-        continue;
-      }
-      let content: Buffer;
+      let opened: { size: number; bytes: Buffer; truncated: boolean };
       try {
-        content = Buffer.from(await readFile(absolute));
+        opened = await readCappedRegularFile(absolute, options.maxFileBytes, {
+          root: rootReal,
+          relativePath: rel,
+        });
       } catch {
         skipped.push({ path: rel, reason: "unreadable" });
         continue;
       }
+      if (opened.truncated) {
+        skipped.push({ path: rel, reason: `larger than ${options.maxFileBytes} bytes` });
+        continue;
+      }
+      const content = opened.bytes;
       const language = languageFor(rel);
       const text = isTextFile(rel) ? content.toString("utf8") : "";
       const lineCount = text ? text.split("\n").length : 0;
       files.push({
         path: rel,
-        size: stats.size,
+        size: opened.size,
         lines: lineCount,
         language,
         sha256: sha256(content),
       });
+      if (text) textByPath.set(rel, text);
       languages[language] = (languages[language] ?? 0) + 1;
-      totalBytes += stats.size;
+      totalBytes += opened.size;
     }
   };
 
-  await visit(root);
-  const textByPath = new Map<string, string>();
-  for (const file of files) {
-    if (!isTextFile(file.path)) continue;
-    try {
-      textByPath.set(file.path, await readFile(join(root, file.path), "utf8"));
-    } catch {
-      // File changed between listing and read; the hash in the inventory is authoritative.
-    }
-  }
+  await visit(rootReal);
 
   return {
     files,

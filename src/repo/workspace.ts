@@ -1,6 +1,7 @@
-import { chmod, copyFile, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, mkdir, open, realpath, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
-import { AppError, createScopeMatcher, matchesScope, normalizePath, safeJoin } from "../util.ts";
+import { AppError, createScopeMatcher, matchesScope, normalizePath, safeJoin, sha256 } from "../util.ts";
 import type { Scope } from "../util.ts";
 import type { Inventory } from "./inventory.ts";
 
@@ -15,12 +16,21 @@ export async function createWorkspace(
   await mkdir(workspace, { recursive: true, mode: 0o700 });
   const fileMode = writable ? 0o600 : 0o400;
   const scopeMatcher = createScopeMatcher(scope);
+  const rootReal = await realpath(repositoryPath);
   for (const file of inventory.files) {
-    if (!scopeMatcher.matches(file.path)) continue;
-    const source = safeJoin(repositoryPath, file.path);
-    const target = safeJoin(workspace, file.path);
+    const normalized = normalizePath(file.path);
+    if (!scopeMatcher.matches(normalized)) continue;
+    const source = safeJoin(rootReal, normalized);
+    const target = safeJoin(workspace, normalized);
     await mkdir(dirname(target), { recursive: true, mode: 0o700 });
-    await copyFile(source, target);
+    const opened = await readCappedRegularFile(source, file.size, {
+      root: rootReal,
+      relativePath: normalized,
+    });
+    if (opened.truncated || opened.size !== file.size || sha256(opened.bytes) !== file.sha256) {
+      throw new AppError(409, "conflict", "Repository file changed during import");
+    }
+    await writeFile(target, opened.bytes, { mode: fileMode });
     await chmod(target, fileMode);
   }
   await chmod(workspace, 0o700);
@@ -43,6 +53,83 @@ export async function createWorkspace(
 }
 
 const OUT_OF_SCOPE = "File is outside the authorized project scope";
+const NOT_A_FILE = "Path is not a regular file";
+
+export async function readCappedRegularFile(
+  path: string,
+  maxBytes: number,
+  containedIn: { root: string; relativePath: string },
+  options?: { preview?: boolean },
+): Promise<{ size: number; bytes: Buffer; truncated: boolean }> {
+  const noFollow = constants.O_NOFOLLOW;
+  const nonBlock = constants.O_NONBLOCK;
+  if (
+    typeof noFollow !== "number" ||
+    typeof nonBlock !== "number" ||
+    noFollow === 0 ||
+    nonBlock === 0 ||
+    !Number.isSafeInteger(maxBytes) ||
+    maxBytes < 0
+  ) {
+    throw new AppError(400, "not_a_file", NOT_A_FILE);
+  }
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    // O_NOFOLLOW refuses a symlink at the final path component. O_NONBLOCK
+    // makes a pipe return immediately; opening it for read would otherwise
+    // wait until another process connects a writer. Intermediate directories
+    // can still be swapped, so the opened descriptor's path is checked below.
+    handle = await open(path, constants.O_RDONLY | noFollow | nonBlock);
+    const info = await handle.stat();
+    if (!info.isFile()) throw new AppError(400, "not_a_file", NOT_A_FILE);
+    const size = info.size;
+    if (!Number.isSafeInteger(size) || size < 0) throw new AppError(400, "not_a_file", NOT_A_FILE);
+    const rootReal = await realpath(containedIn.root);
+    const openedRelative = normalizePath(relative(rootReal, await openedRealPath(handle.fd)));
+    const expected = normalizePath(containedIn.relativePath);
+    if (
+      !openedRelative ||
+      openedRelative === ".." ||
+      openedRelative.startsWith("../") ||
+      openedRelative.startsWith("/") ||
+      openedRelative.split("/").includes("..") ||
+      openedRelative !== expected
+    ) {
+      throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
+    }
+    if (size > maxBytes && options?.preview !== true) {
+      return { size, bytes: Buffer.alloc(0), truncated: true };
+    }
+    // Cap the read at the size just observed. readFile() stats again and would
+    // load a file that grew past this bound, or past the preview cap.
+    const toRead = Math.min(size, maxBytes);
+    const buffer = Buffer.alloc(toRead);
+    let offset = 0;
+    while (offset < toRead) {
+      const { bytesRead } = await handle.read(buffer, offset, toRead - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset !== toRead) throw new AppError(400, "not_a_file", NOT_A_FILE);
+    return { size, bytes: buffer, truncated: size > maxBytes };
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError(400, "not_a_file", NOT_A_FILE);
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function openedRealPath(fd: number): Promise<string> {
+  for (const candidate of [`/proc/self/fd/${fd}`, `/dev/fd/${fd}`]) {
+    try {
+      return await realpath(candidate);
+    } catch {
+      // This platform exposes the descriptor path at the other location.
+    }
+  }
+  throw new AppError(400, "not_a_file", NOT_A_FILE);
+}
 
 export async function readScopedFile(
   root: string,
@@ -78,20 +165,16 @@ export async function readScopedFile(
     throw new AppError(403, "out_of_scope", OUT_OF_SCOPE);
   }
 
-  const stats = await stat(resolved);
-  if (!stats.isFile()) throw new AppError(400, "not_a_file", "Path is not a regular file");
-  if (stats.size > maxBytes) {
-    const handle = Bun.file(resolved);
-    const text = await handle.slice(0, maxBytes).text();
-    return { path: canonical, content: text, size: stats.size, truncated: true, binary: false };
-  }
-  const buffer = Buffer.from(await readFile(resolved));
-  const binary = buffer.includes(0);
+  const opened = await readCappedRegularFile(resolved, maxBytes, {
+    root: absoluteRoot,
+    relativePath: resolvedRelative,
+  }, { preview: true });
+  const binary = !opened.truncated && opened.bytes.includes(0);
   return {
     path: canonical,
-    content: binary ? "" : buffer.toString("utf8"),
-    size: stats.size,
-    truncated: false,
+    content: binary ? "" : opened.bytes.toString("utf8"),
+    size: opened.size,
+    truncated: opened.truncated,
     binary,
   };
 }

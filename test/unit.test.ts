@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -262,6 +262,101 @@ describe("scope and parsing", () => {
     }
   });
 
+  test("readScopedFile reads an in-scope symlink target and caps the bytes it loads", async () => {
+    const root = mkdtempSync(join(tmpdir(), "argus-scoped-read-"));
+    try {
+      mkdirSync(join(root, "src"));
+      writeFileSync(join(root, "src", "b.js"), "console.log('target');\n");
+      symlinkSync("b.js", join(root, "src", "a.js"));
+      writeFileSync(join(root, "src", "big.js"), "A".repeat(5_000));
+      writeFileSync(join(root, "src", "bin.js"), "a\0b");
+      const scope = { include: ["src/**/*.js"], exclude: [] };
+      const linked = await readScopedFile(root, "src/a.js", scope);
+      expect(linked.path).toBe("src/a.js");
+      expect(linked.content).toContain("target");
+      const preview = await readScopedFile(root, "src/big.js", scope, 100);
+      expect(preview.truncated).toBe(true);
+      expect(preview.size).toBe(5_000);
+      expect(preview.content).toBe("A".repeat(100));
+      expect(preview.binary).toBe(false);
+      const binary = await readScopedFile(root, "src/bin.js", scope);
+      expect(binary.binary).toBe(true);
+      expect(binary.content).toBe("");
+
+      const pipe = join(root, "src", "pipe.js");
+      expect(Bun.spawnSync(["mkfifo", pipe]).exitCode).toBe(0);
+      const pipeResult = await Promise.race([
+        readScopedFile(root, "src/pipe.js", scope).then(() => "opened").catch((error: { code?: string }) => error.code ?? "error"),
+        Bun.sleep(500).then(() => "blocked"),
+      ]);
+      expect(pipeResult).toBe("not_a_file");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("readScopedFile does not load bytes written after the size check", async () => {
+    const root = mkdtempSync(join(tmpdir(), "argus-scoped-grow-"));
+    const file = join(root, "a.js");
+    writeFileSync(file, "small");
+    const before = 5;
+    const scope = { include: ["**/*"], exclude: [] };
+    const probe = await open(file, "r");
+    const proto = Object.getPrototypeOf(probe) as {
+      stat: (this: unknown, ...args: unknown[]) => Promise<{ isFile: () => boolean; size: number }>;
+      read: (
+        this: unknown,
+        buffer: Buffer,
+        offset?: number,
+        length?: number,
+        position?: number | null,
+      ) => Promise<{ bytesRead: number }>;
+      readFile: (this: unknown, ...args: unknown[]) => Promise<unknown>;
+    };
+    await probe.close();
+    const originalStat = proto.stat;
+    const originalRead = proto.read;
+    const originalReadFile = proto.readFile;
+    let readFileCalls = 0;
+    let bytesRequested = 0;
+    proto.stat = async function (this: unknown, ...args: unknown[]) {
+      const info = await originalStat.apply(this, args);
+      const size = info.size;
+      const isFile = info.isFile();
+      if (isFile && size === before) writeFileSync(file, "Q".repeat(200_000));
+      return { isFile: () => isFile, size };
+    };
+    proto.read = async function (
+      this: unknown,
+      buffer: Buffer,
+      offset?: number,
+      length?: number,
+      position?: number | null,
+    ) {
+      if (length === undefined || length > before) throw new Error(`unbounded scoped read of ${String(length)} bytes`);
+      bytesRequested += length;
+      return originalRead.call(this, buffer, offset, length, position);
+    };
+    proto.readFile = async function (this: unknown, ...args: unknown[]) {
+      readFileCalls += 1;
+      return originalReadFile.apply(this, args);
+    };
+    try {
+      const result = await readScopedFile(root, "a.js", scope, 1_000);
+      expect(result.content).toBe("Q".repeat(before));
+      expect(result.size).toBe(before);
+      expect(result.truncated).toBe(false);
+      expect(readFileCalls).toBe(0);
+      expect(bytesRequested).toBeGreaterThan(0);
+      expect(bytesRequested).toBeLessThanOrEqual(before);
+    } finally {
+      proto.stat = originalStat;
+      proto.read = originalRead;
+      proto.readFile = originalReadFile;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("scope matching only compiles patterns reached by short-circuit evaluation", () => {
     const matcher = createScopeMatcher({ include: ["src/**", "[z-a]"], exclude: [] });
     expect(matcher.matches("src/main.ts")).toBe(true);
@@ -379,6 +474,71 @@ describe("inventory and evidence gates", () => {
     expect(git.commit?.length).toBeGreaterThan(10);
   });
 
+  test("inventory reads only the checked size when a file grows", async () => {
+    const root = mkdtempSync(join(tmpdir(), "argus-inventory-grow-"));
+    const file = join(root, "a.js");
+    writeFileSync(file, "small");
+    const before = 5;
+    const probe = await open(file, "r");
+    const proto = Object.getPrototypeOf(probe) as {
+      stat: (this: unknown, ...args: unknown[]) => Promise<{ isFile: () => boolean; size: number }>;
+      read: (
+        this: unknown,
+        buffer: Buffer,
+        offset?: number,
+        length?: number,
+        position?: number | null,
+      ) => Promise<{ bytesRead: number }>;
+      readFile: (this: unknown, ...args: unknown[]) => Promise<unknown>;
+    };
+    await probe.close();
+    const originalStat = proto.stat;
+    const originalRead = proto.read;
+    const originalReadFile = proto.readFile;
+    let readFileCalls = 0;
+    let bytesRequested = 0;
+    proto.stat = async function (this: unknown, ...args: unknown[]) {
+      const info = await originalStat.apply(this, args);
+      const size = info.size;
+      const isFile = info.isFile();
+      if (isFile && size === before) writeFileSync(file, "Q".repeat(200_000));
+      return { isFile: () => isFile, size };
+    };
+    proto.read = async function (
+      this: unknown,
+      buffer: Buffer,
+      offset?: number,
+      length?: number,
+      position?: number | null,
+    ) {
+      if (length === undefined || length > before) throw new Error(`unbounded inventory read of ${String(length)} bytes`);
+      bytesRequested += length;
+      return originalRead.call(this, buffer, offset, length, position);
+    };
+    proto.readFile = async function (this: unknown, ...args: unknown[]) {
+      readFileCalls += 1;
+      return originalReadFile.apply(this, args);
+    };
+    try {
+      const inventory = await buildInventory(root, {
+        scope: { include: ["**/*"], exclude: [] },
+        maxFiles: 10,
+        maxFileBytes: 1_000,
+      });
+      expect(inventory.files.map((entry) => entry.path)).toEqual(["a.js"]);
+      expect(inventory.files[0]?.size).toBe(before);
+      expect(inventory.files[0]?.sha256).toBe(sha256("Q".repeat(before)));
+      expect(readFileCalls).toBe(0);
+      expect(bytesRequested).toBeGreaterThan(0);
+      expect(bytesRequested).toBeLessThanOrEqual(before);
+    } finally {
+      proto.stat = originalStat;
+      proto.read = originalRead;
+      proto.readFile = originalReadFile;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("quote verification rejects fabricated excerpts", async () => {
     const scope = { include: ["**/*.js"], exclude: [".git/**"] };
     const exact = await verifyQuote(fixture, scope, {
@@ -489,6 +649,54 @@ describe("repository import", () => {
     expect((await stat(join(writable, "ARGUS_SCOPE.json"))).mode & 0o777).toBe(0o400);
     expect((await Bun.file(join(readOnly, "ARGUS_SCOPE.json")).json()).writable).toBe(false);
     expect((await Bun.file(join(writable, "ARGUS_SCOPE.json")).json()).writable).toBe(true);
+  });
+
+  test("workspace copy rejects a symlink, a directory swap, and bytes that no longer match the inventory", async () => {
+    const scope = { include: ["**/*"], exclude: [] };
+    const listed = (path: string, content: string) => ({
+      files: [{ path, size: Buffer.byteLength(content), lines: 1, language: "JavaScript", sha256: sha256(content) }],
+      skipped: [],
+      languages: {},
+      frameworks: [],
+      endpoints: [],
+      auth_boundaries: [],
+      dependency_graph: [],
+      entrypoints: [],
+      total_bytes: Buffer.byteLength(content),
+      truncated: false,
+    });
+
+    const changedRoot = join(dir, "changed-source");
+    mkdirSync(changedRoot);
+    writeFileSync(join(changedRoot, "a.js"), "alpha");
+    const changedCopy = join(dir, "changed-copy");
+    await expect(createWorkspace(changedRoot, listed("a.js", "beta"), scope, changedCopy, {})).rejects.toMatchObject({
+      code: "conflict",
+    });
+    expect(existsSync(join(changedCopy, "a.js"))).toBe(false);
+
+    const linkRoot = join(dir, "link-source");
+    mkdirSync(linkRoot);
+    const outside = join(dir, "outside-secret.txt");
+    writeFileSync(outside, "SECRET_OUTSIDE_SENTINEL");
+    symlinkSync(outside, join(linkRoot, "link.js"));
+    const linkCopy = join(dir, "link-copy");
+    await expect(createWorkspace(linkRoot, listed("link.js", "SECRET_OUTSIDE_SENTINEL"), scope, linkCopy, {})).rejects.toMatchObject({
+      code: "not_a_file",
+    });
+    expect(existsSync(join(linkCopy, "link.js"))).toBe(false);
+
+    const swappedRoot = join(dir, "swapped-source");
+    const outsideDir = join(dir, "outside-dir");
+    mkdirSync(swappedRoot);
+    mkdirSync(outsideDir);
+    writeFileSync(join(outsideDir, "a.js"), "SECRET_INTERMEDIATE");
+    symlinkSync(outsideDir, join(swappedRoot, "src"));
+    const swappedCopy = join(dir, "swapped-copy");
+    await expect(createWorkspace(swappedRoot, listed("src/a.js", "SECRET_INTERMEDIATE"), scope, swappedCopy, {})).rejects.toMatchObject({
+      code: "out_of_scope",
+    });
+    expect(existsSync(join(swappedCopy, "src", "a.js"))).toBe(false);
   });
 });
 

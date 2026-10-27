@@ -223,7 +223,9 @@ operation, preserving include/exclude short-circuit behavior.
    directory, a symlink inside an object store, and an alternate object
    directory Git would resolve outside the allowed locations are rejected. The
    alternate path follows a symlink before `..` and keeps the raw path bytes.
-   Nested alternates are checked the same way. A subdirectory import archives
+   A path that enters `/proc` or `/dev/fd` is rejected, because those locations
+   are local to the checking process. Nested alternates are checked the same
+   way. A subdirectory import archives
    only that subdirectory. A symlink, a repository directory or
    ancestor replaced by a symlink, a path that escapes the source, or bytes
    that no longer match the inventory are not copied. The inventory is then

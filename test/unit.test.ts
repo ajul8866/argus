@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import type { Config } from "../src/config.ts";
 import { loadConfig, PHASE_NAMES } from "../src/config.ts";
 import { KeyedSerialQueue } from "../src/concurrency.ts";
@@ -901,6 +901,14 @@ describe("repository import", () => {
     expect((await readScopedFile(authorized, "a.js", { include: ["**/*"], exclude: [] })).content).toBe("SECRET_BOUNDARY_SENTINEL");
   });
 
+  function pointBranch(repo: string, sha: string): void {
+    const head = readFileSync(join(repo, ".git/HEAD"), "utf8").trim();
+    if (!head.startsWith("ref: ")) throw new Error(`unexpected HEAD ${head}`);
+    const ref = head.slice("ref: ".length);
+    if (!ref || ref.startsWith("/") || ref.split("/").includes("..")) throw new Error(`unexpected ref ${ref}`);
+    writeFileSync(join(repo, ".git", ref), `${sha}\n`);
+  }
+
   function gitExec(directory: string, args: string[]): string {
     const result = Bun.spawnSync(["git", "-C", directory, ...args], {
       stdout: "pipe",
@@ -1342,6 +1350,153 @@ describe("repository import", () => {
       expect(existsSync(join(dir, "repos"))).toBe(false);
     } finally {
       rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a git ref import rejects an alternate that names a process-local path", async () => {
+    const fdPrefix = existsSync("/proc/self/fd") ? "/proc/self/fd" : "/dev/fd";
+    const outsideRepo = mkdtempSync(join(tmpdir(), "argus-proc-src-"));
+    const outsideName = `argus-proc-objects-${crypto.randomUUID().slice(0, 8)}`;
+    const outsideObjects = join(tmpdir(), outsideName);
+    const limited = { ...config, allowedRoots: [dir] };
+    const requested = {
+      ...project,
+      source_path: join(dir, "proc-repo"),
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    };
+    let swappedFd = -1;
+    try {
+      initRepo(outsideRepo, { "secret.js": "SECRET_PROC_SENTINEL\n" });
+      cpSync(join(outsideRepo, ".git/objects"), outsideObjects, { recursive: true });
+      const repo = requested.source_path;
+      initRepo(repo, { "a.js": "INSIDE_CONTENT\n" });
+      const deep = join(dir, "deep/a/b/c/d");
+      mkdirSync(join(deep, "objects"), { recursive: true });
+      mkdirSync(join(dir, "deep/a", outsideName), { recursive: true });
+      mkdirSync(join(repo, ".git/objects/info"), { recursive: true });
+      const fdLine = `${fdPrefix}/3/objects/../../../../${outsideName}`;
+      writeFileSync(join(repo, ".git/objects/info/alternates"), `${fdLine}\n`);
+      pointBranch(repo, gitExec(outsideRepo, ["rev-parse", "HEAD"]));
+      const gitDir = await open(join(repo, ".git"), "r");
+      try {
+        const tarPath = join(dir, "proc.tar");
+        const archived = await runPinnedGit({
+          fd: gitDir.fd,
+          path: join(repo, ".git"),
+          close: async () => {},
+        }, ["archive", "--format=tar", "--output", tarPath, "HEAD"], 20_000);
+        expect(archived.code).toBe(0);
+        const listed = new TextDecoder().decode(Bun.spawnSync(["tar", "-tf", tarPath], { stdout: "pipe" }).stdout);
+        expect(listed).toContain("secret.js");
+      } finally {
+        await gitDir.close();
+      }
+
+      closeSync(3);
+      swappedFd = openSync(deep, "r");
+      expect(swappedFd).toBe(3);
+      await expect(importRepository({ config: limited, store }, requested, "HEAD", "tester"))
+        .rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+
+      const link = join(dir, "to-proc");
+      symlinkSync(fdLine, link);
+      writeFileSync(join(repo, ".git/objects/info/alternates"), `${link}\n`);
+      await expect(importRepository({ config: limited, store }, requested, "HEAD", "tester"))
+        .rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+    } finally {
+      if (swappedFd >= 0) {
+        try { closeSync(swappedFd); } catch { /* already closed */ }
+        const restored = openSync("/dev/urandom", "r");
+        if (restored !== 3) closeSync(restored);
+      }
+      rmSync(outsideRepo, { recursive: true, force: true });
+      rmSync(outsideObjects, { recursive: true, force: true });
+    }
+  });
+
+  test("a git ref import rejects an alternate resolved through /proc/self/exe", async () => {
+    if (!existsSync("/proc/self/exe")) {
+      expect(process.platform).not.toBe("linux");
+      return;
+    }
+    const gitBin = Bun.which("git");
+    if (!gitBin) throw new Error("git is required");
+    const exeParts = (path: string): string[] => path.split("/").filter((part) => part.length > 0);
+    const bunParts = exeParts(readlinkSync("/proc/self/exe").toString());
+    const gitParts = exeParts(realpathSync(gitBin));
+    const outsideName = `argus-exe-objects-${crypto.randomUUID().slice(0, 8)}`;
+    const suffix = [...realpathSync(tmpdir()).split("/").filter((part) => part.length > 0), outsideName, "objects"];
+    const landed = (parts: string[], ups: number): string => {
+      const kept = parts.slice(0, Math.max(0, parts.length - ups));
+      return `/${[...kept, ...suffix].join("/")}`;
+    };
+    let chosen: { ups: number; server: string; git: string } | null = null;
+    for (let ups = 1; ups <= Math.max(bunParts.length, gitParts.length); ups += 1) {
+      const server = landed(bunParts, ups);
+      const git = landed(gitParts, ups);
+      const allowed = dirname(server);
+      if (server === git || allowed === "/" || git.startsWith(`${allowed}/`)) continue;
+      if (!git.startsWith(`${realpathSync(tmpdir())}/`)) continue;
+      chosen = { ups, server, git };
+      break;
+    }
+    if (!chosen) throw new Error("could not separate /proc/self/exe for git and the server");
+    const allowed = dirname(chosen.server);
+    const outsideRepo = join(dir, "exe-outside-src");
+    const repo = join(allowed, "repo");
+    try {
+      initRepo(outsideRepo, { "secret.js": "SECRET_EXE_SENTINEL\n" });
+      mkdirSync(dirname(chosen.git), { recursive: true });
+      cpSync(join(outsideRepo, ".git/objects"), chosen.git, { recursive: true });
+      mkdirSync(chosen.server, { recursive: true });
+      initRepo(repo, { "a.js": "LOCAL_ONLY\n" });
+      mkdirSync(join(repo, ".git/objects/info"), { recursive: true });
+      const procLine = `/proc/self/exe/${"../".repeat(chosen.ups)}${suffix.join("/")}`;
+      writeFileSync(join(repo, ".git/objects/info/alternates"), `${procLine}\n`);
+      pointBranch(repo, gitExec(outsideRepo, ["rev-parse", "HEAD"]));
+      const gitDir = await open(join(repo, ".git"), "r");
+      try {
+        const tarPath = join(dir, "exe.tar");
+        const archived = await runPinnedGit({
+          fd: gitDir.fd,
+          path: join(repo, ".git"),
+          close: async () => {},
+        }, ["archive", "--format=tar", "--output", tarPath, "HEAD"], 20_000);
+        expect(archived.code).toBe(0);
+        const listed = new TextDecoder().decode(Bun.spawnSync(["tar", "-tf", tarPath], { stdout: "pipe" }).stdout);
+        expect(listed).toContain("secret.js");
+      } finally {
+        await gitDir.close();
+      }
+      await expect(importRepository({
+        config: { ...config, allowedRoots: [allowed] },
+        store,
+      }, {
+        ...project,
+        source_path: repo,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      }, "HEAD", "tester")).rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+
+      const link = join(allowed, "to-exe");
+      symlinkSync(procLine, link);
+      writeFileSync(join(repo, ".git/objects/info/alternates"), `${link}\n`);
+      await expect(importRepository({
+        config: { ...config, allowedRoots: [allowed] },
+        store,
+      }, {
+        ...project,
+        source_path: repo,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      }, "HEAD", "tester")).rejects.toMatchObject({ code: "invalid_repository", message: GIT_OBJECTS_ERROR });
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+    } finally {
+      if (allowed.includes(outsideName)) rmSync(allowed, { recursive: true, force: true });
+      const gitRoot = dirname(chosen.git);
+      if (gitRoot.includes(outsideName)) rmSync(gitRoot, { recursive: true, force: true });
     }
   });
 

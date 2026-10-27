@@ -170,7 +170,9 @@ absence of vulnerabilities. Human review is required.
   larger. The read itself stops at the size checked on the open file, so a
   later write cannot make it load more than that bound. Report downloads
   recompute the stored size and SHA-256. That open does not follow a symlink
-  and does not wait when the path is a pipe.
+  and does not wait when the path is a pipe. The report read stops at the size
+  checked on the open file, so a later write cannot make it load more than
+  that bound.
 - Database-level protection assumes the attacker does not have write access to
   the SQLite file itself. Full-disk tampering is detectable by the chain only if
   the attacker does not rewrite both content and chain metadata; the chain is

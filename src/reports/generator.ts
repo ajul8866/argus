@@ -641,11 +641,11 @@ export class ReportService {
       lines.push("");
     }
     for (const finding of verified) {
-      lines.push(`### ${finding.code} — ${finding.title}`);
+      lines.push(`### ${mdInline(finding.code)} — ${mdInline(finding.title)}`);
       lines.push("");
       lines.push(`- **Severity:** ${finding.severity.toUpperCase()}`);
       lines.push(`- **Status:** ${finding.status}`);
-      lines.push(`- **Category / CWE:** ${finding.category} / ${finding.cwe ?? "unclassified"}`);
+      lines.push(`- **Category / CWE:** ${mdInline(finding.category)} / ${mdInline(finding.cwe ?? "unclassified")}`);
       lines.push(`- **Commit:** ${finding.repository_commit ?? "n/a"}`);
       lines.push(`- **Discovery session:** ${finding.discovery_session_id ?? "n/a"}`);
       lines.push(`- **Verification session:** ${finding.verification_session_id ?? "n/a"}`);
@@ -659,11 +659,12 @@ export class ReportService {
         lines.push("**Verified source evidence**");
         lines.push("");
         for (const excerpt of excerpts) {
-          lines.push(`\`${excerpt.path}:${excerpt.start_line}-${excerpt.end_line}\``);
+          lines.push(mdCodeSpan(`${excerpt.path}:${excerpt.start_line}-${excerpt.end_line}`));
           lines.push("");
-          lines.push("````text");
+          const fence = mdFence(excerpt.quote);
+          lines.push(`${fence}text`);
           lines.push(excerpt.quote);
-          lines.push("````");
+          lines.push(fence);
           lines.push("");
         }
       }
@@ -901,6 +902,34 @@ function escapeTable(value: string): string {
   return value.replaceAll("|", "\\|").replaceAll("\n", " ");
 }
 
+/** Fence longer than any backtick run in the body so quoted text cannot close it. */
+function mdFence(value: string): string {
+  const longest = Math.max(0, ...Array.from(value.matchAll(/`+/g), (match) => match[0].length));
+  return "`".repeat(Math.max(4, longest + 1));
+}
+
+/** Inline code span whose delimiter is longer than any backtick run in the value. */
+function mdCodeSpan(value: string): string {
+  const longest = Math.max(0, ...Array.from(value.matchAll(/`+/g), (match) => match[0].length));
+  const delimiter = "`".repeat(longest + 1);
+  const pad = value.startsWith("`") || value.endsWith("`") ? " " : "";
+  return `${delimiter}${pad}${value}${pad}${delimiter}`;
+}
+
+/** Single-line structural slot: a line break would start a new Markdown block. */
+function mdInline(value: string): string {
+  return value.replace(/\r\n?|\n/g, " ");
+}
+
+/** Free-text block: escape line-leading Markdown block markers. */
+function mdText(value: string): string {
+  return value
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.replace(/^(\s*)([#>`|]|[-*+](?=\s)|\d+\.(?=\s))/, "$1\\$2"))
+    .join("\n");
+}
+
 function markdownToHtml(markdown: string): string {
   const lines = markdown.split("\n");
   const out: string[] = [];
@@ -920,11 +949,22 @@ function markdownToHtml(markdown: string): string {
     }
   };
   for (const line of lines) {
-    if (line.startsWith("```")) {
-      closeList();
-      closeTable();
-      out.push(inCode ? "</code></pre>" : "<pre><code>");
-      inCode = !inCode;
+    const fenceMatch = /^(`{3,})/.exec(line);
+    if (fenceMatch) {
+      const run = fenceMatch[1]!.length;
+      if (!inCode) {
+        closeList();
+        closeTable();
+        fenceLength = run;
+        out.push("<pre><code>");
+        inCode = true;
+      } else if (run >= fenceLength) {
+        out.push("</code></pre>");
+        inCode = false;
+        fenceLength = 0;
+      } else {
+        out.push(escapeHtml(line));
+      }
       continue;
     }
     if (inCode) {

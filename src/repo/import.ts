@@ -1,11 +1,145 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { lstat, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { join, relative, sep } from "node:path";
 import type { Config } from "../config.ts";
 import type { Store } from "../db/index.ts";
 import { runCommand } from "../harness/process.ts";
-import { badRequest, now, parseJson, toJson, uid } from "../util.ts";
+import { AppError, badRequest, now, parseJson, toJson, uid } from "../util.ts";
 import { DEFAULT_EXCLUDES, buildInventory, gitInfo } from "./inventory.ts";
-import { assertAuthorizedRoot, createWorkspace } from "./workspace.ts";
+import { assertAuthorizedRoot, canonicalDirectory, createWorkspace } from "./workspace.ts";
+
+const GIT_METADATA_ERROR = "Git metadata must stay inside the repository";
+
+function gitCommandEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (typeof value !== "string" || key.startsWith("GIT_")) continue;
+    env[key] = value;
+  }
+  if (!env.PATH) env.PATH = "/usr/bin:/bin";
+  return env;
+}
+
+function pathInside(candidate: string, root: string): boolean {
+  const normalizedRoot = root.endsWith("/") ? root : `${root}/`;
+  return candidate === root || candidate.startsWith(normalizedRoot);
+}
+
+function invalidGitMetadata(): AppError {
+  return new AppError(400, "invalid_repository", GIT_METADATA_ERROR);
+}
+
+// A fifo here would block the following git command. A symlink would name a
+// different file than the one inside this directory.
+async function assertRegularGitEntry(path: string): Promise<void> {
+  let info;
+  try {
+    info = await lstat(path);
+  } catch {
+    return;
+  }
+  if (info.isSymbolicLink() || !info.isFile()) throw invalidGitMetadata();
+}
+
+// A pipe or symlink named .git would block or escape before git runs. A gitfile
+// is a regular file; ref imports reject it separately so worktree snapshots can
+// still copy the selected files.
+async function assertLocalGitReadable(sourceRoot: string): Promise<void> {
+  const gitPath = join(sourceRoot, ".git");
+  let info;
+  try {
+    info = await lstat(gitPath);
+  } catch {
+    return;
+  }
+  if (info.isSymbolicLink() || (!info.isDirectory() && !info.isFile())) throw invalidGitMetadata();
+  if (!info.isDirectory()) return;
+  await assertRegularGitEntry(join(gitPath, "HEAD"));
+  await assertRegularGitEntry(join(gitPath, "config"));
+}
+
+// Alternate object databases and symlinked packs live outside the repository
+// even when .git itself is a real directory. git archive would copy those bytes.
+async function assertContainedObjectStore(gitDir: string): Promise<void> {
+  const objectsPath = join(gitDir, "objects");
+  let rootInfo;
+  try {
+    rootInfo = await lstat(objectsPath);
+  } catch {
+    throw invalidGitMetadata();
+  }
+  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) throw invalidGitMetadata();
+  const pending = [objectsPath];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (!current) break;
+    let entries;
+    try {
+      entries = await readdir(current, { withFileTypes: true });
+    } catch {
+      throw invalidGitMetadata();
+    }
+    for (const entry of entries) {
+      if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) throw invalidGitMetadata();
+      if (entry.isDirectory()) {
+        pending.push(join(current, entry.name));
+        continue;
+      }
+      if (entry.name === "alternates" && current === join(objectsPath, "info")) throw invalidGitMetadata();
+    }
+  }
+}
+
+// Git walks parent directories and follows a .git file or symlink. Archive only
+// when that discovered metadata is the work tree containing this source path,
+// and the object store does not point at another repository. subpath is the
+// directory to archive when the source sits below the work tree root.
+async function prepareRefArchive(sourceRoot: string): Promise<{ toplevel: string; subpath: string | null }> {
+  const gitPath = join(sourceRoot, ".git");
+  let localGit;
+  try {
+    localGit = await lstat(gitPath);
+  } catch {
+    localGit = null;
+  }
+  if (localGit && (localGit.isSymbolicLink() || !localGit.isDirectory())) throw invalidGitMetadata();
+  const env = gitCommandEnv();
+  const gitDirResult = await runCommand(
+    ["git", "-C", sourceRoot, "rev-parse", "--absolute-git-dir"],
+    { env, timeoutMs: 20_000 },
+  );
+  const topResult = await runCommand(
+    ["git", "-C", sourceRoot, "rev-parse", "--show-toplevel"],
+    { env, timeoutMs: 20_000 },
+  );
+  if (
+    gitDirResult.code !== 0 ||
+    gitDirResult.timedOut ||
+    topResult.code !== 0 ||
+    topResult.timedOut
+  ) {
+    throw badRequest("Git refs require a git repository");
+  }
+  let pinnedGit: string;
+  let pinnedTop: string;
+  try {
+    pinnedGit = await canonicalDirectory(gitDirResult.stdout.trim());
+    pinnedTop = await canonicalDirectory(topResult.stdout.trim());
+  } catch {
+    throw invalidGitMetadata();
+  }
+  if (!pathInside(sourceRoot, pinnedTop) || !pathInside(pinnedGit, pinnedTop)) throw invalidGitMetadata();
+  await assertContainedObjectStore(pinnedGit);
+  const relativePath = relative(pinnedTop, sourceRoot);
+  if (!relativePath) return { toplevel: pinnedTop, subpath: null };
+  if (
+    relativePath.startsWith("..") ||
+    relativePath.startsWith("/") ||
+    relativePath.includes("\0")
+  ) {
+    throw invalidGitMetadata();
+  }
+  return { toplevel: pinnedTop, subpath: relativePath.split(sep).join("/") };
+}
 
 export async function importRepository(
   deps: { config: Config; store: Store },
@@ -23,6 +157,11 @@ export async function importRepository(
   imported_at: string;
 }> {
   const sourceRoot = await assertAuthorizedRoot(project.source_path, deps.config.allowedRoots);
+  if (ref && !/^[A-Za-z0-9][A-Za-z0-9._/@^~:-]{0,199}$/.test(ref)) {
+    throw badRequest("Invalid git ref");
+  }
+  await assertLocalGitReadable(sourceRoot);
+  const refArchive = ref ? await prepareRefArchive(sourceRoot) : null;
   const git = await gitInfo(sourceRoot);
   const scope = {
     include: parseJson<string[]>(project.scope_include, ["**/*"]),
@@ -41,22 +180,21 @@ export async function importRepository(
   try {
     if (ref) {
       if (!git.commit) throw badRequest("Git refs require a git repository");
-      if (!/^[A-Za-z0-9][A-Za-z0-9._/@^~:-]{0,199}$/.test(ref)) {
-        throw badRequest("Invalid git ref");
-      }
+      const env = gitCommandEnv();
       const resolved = await runCommand(
         ["git", "-C", sourceRoot, "rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`],
-        { timeoutMs: 20_000 },
+        { env, timeoutMs: 20_000 },
       );
-      if (resolved.code !== 0) throw badRequest(`Unknown git ref: ${ref}`);
+      if (resolved.code !== 0 || resolved.timedOut) throw badRequest(`Unknown git ref: ${ref}`);
       commit = resolved.stdout.trim();
+      const treeish = refArchive?.subpath ? `${commit}:${refArchive.subpath}` : commit;
       staging = await mkdtemp(join(deps.config.dataDir, "repo-import-"));
       const archivePath = join(staging, "snapshot.tar");
       const extractedRoot = join(staging, "source");
       await mkdir(extractedRoot, { mode: 0o700 });
       const archived = await runCommand(
-        ["git", "-C", sourceRoot, "archive", "--format=tar", "--output", archivePath, commit],
-        { timeoutMs: 180_000 },
+        ["git", "-C", refArchive?.toplevel ?? sourceRoot, "archive", "--format=tar", "--output", archivePath, treeish],
+        { env, timeoutMs: 180_000 },
       );
       if (archived.code !== 0 || archived.timedOut) {
         throw badRequest(`Failed to archive ${ref}: ${archived.stderr.slice(0, 500)}`);

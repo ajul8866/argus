@@ -634,6 +634,198 @@ describe("repository import", () => {
     expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
   });
 
+  test("a git ref import rejects object metadata that points outside the repository", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "argus-outside-git-"));
+    const git = (cwd: string, args: string[]): string => {
+      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          GIT_AUTHOR_NAME: "Tester",
+          GIT_AUTHOR_EMAIL: "tester@example.com",
+          GIT_COMMITTER_NAME: "Tester",
+          GIT_COMMITTER_EMAIL: "tester@example.com",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+      return result.stdout.toString().trim();
+    };
+    const insert = (id: string, source: string): void => {
+      store.run(
+        `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+         VALUES (?, ?, '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+        id, id, source, JSON.stringify(["**/*.js"]),
+      );
+    };
+    try {
+      git(outside, ["init", "-q"]);
+      writeFileSync(join(outside, "secret.js"), "SECRET_GITDIR_SENTINEL\n");
+      git(outside, ["add", "secret.js"]);
+      git(outside, ["commit", "-qm", "secret"]);
+      const sha = git(outside, ["rev-parse", "HEAD"]);
+      git(outside, ["gc", "-q"]);
+
+      const gitfile = join(dir, "gitfile-decoy");
+      mkdirSync(gitfile);
+      writeFileSync(join(gitfile, ".git"), `gitdir: ${join(outside, ".git")}\n`);
+      writeFileSync(join(gitfile, "local.js"), "LOCAL_ONLY\n");
+      insert("p-gitfile", gitfile);
+
+      const linked = join(dir, "linked-decoy");
+      mkdirSync(linked);
+      symlinkSync(join(outside, ".git"), join(linked, ".git"));
+      writeFileSync(join(linked, "local.js"), "LOCAL_ONLY\n");
+      insert("p-linked", linked);
+
+      const alternates = join(dir, "alternates-decoy");
+      mkdirSync(alternates);
+      git(alternates, ["init", "-q"]);
+      mkdirSync(join(alternates, ".git", "objects", "info"), { recursive: true });
+      writeFileSync(join(alternates, ".git", "objects", "info", "alternates"), `${join(outside, ".git", "objects")}\n`);
+      git(alternates, ["update-ref", "refs/heads/stolen", sha]);
+      insert("p-alternates", alternates);
+
+      const packed = join(dir, "packed-decoy");
+      mkdirSync(packed);
+      git(packed, ["init", "-q"]);
+      rmSync(join(packed, ".git", "objects", "pack"), { recursive: true, force: true });
+      symlinkSync(join(outside, ".git", "objects", "pack"), join(packed, ".git", "objects", "pack"));
+      git(packed, ["update-ref", "refs/heads/stolen", sha]);
+      insert("p-packed", packed);
+
+      const replaced = join(dir, "objects-decoy");
+      mkdirSync(replaced);
+      git(replaced, ["init", "-q"]);
+      rmSync(join(replaced, ".git", "objects"), { recursive: true, force: true });
+      symlinkSync(join(outside, ".git", "objects"), join(replaced, ".git", "objects"));
+      git(replaced, ["update-ref", "refs/heads/stolen", sha]);
+      insert("p-objects", replaced);
+
+      const cases = [
+        { id: "p-gitfile", ref: "HEAD" },
+        { id: "p-linked", ref: "HEAD" },
+        { id: "p-alternates", ref: "stolen" },
+        { id: "p-packed", ref: "stolen" },
+        { id: "p-objects", ref: "stolen" },
+      ];
+      for (const item of cases) {
+        const row = store.get<{ source_path: string; scope_include: string; scope_exclude: string }>(
+          "SELECT source_path, scope_include, scope_exclude FROM projects WHERE id = ?",
+          item.id,
+        )!;
+        await expect(importRepository({
+          config,
+          store,
+        }, {
+          id: item.id,
+          source_path: row.source_path,
+          scope_include: row.scope_include,
+          scope_exclude: row.scope_exclude,
+        }, item.ref, "tester")).rejects.toMatchObject({ code: "invalid_repository" });
+      }
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+      expect(existsSync(join(dir, "repos"))).toBe(false);
+
+      const parent = join(dir, "parent-repo");
+      const child = join(parent, "child");
+      mkdirSync(child, { recursive: true });
+      writeFileSync(join(parent, "secret.js"), "SIBLING_SECRET\n");
+      writeFileSync(join(child, "a.js"), "CHILD_CONTENT\n");
+      git(parent, ["init", "-q"]);
+      git(parent, ["add", "secret.js", "child/a.js"]);
+      git(parent, ["commit", "-qm", "both"]);
+      insert("p-child", child);
+      const imported = await importRepository({ config, store }, {
+        id: "p-child",
+        source_path: child,
+        scope_include: JSON.stringify(["**/*.js"]),
+        scope_exclude: "[]",
+      }, "HEAD", "tester");
+      expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("CHILD_CONTENT\n");
+      expect(existsSync(join(imported.path, "secret.js"))).toBe(false);
+      expect(imported.commit_sha).toBe(git(parent, ["rev-parse", "HEAD"]));
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("a git ref import archives the selected repository when GIT_DIR points elsewhere", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "argus-git-dir-outside-"));
+    const inside = join(dir, "inside-repo");
+    const previous = process.env.GIT_DIR;
+    const git = (cwd: string, args: string[]): string => {
+      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          GIT_AUTHOR_NAME: "Tester",
+          GIT_AUTHOR_EMAIL: "tester@example.com",
+          GIT_COMMITTER_NAME: "Tester",
+          GIT_COMMITTER_EMAIL: "tester@example.com",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+      return result.stdout.toString().trim();
+    };
+    try {
+      git(outside, ["init", "-q"]);
+      writeFileSync(join(outside, "secret.js"), "SECRET_ENV_SENTINEL\n");
+      git(outside, ["add", "secret.js"]);
+      git(outside, ["commit", "-qm", "secret"]);
+      mkdirSync(inside);
+      writeFileSync(join(inside, "inside.js"), "INSIDE_REF_CONTENT\n");
+      git(inside, ["init", "-q"]);
+      git(inside, ["add", "inside.js"]);
+      git(inside, ["commit", "-qm", "inside"]);
+      const insideCommit = git(inside, ["rev-parse", "HEAD"]);
+      store.run(
+        `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+         VALUES ('p-env', 'env', '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+        inside, JSON.stringify(["**/*.js"]),
+      );
+      process.env.GIT_DIR = join(outside, ".git");
+      const imported = await importRepository({ config, store }, {
+        id: "p-env",
+        source_path: inside,
+        scope_include: JSON.stringify(["**/*.js"]),
+        scope_exclude: "[]",
+      }, "HEAD", "tester");
+      expect(imported.commit_sha).toBe(insideCommit);
+      expect(await Bun.file(join(imported.path, "inside.js")).text()).toBe("INSIDE_REF_CONTENT\n");
+      expect(existsSync(join(imported.path, "secret.js"))).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.GIT_DIR;
+      else process.env.GIT_DIR = previous;
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("import does not wait when git HEAD is a pipe", async () => {
+    const source = join(dir, "fifo-head");
+    mkdirSync(join(source, ".git"), { recursive: true });
+    writeFileSync(join(source, "a.js"), "LOCAL_ONLY\n");
+    const result = Bun.spawnSync(["mkfifo", join(source, ".git", "HEAD")]);
+    expect(result.exitCode).toBe(0);
+    store.run(
+      `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+       VALUES ('p-fifo', 'fifo', '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+      source, JSON.stringify(["**/*.js"]),
+    );
+    const raced = await Promise.race([
+      importRepository({ config, store }, {
+        id: "p-fifo",
+        source_path: source,
+        scope_include: JSON.stringify(["**/*.js"]),
+        scope_exclude: "[]",
+      }, null, "tester").then(() => "imported").catch((error: { code?: string }) => error.code ?? "error"),
+      Bun.sleep(500).then(() => "blocked"),
+    ]);
+    expect(raced).toBe("invalid_repository");
+    expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+  });
+
   test("workspaces are read-only by default and owner-writable only on explicit request", async () => {
     const scope = { include: ["**/*.js", "**/*.json", "README.md"], exclude: ["src/routes/media.js"] };
     const inventory = await buildInventory(fixture, { scope, maxFiles: 100, maxFileBytes: 1_000_000 });

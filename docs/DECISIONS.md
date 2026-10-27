@@ -61,7 +61,9 @@ suite asserts report creation happens after the last retest.
 snapshot (or `git archive` for a ref) and rebuilds the inventory there. This
 prevents a later worktree edit from invalidating evidence. The original commit
 and branch are recorded; uncommitted worktree state is represented by the file
-hashes in the inventory.
+hashes in the inventory. A ref archive uses the Git directory discovered for
+that work tree and ignores `GIT_*` overrides. Metadata that points at another
+object store is rejected instead of being copied into the snapshot.
 
 **Scope is a platform boundary.** The prompt tells the agent what it is doing,
 but the workspace, explorer, and evidence checker independently enforce scope.

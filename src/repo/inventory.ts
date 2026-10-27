@@ -1,5 +1,6 @@
 import { readdir } from "node:fs/promises";
 import { extname, join, relative } from "node:path";
+import { runCommand } from "../harness/process.ts";
 import { createScopeMatcher, normalizePath, sha256, toJson, truncate } from "../util.ts";
 import type { Scope } from "../util.ts";
 import { canonicalDirectory, readCappedRegularFile } from "./workspace.ts";
@@ -139,14 +140,13 @@ export function clampText(value: unknown, max = 4000): string {
 export async function gitInfo(path: string): Promise<{ commit: string | null; branch: string | null }> {
   const run = async (args: string[]): Promise<string | null> => {
     try {
-      const proc = Bun.spawn(["git", ...args], {
+      const result = await runCommand(["git", ...args], {
         cwd: path,
-        stdout: "pipe",
-        stderr: "ignore",
         env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+        timeoutMs: 15_000,
       });
-      const [output, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-      return code === 0 ? output.trim() : null;
+      if (result.timedOut || result.code !== 0) return null;
+      return result.stdout.trim() || null;
     } catch {
       return null;
     }

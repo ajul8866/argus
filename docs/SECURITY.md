@@ -42,7 +42,12 @@ LLM agents. Use it only on repositories you are authorized to assess.
   worktree cannot change what the evidence refers to.
 - Git-ref imports resolve the ref once, archive that immutable commit, and copy
   only in-scope regular files into a read-only snapshot. Excluded files,
-  oversized files, and symlinks are not retained in the snapshot.
+  oversized files, and symlinks are not retained in the snapshot. The archive
+  reads only a Git directory that belongs to the selected work tree. A `.git`
+  symlink or gitfile, an alternate object database, a symlink inside the object
+  store, and `GIT_*` environment variables are rejected or ignored, so a ref
+  import cannot copy commits stored outside that work tree. A subdirectory of
+  a repository archives only that subdirectory.
 
 ## Execution isolation
 

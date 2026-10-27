@@ -68,8 +68,9 @@ of being copied into the snapshot. That archive does not load repository,
 system, or global Git configuration, so filter commands do not run and
 `core.autocrlf` is not applied. System and global attribute files are not
 read. The archive Git directory uses the pinned repository's object format,
-including SHA-256. Committed attributes can still request line-ending
-conversion.
+including SHA-256. Committed `export-subst` attributes are disabled, so a
+signature placeholder cannot run `gpg`. Committed attributes can still request
+line-ending conversion.
 
 **Scope is a platform boundary.** The prompt tells the agent what it is doing,
 but the workspace, explorer, and evidence checker independently enforce scope.

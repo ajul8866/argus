@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join, relative } from "node:path";
@@ -1008,6 +1008,85 @@ describe("repository import", () => {
     expect(imported.commit_sha).toBe(commit);
     expect(await Bun.file(join(imported.path, "a.js")).text()).toBe("SHA256_PLAIN\n");
     expect(existsSync(marker)).toBe(false);
+  });
+
+  test("a git ref import does not run gpg for an export-subst signature placeholder", async () => {
+    const source = join(dir, "subst-repo");
+    const marker = join(dir, "gpg-ran");
+    const wrapper = join(dir, "bin");
+    const previousPath = process.env.PATH;
+    const git = (cwd: string, args: string[]): string => {
+      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+        env: {
+          PATH: "/usr/bin:/bin",
+          GIT_AUTHOR_NAME: "Tester",
+          GIT_AUTHOR_EMAIL: "tester@example.com",
+          GIT_COMMITTER_NAME: "Tester",
+          GIT_COMMITTER_EMAIL: "tester@example.com",
+          GIT_CONFIG_NOSYSTEM: "1",
+          HOME: join(dir, "subst-home"),
+          GIT_CONFIG_GLOBAL: "/dev/null",
+          GIT_ATTR_NOSYSTEM: "1",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+      return result.stdout.toString().trim();
+    };
+    mkdirSync(join(dir, "subst-home"), { recursive: true });
+    mkdirSync(join(source, "nested"), { recursive: true });
+    writeFileSync(join(source, "sig.js"), "sig:$Format:%G?$\n");
+    writeFileSync(join(source, "nested", "sig.js"), "nested:$Format:%G?$\n");
+    writeFileSync(join(source, ".gitattributes"), "[attr]evil export-subst\nsig.js evil\n");
+    writeFileSync(join(source, "nested", ".gitattributes"), "sig.js export-subst\n");
+    git(source, ["init", "-q"]);
+    git(source, ["add", "sig.js", "nested/sig.js", ".gitattributes", "nested/.gitattributes"]);
+    git(source, ["commit", "-qm", "init"]);
+    expect(git(source, ["check-attr", "export-subst", "--", "sig.js", "nested/sig.js"])).toBe(
+      "sig.js: export-subst: set\nnested/sig.js: export-subst: set",
+    );
+    const tree = git(source, ["rev-parse", "HEAD^{tree}"]);
+    const signatureHeader = "-----BEGIN PGP SIGNATURE-----";
+    const signatureBody = ["", "iQE=", "=abcd", "-----END PGP SIGNATURE-----"];
+    const forged = [
+      `tree ${tree}`,
+      "author Tester <tester@example.com> 1700000000 +0000",
+      "committer Tester <tester@example.com> 1700000000 +0000",
+      `gpgsig ${signatureHeader}`,
+      ...signatureBody.map((line) => ` ${line}`),
+      "",
+      "signed",
+      "",
+    ].join("\n");
+    const commitFile = join(dir, "signed-commit");
+    writeFileSync(commitFile, forged);
+    const commit = git(source, ["hash-object", "-t", "commit", "-w", commitFile]);
+    git(source, ["update-ref", "HEAD", commit]);
+    mkdirSync(wrapper);
+    writeFileSync(join(wrapper, "gpg"), `#!/bin/sh\ntouch ${marker}\nexit 0\n`);
+    chmodSync(join(wrapper, "gpg"), 0o755);
+    store.run(
+      `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+       VALUES ('p-subst', 'subst', '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+      source, JSON.stringify(["**/*.js"]),
+    );
+    process.env.PATH = `${wrapper}:${previousPath ?? "/usr/bin:/bin"}`;
+    try {
+      const imported = await importRepository({ config, store }, {
+        id: "p-subst",
+        source_path: source,
+        scope_include: JSON.stringify(["**/*.js"]),
+        scope_exclude: "[]",
+      }, "HEAD", "tester");
+      expect(imported.commit_sha).toBe(commit);
+      expect(await Bun.file(join(imported.path, "sig.js")).text()).toBe("sig:$Format:%G?$\n");
+      expect(await Bun.file(join(imported.path, "nested/sig.js")).text()).toBe("nested:$Format:%G?$\n");
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
   });
 
   test("a git ref import ignores global attributes and keeps a committed line-ending rule", async () => {

@@ -204,6 +204,11 @@ async function archivePinnedCommit(
     : "[core]\n\trepositoryformatversion = 0\n";
   await writeFile(join(archiveGit, "config"), repositoryConfig, { mode: 0o600 });
   await writeFile(join(archiveGit, "HEAD"), "ref: refs/heads/argus\n", { mode: 0o600 });
+  // `export-subst` expands pretty-format placeholders. `%G?` on a commit with a
+  // gpgsig header executes `gpg`. This file outranks `.gitattributes` in the
+  // tree, including a macro that sets the attribute. Line-ending rules stay.
+  await mkdir(join(archiveGit, "info"), { mode: 0o700 });
+  await writeFile(join(archiveGit, "info", "attributes"), "* -export-subst\n", { mode: 0o600 });
   env.GIT_DIR = archiveGit;
   env.GIT_OBJECT_DIRECTORY = join(gitDir, "objects");
   return runCommand(

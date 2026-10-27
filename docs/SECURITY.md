@@ -52,9 +52,10 @@ LLM agents. Use it only on repositories you are authorized to assess.
   repository's object format, including SHA-256, and replaces repository,
   system, and global Git configuration, so a smudge or process filter cannot
   run during import. Settings such as `core.autocrlf` are not applied. System
-  and global attribute files are not read. Committed attributes can still
-  request line-ending conversion. A subdirectory of a repository archives only
-  that subdirectory.
+  and global attribute files are not read. Committed `export-subst` attributes
+  are disabled, so a signature placeholder cannot run `gpg`. Committed
+  attributes can still request line-ending conversion. A subdirectory of a
+  repository archives only that subdirectory.
 
 ## Execution isolation
 

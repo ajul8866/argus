@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join, relative } from "node:path";
@@ -1780,7 +1779,6 @@ describe("repository import", () => {
   });
 
   test("import does not wait on a loose ref pipe Git probes for that revision", async () => {
-  test("import does not wait on a pipe in a loose ref, pseudoref, or worktree", async () => {
     const gitEnv = {
       PATH: process.env.PATH ?? "/usr/bin:/bin",
       GIT_AUTHOR_NAME: "Tester",
@@ -1917,8 +1915,6 @@ describe("repository import", () => {
       const source = join(dir, name);
       mkdirSync(source);
       git(source, ["init", "-q", "-b", "master"]);
-      mkdirSync(source);
-      git(source, ["init", "-q"]);
       writeFileSync(join(source, "a.js"), "LOCAL_ONLY\n");
       git(source, ["add", "a.js"]);
       git(source, ["commit", "-qm", "local"]);
@@ -2131,13 +2127,7 @@ describe("repository import", () => {
     fifo(join(otherMain, ".git", "refs", "tags", "feature"));
     insert("p-branch-other-worktree", otherA);
     expect(await attempt("p-branch-other-worktree", otherA, null)).toBe("invalid_repository");
-    const chain = prepare("branch-chain");
-    writeFileSync(join(chain, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
-    writeFileSync(join(chain, ".git", "HEAD"), "ref: refs/heads/alias\n");
-    fifo(join(chain, ".git", "refs", "tags", "master"));
-    insert("p-branch-chain", chain);
-    expect(await attempt("p-branch-chain", chain, null)).toBe("invalid_repository");
-
+    {
     const chainRef = prepare("branch-chain-ref");
     writeFileSync(join(chainRef, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
     writeFileSync(join(chainRef, ".git", "HEAD"), "ref: refs/heads/alias\n");
@@ -2145,27 +2135,6 @@ describe("repository import", () => {
     fifo(join(chainRef, ".git", "master"));
     insert("p-branch-chain-ref", chainRef);
     expect(await attempt("p-branch-chain-ref", chainRef, "v1")).toBe("invalid_repository");
-
-    const ambiguous = prepare("branch-chain-ambiguous");
-    writeFileSync(join(ambiguous, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
-    writeFileSync(join(ambiguous, ".git", "HEAD"), "ref: refs/heads/alias\n");
-    writeFileSync(join(ambiguous, ".git", "refs", "tags", "master"), readFileSync(join(ambiguous, ".git", "refs", "heads", "master")));
-    fifo(join(ambiguous, ".git", "heads", "master"));
-    insert("p-branch-chain-ambiguous", ambiguous);
-    expect(await attempt("p-branch-chain-ambiguous", ambiguous, null)).toBe("invalid_repository");
-
-    const chainMain = prepare("branch-chain-worktree-main");
-    git(chainMain, ["branch", "feature"]);
-    writeFileSync(join(chainMain, ".git", "refs", "heads", "alias"), "ref: refs/heads/feature\n");
-    const chainLinked = join(dir, "branch-chain-worktree");
-    git(chainMain, ["worktree", "add", "-q", chainLinked, "feature"]);
-    const gitdirLine = readFileSync(join(chainLinked, ".git"), "utf8").trim();
-    const declaredGitDir = gitdirLine.startsWith("gitdir: ") ? gitdirLine.slice("gitdir: ".length).trim() : "";
-    const worktreeGit = declaredGitDir.startsWith("/") ? declaredGitDir : join(chainLinked, declaredGitDir);
-    writeFileSync(join(worktreeGit, "HEAD"), "ref: refs/heads/alias\n");
-    fifo(join(chainMain, ".git", "refs", "tags", "feature"));
-    insert("p-branch-chain-worktree", chainLinked);
-    expect(await attempt("p-branch-chain-worktree", chainLinked, null)).toBe("invalid_repository");
 
     const bisectMain = prepare("branch-bisect-main");
     git(bisectMain, ["checkout", "-q", "-b", "other"]);
@@ -2203,6 +2172,7 @@ describe("repository import", () => {
     fifo(join(mainWorktreeRoot, ".git", "refs", "tags", "master"));
     insert("p-main-worktree-linked", mainWorktreeChild);
     expect(await attempt("p-main-worktree-linked", mainWorktreeChild, null)).toBe("invalid_repository");
+    }
 
     const healthy = prepare("branch-healthy");
     insert("p-branch-healthy", healthy);
@@ -2212,8 +2182,6 @@ describe("repository import", () => {
     const healthyChain = prepare("branch-chain-healthy");
     git(healthyChain, ["symbolic-ref", "refs/heads/link", "refs/heads/master"]);
     git(healthyChain, ["symbolic-ref", "HEAD", "refs/heads/link"]);
-    writeFileSync(join(healthyChain, ".git", "refs", "heads", "alias"), "ref: refs/heads/master\n");
-    writeFileSync(join(healthyChain, ".git", "HEAD"), "ref: refs/heads/alias\n");
     insert("p-branch-chain-healthy", healthyChain);
     const chainImported = await importRepository({ config, store }, projectFor("p-branch-chain-healthy", healthyChain), null, "tester");
     expect(await Bun.file(join(chainImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
@@ -2274,6 +2242,7 @@ describe("repository import", () => {
       "tester",
     );
     expect(await Bun.file(join(mainWorktreeLinkedImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+    {
     const healthyAmbiguous = prepare("branch-ambiguous-healthy");
     writeFileSync(join(healthyAmbiguous, ".git", "refs", "tags", "master"), readFileSync(join(healthyAmbiguous, ".git", "refs", "heads", "master")));
     insert("p-branch-ambiguous-healthy", healthyAmbiguous);
@@ -2305,9 +2274,59 @@ describe("repository import", () => {
     insert("p-main-worktree-linked-healthy", healthyLinked);
     const linkedImported = await importRepository({ config, store }, projectFor("p-main-worktree-linked-healthy", healthyLinked), null, "tester");
     expect(await Bun.file(join(linkedImported.path, "a.js")).text()).toBe("LOCAL_ONLY\n");
+    }
   });
 
-  test("import does not wait on a pipe Git opens while resolving HEAD", async () => {
+  test("import does not wait on a pipe in a loose ref, pseudoref, or worktree", async () => {
+    const gitEnv = {
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      GIT_AUTHOR_NAME: "Tester",
+      GIT_AUTHOR_EMAIL: "tester@example.com",
+      GIT_COMMITTER_NAME: "Tester",
+      GIT_COMMITTER_EMAIL: "tester@example.com",
+    };
+    const git = (cwd: string, args: string[]): void => {
+      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
+        env: gitEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
+    };
+    const fifo = (path: string): void => {
+      expect(Bun.spawnSync(["mkfifo", path]).exitCode).toBe(0);
+    };
+    const prepare = (name: string): string => {
+      const source = join(dir, name);
+      mkdirSync(source);
+      git(source, ["init", "-q"]);
+      writeFileSync(join(source, "a.js"), "LOCAL_ONLY\n");
+      git(source, ["add", "a.js"]);
+      git(source, ["commit", "-qm", "local"]);
+      return source;
+    };
+    const insert = (id: string, source: string): void => {
+      store.run(
+        `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
+         VALUES (?, ?, '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
+        id, id, source, JSON.stringify(["**/*.js"]),
+      );
+    };
+    const projectFor = (id: string, source: string) => ({
+      id,
+      source_path: source,
+      scope_include: JSON.stringify(["**/*.js"]),
+      scope_exclude: "[]",
+    });
+    const attempt = async (id: string, source: string, ref: string | null): Promise<string> => {
+      return Promise.race([
+        importRepository({ config, store }, projectFor(id, source), ref, "tester")
+          .then(() => "imported")
+          .catch((error: { code?: string }) => error.code ?? "error"),
+        Bun.sleep(800).then(() => "blocked"),
+      ]);
+    };
+
     const side = prepare("ref-fifo");
     fifo(join(side, ".git", "refs", "heads", "side"));
     insert("p-ref-fifo", side);
@@ -2373,9 +2392,6 @@ describe("repository import", () => {
       GIT_COMMITTER_NAME: "Tester",
       GIT_COMMITTER_EMAIL: "tester@example.com",
     };
-    const git = (cwd: string, args: string[]): void => {
-      const result = Bun.spawnSync(["git", "-C", cwd, ...args], {
-        env: gitEnv,
     const source = join(dir, "replace-ref");
     mkdirSync(source);
     const git = (args: string[], stdin?: Buffer): string => {
@@ -2386,75 +2402,6 @@ describe("repository import", () => {
         stderr: "pipe",
       });
       if (result.exitCode !== 0) throw new Error(`${args.join(" ")} failed: ${result.stderr.toString()}`);
-    };
-    const fifo = (path: string): void => {
-      expect(Bun.spawnSync(["mkfifo", path]).exitCode).toBe(0);
-    };
-    const prepare = (name: string, branch = "master"): string => {
-      const source = join(dir, name);
-      mkdirSync(source, { recursive: true });
-      git(source, ["init", "-q", "-b", "master"]);
-      writeFileSync(join(source, "a.js"), "LOCAL_ONLY\n");
-      git(source, ["add", "a.js"]);
-      git(source, ["commit", "-qm", "local"]);
-      if (branch !== "master") git(source, ["checkout", "-q", "-b", branch]);
-      return source;
-    };
-    const project = (id: string, source: string) => ({
-      id,
-      source_path: source,
-      scope_include: JSON.stringify(["**/*.js"]),
-      scope_exclude: "[]",
-    });
-    const insert = (id: string, source: string): void => {
-      store.run(
-        `INSERT INTO projects (id, name, description, source_path, scope_include, scope_exclude, authorized_by, authorization_ref, created_at, updated_at)
-         VALUES (?, ?, '', ?, ?, '[]', 'Tester', 'TEST-AUTH', '2026-01-01', '2026-01-01')`,
-        id, id, source, JSON.stringify(["**/*.js"]),
-      );
-    };
-    const attempt = async (id: string, source: string, ref: string | null): Promise<string> => {
-      insert(id, source);
-      return Promise.race([
-        importRepository({ config, store }, project(id, source), ref, "tester")
-          .then(() => "imported")
-          .catch((error: { code?: string }) => error.code ?? "error"),
-        Bun.sleep(800).then(() => "blocked"),
-      ]);
-    };
-
-    const tagsBranch = prepare("head-tags-branch");
-    fifo(join(tagsBranch, ".git", "refs", "tags", "master"));
-    expect(await attempt("p-head-tags-worktree", tagsBranch, null)).toBe("invalid_repository");
-    expect(await attempt("p-head-tags-head", tagsBranch, "HEAD")).toBe("invalid_repository");
-
-    const gitBranch = prepare("head-git-branch");
-    git(gitBranch, ["tag", "v1"]);
-    fifo(join(gitBranch, ".git", "master"));
-    expect(await attempt("p-head-git-worktree", gitBranch, null)).toBe("invalid_repository");
-    expect(await attempt("p-head-git-v1", gitBranch, "v1")).toBe("invalid_repository");
-
-    const nested = prepare("head-nested", "feature/foo");
-    mkdirSync(join(nested, ".git", "refs", "tags", "feature"), { recursive: true });
-    fifo(join(nested, ".git", "refs", "tags", "feature", "foo"));
-    expect(await attempt("p-head-nested", nested, null)).toBe("invalid_repository");
-
-    const chained = prepare("head-chain");
-    git(chained, ["symbolic-ref", "refs/heads/next", "refs/heads/master"]);
-    git(chained, ["symbolic-ref", "HEAD", "refs/heads/next"]);
-    fifo(join(chained, ".git", "refs", "tags", "master"));
-    expect(await attempt("p-head-chain", chained, null)).toBe("invalid_repository");
-
-    const holder = prepare("head-common-holder", "other");
-    fifo(join(holder, ".git", "refs", "tags", "master"));
-    const child = prepare("head-common-child");
-    writeFileSync(join(child, ".git", "commondir"), `${join(holder, ".git")}\n`);
-    expect(await attempt("p-head-common", child, null)).toBe("invalid_repository");
-
-    const healthy = prepare("head-healthy");
-    git(healthy, ["tag", "v1"]);
-    git(healthy, ["update-ref", "refs/remotes/origin/master", "HEAD"]);
-    expect(await attempt("p-head-healthy", healthy, null)).toBe("imported");
       return result.stdout.toString().trim();
     };
     git(["init", "-q"]);

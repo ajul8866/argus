@@ -46,7 +46,14 @@ export async function importRepository(
       }
       const resolved = await runCommand(
         ["git", "-C", sourceRoot, "rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`],
-        { timeoutMs: 20_000 },
+        {
+          timeoutMs: 20_000,
+          env: {
+            PATH: process.env.PATH ?? "/usr/bin:/bin",
+            GIT_CONFIG_NOSYSTEM: "1",
+            GIT_CONFIG_GLOBAL: "/dev/null",
+          },
+        },
       );
       if (resolved.code !== 0) throw badRequest(`Unknown git ref: ${ref}`);
       commit = resolved.stdout.trim();
@@ -54,9 +61,53 @@ export async function importRepository(
       const archivePath = join(staging, "snapshot.tar");
       const extractedRoot = join(staging, "source");
       await mkdir(extractedRoot, { mode: 0o700 });
+      // Archive with every repository-local command-bearing configuration
+      // entry overridden, so a filter/tar/fsmonitor driver shipped inside the
+      // audited repository cannot execute during `git archive`.
+      const gitDir = await runCommand(
+        ["git", "-C", sourceRoot, "rev-parse", "--absolute-git-dir"],
+        { timeoutMs: 20_000 },
+      );
+      if (gitDir.code !== 0) throw badRequest("Failed to locate the git directory");
+      const localConfig = await runCommand(
+        ["git", "--git-dir", gitDir.stdout.trim(), "config", "--local", "--name-only", "--list"],
+        { timeoutMs: 20_000 },
+      );
+      const dangerousKey =
+        /^(filter\..*\.(smudge|clean|process)|tar\..*\.command|diff\..*\.(textconv|command)|core\.(fsmonitor|hookspath|pager|editor|sshcommand|alternaterefscommand|gitproxy)|credential\..*\.helper|uploadpack\..*\.(uploadpack|receivepack)|gpg\..*\.program)$/i;
+      const overrides = localConfig.stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((key) => key && dangerousKey.test(key))
+        .flatMap((key) => ["-c", `${key}=`]);
       const archived = await runCommand(
-        ["git", "-C", sourceRoot, "archive", "--format=tar", "--output", archivePath, commit],
-        { timeoutMs: 180_000 },
+        [
+          "git",
+          ...overrides,
+          "-c",
+          "core.fsmonitor=",
+          "-c",
+          `core.hooksPath=${join(staging, "nohooks")}`,
+          "-c",
+          "core.pager=cat",
+          "-C",
+          sourceRoot,
+          "archive",
+          "--format=tar",
+          "--output",
+          archivePath,
+          commit,
+        ],
+        {
+          timeoutMs: 180_000,
+          env: {
+            PATH: process.env.PATH ?? "/usr/bin:/bin",
+            HOME: staging,
+            GIT_CONFIG_NOSYSTEM: "1",
+            GIT_CONFIG_GLOBAL: "/dev/null",
+            GIT_ATTR_NOSYSTEM: "1",
+          },
+        },
       );
       if (archived.code !== 0 || archived.timedOut) {
         throw badRequest(`Failed to archive ${ref}: ${archived.stderr.slice(0, 500)}`);

@@ -31,6 +31,8 @@ export type AuthContext = {
 const ROLE_RANK: Record<User["role"], number> = { viewer: 1, auditor: 2, admin: 3 };
 
 const ARGON2_OPTIONS = { algorithm: "argon2id", memoryCost: 65_536, timeCost: 3 } as const;
+const MAX_LOGIN_ATTEMPTS = 6;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const PUBLIC_USER_COLUMNS = "id, email, name, role, disabled, created_at";
 
 function hashPassword(password: string): Promise<string> {
@@ -117,15 +119,28 @@ export class AuthService {
     if (nowMs - record.firstAt > 15 * 60 * 1000) this.failures.delete(key);
   }
 
-  private recordFailure(key: string): void {
+  /**
+   * Charge an attempt to the bucket before the password hash is verified.
+   * Counting first means concurrent requests cannot all pass `checkRateLimit`
+   * while an earlier verification is still awaiting the key derivation.
+   */
+  private reserveAttempt(key: string): void {
     const nowMs = Date.now();
     const record = this.failures.get(key);
-    if (!record || nowMs - record.firstAt > 15 * 60 * 1000) {
+    if (!record || nowMs - record.firstAt > LOGIN_WINDOW_MS) {
       this.failures.set(key, { count: 1, firstAt: nowMs, lockedUntil: 0 });
       return;
     }
     record.count += 1;
-    if (record.count >= 6) record.lockedUntil = nowMs + 15 * 60 * 1000;
+    if (record.count >= MAX_LOGIN_ATTEMPTS) record.lockedUntil = nowMs + LOGIN_WINDOW_MS;
+  }
+
+  /** Refund the reservation after a successful sign-in. */
+  private refundAttempt(key: string): void {
+    const record = this.failures.get(key);
+    if (!record) return;
+    record.count = Math.max(0, record.count - 1);
+    if (record.count === 0) this.failures.delete(key);
   }
 
   async login(
@@ -136,20 +151,15 @@ export class AuthService {
   ): Promise<{ user: User; token: string; csrf: string; expiresAt: string }> {
     const key = this.loginKey(ip, email);
     this.checkRateLimit(key);
+    this.reserveAttempt(key);
     const row = this.store.get<User & { password_hash: string }>(
       "SELECT * FROM users WHERE email = ?",
       email.toLowerCase(),
     );
-    if (!row || row.disabled === 1) {
-      this.recordFailure(key);
-      throw new Error("Invalid email or password");
-    }
+    if (!row || row.disabled === 1) throw new Error("Invalid email or password");
     const valid = await Bun.password.verify(password, row.password_hash);
-    if (!valid) {
-      this.recordFailure(key);
-      throw new Error("Invalid email or password");
-    }
-    this.failures.delete(key);
+    if (!valid) throw new Error("Invalid email or password");
+    this.refundAttempt(key);
     const token = randomBytes(32).toString("base64url");
     const csrf = randomBytes(32).toString("base64url");
     const expiresAt = new Date(Date.now() + this.config.sessionTtlMs).toISOString();

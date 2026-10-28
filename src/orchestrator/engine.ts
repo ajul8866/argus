@@ -207,24 +207,13 @@ type FindingRow = {
 };
 
 const TERMINAL_TASK_STATES = new Set(["completed", "failed", "cancelled", "blocked"]);
-const DETERMINISTIC_TASK_KINDS: Record<string, true> = { "phase4.persist": true, "phase6.report": true };
-/** Terminal on the first check, including the generic fallback kind. */
-const WRITABLE_WORKSPACE_DENIALS = new Set([
-  "writable_workspace_disabled",
-  "writable_workspace_not_approved",
-  "writable_workspace_denied",
-]);
 const NON_RETRYABLE_FAILURES = new Set([
   "cancelled",
   "budget_exceeded",
   "harness_missing",
   "harness_auth",
-  "shell_tools_disabled",
-  "shell_tools_not_approved",
-  "harness_tool_policy",
   "audit_closed",
   "local_resources",
-  ...WRITABLE_WORKSPACE_DENIALS,
 ]);
 
 const TASK_SCHEMAS: Record<string, JsonSchema> = {
@@ -536,14 +525,6 @@ export class AuditEngine {
         "Import an authorized repository for this project before starting an audit",
       );
     }
-    const writableWorkspace = input.overrides?.writable_workspace === true;
-    if (writableWorkspace && !getSetting(this.store, "security.allow_writable_workspace", false)) {
-      throw new AppError(
-        409,
-        "writable_workspace_disabled",
-        "security.allow_writable_workspace is disabled. An administrator must enable it with explicit confirmation before an audit can request a writable workspace.",
-      );
-    }
     const maxAreas = clamp(
       Number(input.overrides?.max_areas ?? getSetting(this.store, "audit.max_areas", 4)),
       1,
@@ -580,7 +561,6 @@ export class AuditEngine {
         input.overrides?.require_distinct_harness_for_retest ??
           getSetting(this.store, "audit.require_distinct_harness_for_retest", true),
       ),
-      writable_workspace: writableWorkspace,
       max_cost_usd: normalizeCostCeiling(input.overrides?.max_cost_usd),
       target_id: input.targetId ?? null,
       max_tasks: clamp(Number(input.overrides?.max_tasks ?? 200), 1, 100_000),
@@ -1411,10 +1391,9 @@ export class AuditEngine {
     let harness: HarnessKind | null = options.harness ?? null;
     let model: string | null = options.model ?? null;
     let maxAttempts = options.maxAttempts ?? 2;
-    let requiresApproval = options.requiresApproval ?? false;
-    const approvalRequests: Array<{ action: string; scope: string }> = [];
+    const requiresApproval = options.requiresApproval === true;
     if (options.agentRole) {
-      let definition = agentDefinition(this.store, options.agentRole);
+      const definition = agentDefinition(this.store, options.agentRole);
       const audit = this.store.get<{ config: string }>("SELECT config FROM audits WHERE id = ?", options.auditId);
       const auditConfig = parseJson<Record<string, unknown>>(audit?.config ?? "{}", {});
       const overrides = (auditConfig.harness_overrides ?? {}) as Record<
@@ -1422,6 +1401,9 @@ export class AuditEngine {
         { harness?: HarnessKind; model?: string | null }
       >;
       const override = overrides[options.agentRole] ?? {};
+      if (override.harness !== undefined && override.harness !== "pi" && override.harness !== "claude-code") {
+        throw new AppError(400, "invalid_harness_override", `Invalid harness override for ${definition.role}`);
+      }
       harness = override.harness ?? definition.harness;
       model = override.model !== undefined ? override.model : definition.model;
       maxAttempts = definition.max_retries + 1;
@@ -1477,39 +1459,7 @@ export class AuditEngine {
           }
         }
       }
-      definition = agentDefinition(this.store, options.agentRole, harness);
-      const shellTools = definition.allow_shell || definition.allowed_tools.some((tool) => /^(bash|Bash)(?:$|\()/.test(tool));
-      if (shellTools) {
-        const allowShell = Boolean(getSetting(this.store, "security.allow_shell_tools", false));
-        if (!allowShell) {
-          throw new AppError(
-            409,
-            "shell_tools_disabled",
-            `Agent ${definition.role} requests shell tools, but security.allow_shell_tools is disabled. Enable it explicitly and approve the task.`,
-          );
-        }
-        if (Boolean(getSetting(this.store, "security.require_approval_for_shell", true))) {
-          requiresApproval = true;
-          approvalRequests.push({
-            action: "allow_shell_tools",
-            scope: `Task ${id} (${options.kind}) requests shell tool execution`,
-          });
-        }
-      }
-      if (DETERMINISTIC_TASK_KINDS[options.kind] !== true && auditConfig.writable_workspace === true) {
-        approvalRequests.push({
-          action: "allow_writable_workspace",
-          scope: `Task ${id} (${options.kind}) requests a writable audit workspace`,
-        });
-      }
     }
-    if (requiresApproval && approvalRequests.length === 0) {
-      approvalRequests.push({
-        action: "allow_shell_tools",
-        scope: `Task ${id} (${options.kind}) requests task-level approval`,
-      });
-    }
-    requiresApproval = requiresApproval || approvalRequests.length > 0;
     this.store.transaction(() => {
       this.store.run(
         `INSERT INTO tasks (id, audit_id, phase, kind, task_key, title, status, priority, payload, agent_role, harness, model, attempts, max_attempts, requires_approval, created_at)
@@ -1538,22 +1488,17 @@ export class AuditEngine {
         );
       }
       if (requiresApproval) {
-        let primaryApprovalId: string | null = null;
-        for (const request of approvalRequests) {
-          const approvalId = uid();
-          this.store.run(
-            `INSERT INTO approvals (id, audit_id, task_id, action, scope, status, requested_by, created_at)
-             VALUES (?, ?, ?, ?, ?, 'pending', NULL, ?)`,
-            approvalId,
-            options.auditId,
-            id,
-            request.action,
-            request.scope,
-            timestamp,
-          );
-          primaryApprovalId = primaryApprovalId ?? approvalId;
-        }
-        this.store.run("UPDATE tasks SET approval_id = ? WHERE id = ?", primaryApprovalId, id);
+        const approvalId = uid();
+        this.store.run(
+          `INSERT INTO approvals (id, audit_id, task_id, action, scope, status, requested_by, created_at)
+           VALUES (?, ?, ?, 'task_approval', ?, 'pending', NULL, ?)`,
+          approvalId,
+          options.auditId,
+          id,
+          `Task ${id} (${options.kind}) requests operator approval`,
+          timestamp,
+        );
+        this.store.run("UPDATE tasks SET approval_id = ? WHERE id = ?", approvalId, id);
       }
     });
     this.events.append({
@@ -1696,11 +1641,11 @@ export class AuditEngine {
       return;
     }
     if (task.kind === "phase4.persist") {
-      await this.runDeterministicTask(task);
+      await this.runDeterministicTask(task, signal);
       return;
     }
     if (task.kind === "phase6.report") {
-      await this.runReportTask(task);
+      await this.runReportTask(task, signal);
       return;
     }
     if (task.kind === "phase5.reverify") {
@@ -1714,7 +1659,7 @@ export class AuditEngine {
         return;
       }
     }
-    await this.runAgentTask(task, audit, signal);
+    await this.runAgentTask(task, signal);
   }
 
   /**
@@ -1762,12 +1707,12 @@ export class AuditEngine {
     }
   }
 
-  private async runDeterministicTask(task: TaskRow): Promise<void> {
+  private async runDeterministicTask(task: TaskRow, signal: AbortSignal): Promise<void> {
     try {
       if (this.cancelIfAuditClosed(task, "Audit was cancelled before deterministic persistence ran")) return;
       const payload = parseJson<Record<string, unknown>>(task.payload, {});
       const result = await this.persistFinding(task, payload);
-      if (!this.auditIsRunning(task.audit_id)) {
+      if (signal.aborted || !this.auditIsRunning(task.audit_id)) {
         this.finishTaskFailure(task.id, "cancelled", "Audit was cancelled while the finding was being persisted");
         return;
       }
@@ -1777,10 +1722,14 @@ export class AuditEngine {
     }
   }
 
-  private async runReportTask(task: TaskRow): Promise<void> {
+  private async runReportTask(task: TaskRow, signal: AbortSignal): Promise<void> {
     try {
       if (this.cancelIfAuditClosed(task, "Audit was cancelled before report generation")) return;
       const generated = await this.reports.generate(task.audit_id, REPORT_FORMATS, "phase6");
+      if (signal.aborted || !this.auditIsRunning(task.audit_id)) {
+        this.finishTaskFailure(task.id, "cancelled", "Audit was cancelled while reports were generated");
+        return;
+      }
       if (generated.length !== REPORT_FORMATS.length) {
         throw new Error(`Only ${generated.length}/${REPORT_FORMATS.length} report formats were generated`);
       }
@@ -1792,62 +1741,13 @@ export class AuditEngine {
     }
   }
 
-  private toolsForHarness(tools: string[], harness: HarnessKind): string[] {
-    const toClaude: Record<string, string> = {
-      read: "Read",
-      grep: "Grep",
-      find: "Glob",
-      ls: "LS",
-      bash: "Bash",
-      edit: "Edit",
-      write: "Write",
-    };
-    const toPi: Record<string, string> = {
-      Read: "read",
-      Grep: "grep",
-      Glob: "find",
-      LS: "ls",
-      Bash: "bash",
-      Edit: "edit",
-      Write: "write",
-    };
-    return tools.map((tool) => (harness === "claude-code" ? toClaude[tool] ?? tool : toPi[tool] ?? tool));
-  }
-
-  private async runAgentTask(task: TaskRow, audit: AuditRow, signal: AbortSignal): Promise<void> {
+  private async runAgentTask(task: TaskRow, signal: AbortSignal): Promise<void> {
     const ctx = this.context(task.audit_id);
-    const definition = agentDefinition(this.store, task.agent_role!, task.harness ?? undefined);
+    const definition = agentDefinition(this.store, task.agent_role!);
     const harness = task.harness ?? definition.harness;
     const supportsRole = definition.enabled;
     if (!supportsRole) {
       this.finishTaskFailure(task.id, "internal", `Agent role ${definition.role} is disabled`);
-      return;
-    }
-    const shellTools = definition.allow_shell || definition.allowed_tools.some((tool) => /^(bash|Bash)(?:$|\()/.test(tool));
-    if (shellTools) {
-      if (!getSetting(this.store, "security.allow_shell_tools", false)) {
-        this.finishTaskFailure(task.id, "shell_tools_disabled", "Shell tools are disabled in Settings.");
-        return;
-      }
-      if (getSetting(this.store, "security.require_approval_for_shell", true)) {
-        const approval = this.store.get<{ status: string }>(
-          "SELECT status FROM approvals WHERE task_id = ? AND action = 'allow_shell_tools' ORDER BY created_at DESC LIMIT 1", task.id,
-        );
-        if (approval?.status !== "approved") {
-          this.finishTaskFailure(task.id, "shell_tools_not_approved", "The runtime tool list now includes shell access. This task needs shell approval before it can run.");
-          return;
-        }
-      }
-    }
-    let writableWorkspace: boolean;
-    try {
-      writableWorkspace = this.resolveWritableWorkspace(task, ctx.auditConfig);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const failureKind = error instanceof AppError && WRITABLE_WORKSPACE_DENIALS.has(error.code)
-        ? error.code
-        : "writable_workspace_denied";
-      this.finishTaskFailure(task.id, failureKind, message);
       return;
     }
     const sessionId = uid();
@@ -1929,7 +1829,7 @@ export class AuditEngine {
           commit: ctx.repository.commit_sha,
           scope: ctx.scope,
         },
-        writableWorkspace,
+        true,
       );
       this.events.append({
         auditId: task.audit_id,
@@ -1938,7 +1838,7 @@ export class AuditEngine {
         type: "agent.workspace_ready",
         payload: {
           workspace,
-          writable: writableWorkspace,
+          writable: true,
           file_count: ctx.inventory.files.length,
           summary: inventorySummary(ctx.inventory),
         },
@@ -1995,27 +1895,6 @@ export class AuditEngine {
     }
 
     const schema = TASK_SCHEMAS[task.kind] ?? null;
-    const tools = this.toolsForHarness(
-      definition.allow_shell
-        ? [...definition.allowed_tools, harness === "pi" ? "bash" : "Bash"]
-        : definition.allowed_tools,
-      harness,
-    );
-    const harnessPolicy = harnessConfig(this.store, harness).allowed_tools;
-    const policyViolations = tools.filter((tool) => !harnessPolicy.includes(tool));
-    if (policyViolations.length > 0) {
-      finalizeSession(
-        "failed",
-        null,
-        `Harness policy does not allow tool(s): ${policyViolations.join(", ")}. Update Harness settings or the role tool list.`,
-      );
-      this.finishTaskFailure(
-        task.id,
-        "harness_tool_policy",
-        `Harness policy does not allow tool(s): ${policyViolations.join(", ")}. The task failed closed; no tool was silently removed.`,
-      );
-      return;
-    }
     let bufferedText = "";
     let lastFlush = Date.now();
     const flush = () => {
@@ -2048,8 +1927,6 @@ export class AuditEngine {
           payload: {
             harness,
             model: task.model,
-            allowed_tools: tools,
-            inherit_tools: definition.inherit_tools,
             sandbox: event.meta?.sandbox,
             warnings: event.meta?.warnings ?? [],
             pid: event.meta?.pid,
@@ -2154,17 +2031,15 @@ export class AuditEngine {
           taskId: task.id,
           role: definition.role,
           prompt,
-          systemPrompt: this.systemPrompt(task, definition, ctx.scope, ctx.repository.commit_sha, workspace, writableWorkspace) + localResourcePrompt(this.config, sessionId, resources),
+          systemPrompt: this.systemPrompt(task, definition, ctx.scope, ctx.repository.commit_sha, workspace) + localResourcePrompt(this.config, sessionId, resources),
           workspace,
           model: task.model,
           provider: harnessConfig(this.store, harness).provider,
-          allowedTools: tools,
           timeoutMs: Math.min(definition.max_duration_ms, timeout),
           schema: schema ?? undefined,
           maxBudgetUsd: definition.budget_usd,
           metadata: { attempt: task.attempts },
           resources,
-          workspaceWritable: writableWorkspace,
         },
         { onEvent, signal },
       );
@@ -2299,43 +2174,18 @@ export class AuditEngine {
     };
   }
 
-  /** Fail closed unless the audit requested writes and an administrator approved this task. */
-  private resolveWritableWorkspace(task: TaskRow, auditConfig: Record<string, unknown>): boolean {
-    if (auditConfig.writable_workspace !== true) return false;
-    if (!getSetting(this.store, "security.allow_writable_workspace", false)) {
-      throw new AppError(
-        409,
-        "writable_workspace_disabled",
-        "security.allow_writable_workspace is disabled; refusing to run this task with write access.",
-      );
-    }
-    const approval = this.store.get<{ status: string }>(
-      "SELECT status FROM approvals WHERE task_id = ? AND action = 'allow_writable_workspace' ORDER BY created_at DESC LIMIT 1",
-      task.id,
-    );
-    if (approval?.status !== "approved") {
-      throw new AppError(
-        409,
-        "writable_workspace_not_approved",
-        "This audit requests a writable workspace, but this task has no approved allow_writable_workspace decision.",
-      );
-    }
-    return true;
-  }
-
   private systemPrompt(
     task: TaskRow,
     definition: AgentDefinition,
     scope: Scope,
     commit: string | null,
     workspace: string,
-    writable: boolean,
   ): string {
-    if (task.kind === "phase1.map") return mapperSystem(definition.system_instructions, workspace, commit, writable);
-    if (task.kind === "phase2.discover") return researcherSystem(definition.system_instructions, workspace, commit, writable);
-    if (task.kind === "phase3.confirm") return validatorSystem(definition.system_instructions, workspace, commit, writable);
-    if (task.kind === "phase5.reverify") return retestSystem(definition.system_instructions, workspace, commit, writable);
-    return `${definition.system_instructions}\nWorkspace (${writable ? "writable copy, administrator-approved for this task" : "read-only copy"}): ${workspace}\nScope: ${scope.include.join(", ")}`;
+    if (task.kind === "phase1.map") return mapperSystem(definition.system_instructions, workspace, commit);
+    if (task.kind === "phase2.discover") return researcherSystem(definition.system_instructions, workspace, commit);
+    if (task.kind === "phase3.confirm") return validatorSystem(definition.system_instructions, workspace, commit);
+    if (task.kind === "phase5.reverify") return retestSystem(definition.system_instructions, workspace, commit);
+    return `${definition.system_instructions}\nWorkspace: ${workspace}\nScope: ${scope.include.join(", ")}`;
   }
 
   private async buildPrompt(task: TaskRow, ctx: ReturnType<AuditEngine["context"]>): Promise<string | null> {
@@ -3166,12 +3016,13 @@ export class AuditEngine {
 
   private completeTask(taskId: string, data: unknown): void {
     const timestamp = now();
-    this.store.run(
-      "UPDATE tasks SET status = 'completed', result = ?, error = NULL, failure_kind = NULL, finished_at = ? WHERE id = ?",
+    const changes = this.store.changes(
+      "UPDATE tasks SET status = 'completed', result = ?, error = NULL, failure_kind = NULL, finished_at = ? WHERE id = ? AND status = 'running'",
       toJson(data),
       timestamp,
       taskId,
     );
+    if (changes === 0) return;
     const task = this.store.get<TaskRow>("SELECT * FROM tasks WHERE id = ?", taskId);
     if (task) {
       this.events.append({
@@ -3549,7 +3400,7 @@ export class AuditEngine {
         "SELECT COUNT(*) AS count FROM tasks WHERE audit_id = ? AND phase = 3",
         auditId,
       )?.count ?? 0;
-      if ((phase2.total > 0 || dynamicExplored) && phase2.active === 0 && phase3CountAfter === 0) {
+      if (explorationClosed && (phase2.total > 0 || dynamicExplored) && phase2.active === 0 && phase3CountAfter === 0) {
         this.store.run(
           "UPDATE audit_phases SET status = 'completed', finished_at = COALESCE(finished_at, ?), summary = COALESCE(summary, 'No confirmable candidates remained.') WHERE audit_id = ? AND phase = 3",
           now(),

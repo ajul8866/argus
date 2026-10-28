@@ -36,8 +36,7 @@ async function fakeAdapter(kind: HarnessKind, source: string) {
 function task(timeoutMs = 5_000): HarnessTask {
   return {
     runId: crypto.randomUUID(), auditId: "audit", taskId: "task", role: "test",
-    prompt: "Return JSON", systemPrompt: "Test", workspace: join(dir, "workspace"), model: "test-model",
-    allowedTools: [], timeoutMs,
+    prompt: "Return JSON", systemPrompt: "Test", workspace: join(dir, "workspace"), model: "test-model", timeoutMs,
   };
 }
 

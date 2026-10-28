@@ -1,4 +1,4 @@
-import type { Candidate, ConfirmationResult, DiscoveryResult, MapResult } from "./schemas.ts";
+import type { Candidate, MapResult } from "./schemas.ts";
 import { CONFIRMATION_SCHEMA, DISCOVERY_SCHEMA, MAP_SCHEMA, RETEST_SCHEMA } from "./schemas.ts";
 import type { Inventory } from "../repo/inventory.ts";
 import type { Scope } from "../util.ts";
@@ -12,23 +12,22 @@ function schemaBlock(schema: unknown): string {
 function fileList(paths: string[], limit = MAX_PROMPT_FILES): string {
   if (paths.length === 0) return "(none)";
   const shown = paths.slice(0, limit);
-  return `${shown.join("\n")}${paths.length > limit ? `\n… ${paths.length - limit} more files omitted; use find/grep/read to inspect them` : ""}`;
+  return `${shown.join("\n")}${paths.length > limit ? `\n… ${paths.length - limit} more files omitted; use the file tools to inspect them` : ""}`;
 }
 
-function workspaceLine(workspace: string, writable: boolean): string {
-  return writable
-    ? `- Workspace (writable copy, administrator-approved for this task): ${workspace}\n- You may create scratch files inside this workspace only. Never write outside it.`
-    : `- Workspace (read-only copy): ${workspace}`;
+function workspaceLine(workspace: string): string {
+  return `- Workspace: ${workspace}
+  Independent writable copy of the in-scope files at the audited commit. Edit it, add fixtures and test scripts, and install the dependencies a reproduction needs. Changes here never touch the original repository or another session.`;
 }
 
-export function mapperSystem(agentInstructions: string, workspace: string, commit: string | null, writable: boolean): string {
+export function mapperSystem(agentInstructions: string, workspace: string, commit: string | null): string {
   return `${agentInstructions}
 
-Task context:
-${workspaceLine(workspace, writable)}
+This run:
+${workspaceLine(workspace)}
 - Repository commit: ${commit ?? "unknown (non-git repository)"}
-- You are phase 1 of a six-phase audit. Do not report vulnerabilities; produce a factual map and focused areas for later research.
-- Only reference files that exist in the workspace file inventory supplied to you.`;
+- Phase 1 of six. Deliver the architecture map and assessment areas; claim no vulnerabilities.
+- Every file you cite comes from the inventory supplied with the task.`;
 }
 
 export function mapperPrompt(options: {
@@ -68,28 +67,29 @@ ${endpointLines || "(none detected)"}
 Static authentication/authorization signals:
 ${boundaryLines || "(none detected)"}
 
-Your tasks:
-1. Inspect the workspace with read/grep/find/ls to validate and enrich the static map. Read entrypoints, routing, middleware, database access, and configuration.
-2. Produce a factual architecture map: modules, frameworks, entrypoints, authentication and authorization boundaries, data access patterns, endpoints, and security-critical execution paths.
-3. Divide the repository into 1 to ${options.maxAreas} coherent security assessment areas. Each area must list real files from the inventory above. Prefer areas that concentrate security-critical code over broad directory listings. Every file must appear in the inventory.
-4. Record honest coverage notes and limitations.
+Work:
+1. Inspect the workspace: entrypoints, routing, middleware, database access, configuration, and build/start scripts. Follow imports to resolve the real module boundaries.
+2. Map the architecture: modules, frameworks, entrypoints, authentication and authorization boundaries, data access patterns, endpoints, and security-critical execution paths.
+3. Divide the code into 1 to ${options.maxAreas} coherent assessment areas. Each area lists real inventory files and concentrates security-critical code instead of broad directories.
+4. Account for the inventory: every file in an area must be listed above, and security-relevant inventory files outside all areas get a coverage_notes line with the reason. limitations records what you could not inspect.
 
 Rules:
-- Do not claim any vulnerability in this phase.
+- No vulnerability claims in this phase.
 - Do not invent files, endpoints, line numbers, or framework usage.
-- If the static inventory disagrees with the code, trust the code and explain the discrepancy.
+- If the inventory disagrees with the code, trust the code and explain the discrepancy in coverage_notes.
 
 ${schemaBlock(MAP_SCHEMA)}`;
 }
 
-export function researcherSystem(agentInstructions: string, workspace: string, commit: string | null, writable: boolean): string {
+export function researcherSystem(agentInstructions: string, workspace: string, commit: string | null): string {
   return `${agentInstructions}
 
-Task context:
-${workspaceLine(workspace, writable)}
+This run:
+${workspaceLine(workspace)}
 - Repository commit: ${commit ?? "unknown"}
-- You are phase 2 of a six-phase audit. Investigate exactly one assigned area.
-- Report only concrete, evidence-backed candidates. An empty candidate list with honest limitations is an acceptable result.`;
+- Phase 2 of six. One assigned area, evidence-backed candidates only.
+- Tests and minimal local reproductions are expected when they settle reachability faster than reading. Record the exact command and observed result.
+- An empty candidate list with honest limitations is a valid result.`;
 }
 
 export function researcherPrompt(options: {
@@ -108,7 +108,7 @@ export function researcherPrompt(options: {
     .slice(0, 60)
     .map((boundary) => `${boundary.kind}: ${boundary.detail} — ${boundary.file}:${boundary.line}`)
     .join("\n");
-  return `Phase 2 — Systematic Vulnerability Discovery.
+  return `Phase 2 — Vulnerability Discovery.
 
 Assessment area ID: ${options.area.id}
 Title: ${options.area.title}
@@ -124,30 +124,32 @@ ${areaEndpoints || "(none detected)"}
 Authentication/authorization signals in this area:
 ${areaBoundaries || "(none detected)"}
 
-Method:
-- Read the assigned files first, then follow source-to-sink flows across other in-scope files with grep/find/read.
-- Examine authentication and authorization logic, injection, unsafe deserialization, SSRF, path traversal, file handling, state management, business logic, and framework-specific security boundaries.
-- For each candidate, prove the flow with exact verbatim code excerpts. The platform will reject excerpts that do not occur in the file at the audited commit.
-- Include the strongest candidates only, up to ${options.maxCandidates}. Do not pad the list.
-- If an area has no defensible candidate, return an empty candidates array and explain what you inspected and what you could not cover.
+Work:
+- Read the assigned files, then trace reachable source-to-sink flows through every in-scope file they touch.
+- Examine authentication and authorization, injection, unsafe deserialization, SSRF, path traversal, file handling, state management, business logic, and framework boundaries where the code actually reaches them.
+- When reachability depends on runtime behavior (parser, framework default, configuration), settle it with the project's own tests or a minimal local reproduction using synthetic fixtures. Stop at the first confirmed effect.
+- Report the strongest candidates only, up to ${options.maxCandidates}; do not pad the list.
+- List every file you actually read in inspected_files. If the area has no defensible candidate, return an empty candidates array and explain what you inspected and could not cover in limitations.
 
-Non-negotiable evidence rules:
-- quote must be copied verbatim from the file. No line numbers, no ellipses, no paraphrasing, no markdown fences.
-- start_line and end_line are 1-based and must span the quoted code.
-- Every candidate must include at least one evidence excerpt.
-- Do not invent runtime behavior, credentials, or test results.
+Evidence rules:
+- quote is verbatim source text from the original repository at the audited commit, never from a file you added or edited. Copy a file aside before experimenting and quote the untouched copy.
+- start_line and end_line are 1-based and span exactly the quoted code.
+- Every candidate needs at least one excerpt. The platform rejects any excerpt that does not occur in the original file.
+- reproduction_notes holds the exact commands you ran and the observed result, or "not run" plus the missing prerequisite.
+- expected and observed describe behavior. A run you did not execute is not an observed result.
 
 ${schemaBlock(DISCOVERY_SCHEMA)}`;
 }
 
-export function validatorSystem(agentInstructions: string, workspace: string, commit: string | null, writable: boolean): string {
+export function validatorSystem(agentInstructions: string, workspace: string, commit: string | null): string {
   return `${agentInstructions}
 
-Task context:
-${workspaceLine(workspace, writable)}
+This run:
+${workspaceLine(workspace)}
 - Repository commit: ${commit ?? "unknown"}
-- You are phase 3 of a six-phase audit and did not discover this candidate.
-- Your job is adversarial validation, not agreement. Refuting an unsupported candidate is a successful outcome.`;
+- Phase 3 of six, fresh session. You did not discover this candidate and owe its author no agreement.
+- Validation is adversarial: refute what the code does not support. A refuted candidate is a successful result.
+- Reproduce locally where it settles reachability; record exact commands and results, or the prerequisite you could not supply.`;
 }
 
 export function validatorPrompt(options: {
@@ -163,6 +165,7 @@ export function validatorPrompt(options: {
     .join("\n\n");
   return `Phase 3 — Independent Confirmation.
 
+Repository commit: ${options.commit ?? "unknown"}
 Hypothesis to test (written by a different agent):
 Title: ${candidate.title}
 Category: ${candidate.category}
@@ -195,27 +198,26 @@ ${excerpts || "(none supplied)"}
 Existing finding codes in this audit (for duplicate detection):
 ${options.findingCodes.join(", ") || "(none yet)"}
 
-Independent validation requirements:
-1. Inspect the affected code yourself. Do not trust the excerpts above; verify them against the workspace.
-2. Verify each prerequisite against actual code or configuration. If a prerequisite is assumed but unproven, say so.
-3. Attempt to construct the exploit path from the repository alone. If the flow is blocked by validation, authentication, authorization, parameterization, encoding, or another control, refute or downgrade the candidate.
-4. Consider at least two alternative explanations or mitigating controls and state why they do or do not apply.
-5. If the claim is wrong in a material way, verdict REFUTED. If evidence is insufficient, INCONCLUSIVE. Use DUPLICATE only if the same issue is already represented by an existing finding code above.
-6. CONFIRMED requires at least one exact verbatim excerpt that you personally verified and a concrete, code-backed impact statement.
-7. Reassess severity from the code, not from the claimed severity.
+Validation:
+1. Inspect the affected code yourself and verify each excerpt against the original source, not against the claim.
+2. Verify every prerequisite against code or configuration; put the result of each check in prerequisites_checked, including assumptions you could not prove.
+3. Reconstruct the exploit path end to end. Where reachability turns on runtime behavior, reproduce it locally in your copy with the smallest safe test that settles it, and record the exact command and observed result in reproduction_steps. If a service, credential, or dataset is unavailable, name it there.
+4. Test at least two alternative explanations or mitigating controls and explain in alternative_explanations and mitigating_controls why each does or does not hold.
+5. Verdicts: REFUTED when the claim is materially wrong; INCONCLUSIVE when evidence is insufficient; DUPLICATE only when the same issue is already represented by an existing finding code above; CONFIRMED only with at least one excerpt you verified yourself and a concrete, code-backed impact_assessment.
+6. Set severity_assessment from the code you verified, not from the claimed severity.
 
 ${schemaBlock(CONFIRMATION_SCHEMA)}`;
 }
 
-export function retestSystem(agentInstructions: string, workspace: string, commit: string | null, writable: boolean): string {
+export function retestSystem(agentInstructions: string, workspace: string, commit: string | null): string {
   return `${agentInstructions}
 
-Task context:
-${workspaceLine(workspace, writable)}
+This run:
+${workspaceLine(workspace)}
 - Repository commit: ${commit ?? "unknown"}
-- You are phase 5 of a six-phase audit. You are independent of the discovery agent and the first validator.
-- You have not been given their verdicts. Re-derive the conclusion from the source and the original evidence.
-- Previous verification history is immutable; your decision is recorded separately.`;
+- Phase 5 of six, fresh session. You are independent of both the discovery agent and the first validator; neither verdict is provided.
+- Re-derive the finding from the code and the original evidence. Prior verification history is immutable and your decision is recorded separately.
+- Re-run the recorded reproduction where feasible; record exact commands and results, or the prerequisite you could not supply.`;
 }
 
 export function retestPrompt(options: {
@@ -268,16 +270,13 @@ ${options.excerpts
   )
   .join("\n\n") || "(none recorded)"}
 
-Independent retest tasks:
-1. Re-open the affected code and verify the locations, snippets, and stated root cause.
-2. Independently re-derive the security impact. Reject claims that rely on unproven preconditions or invented runtime behavior.
-3. Check reproduction consistency: does the recorded reasoning follow from the code? Do not execute anything.
-4. Identify unsupported or overstated claims, missing details, and severity errors.
-5. Decide REVERIFIED only when the code evidence supports the finding and the impact. Use NEEDS_CORRECTION if the finding is real but materially inaccurate or incomplete. Use REJECTED for false positives. Use UNRESOLVED when evidence is insufficient.
-6. Provide exact verbatim excerpts for the code you rely on. The platform verifies them against the audited commit.
+Reverification:
+1. Re-open the affected code and verify the locations, excerpts, and stated root cause against the original source.
+2. Independently re-derive the security impact. Reject claims that rely on unproven preconditions or invented runtime behavior; record each in unsupported_claims.
+3. Re-run the recorded reproduction in your copy where feasible, or a smaller equivalent with synthetic data. Put the exact command and observed output in reproduction_consistency; if a step is not executable as written, say which step fails and why. Name missing prerequisites in notes.
+4. Record missing or misleading detail in completeness_issues.
+5. Decisions: REVERIFIED when the code evidence supports the finding and its impact; NEEDS_CORRECTION when the finding is real but materially inaccurate or incomplete; REJECTED for false positives; UNRESOLVED when evidence is insufficient.
+6. Supply exact verbatim excerpts for the code you rely on; the platform verifies them against the audited commit. Do not quote a file you modified for the reproduction.
 
 ${schemaBlock(RETEST_SCHEMA)}`;
 }
-
-export type ConfirmationValidation = ConfirmationResult;
-export type DiscoveryValidation = DiscoveryResult;

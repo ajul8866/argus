@@ -56,7 +56,6 @@ let currentRoute = "dashboard";
 let currentParams = new URLSearchParams();
 let renderToken = 0;
 let liveConnected = false;
-let focusRestore: (() => void) | null = null;
 const mobileNav = window.matchMedia("(max-width: 900px)");
 let navListenersInstalled = false;
 let loggingOut = false;
@@ -231,7 +230,7 @@ function captureViewFocus(): () => void {
     if (id) {
       const byId = root.querySelector<HTMLElement>(`#${CSS.escape(id)}`);
       if (byId) {
-        byId.focus();
+        byId.focus({ preventScroll: true });
         return;
       }
     }
@@ -239,32 +238,33 @@ function captureViewFocus(): () => void {
       const match = [...root.querySelectorAll<HTMLElement>("[aria-label]")]
         .find((element) => element.getAttribute("aria-label") === label);
       if (match) {
-        match.focus();
+        match.focus({ preventScroll: true });
         return;
       }
     }
     if (!text) return;
     const matches = [...root.querySelectorAll<HTMLElement>(tag)].filter((element) => (element.textContent ?? "").trim() === text);
     const only = matches.length === 1 ? matches[0] : undefined;
-    only?.focus();
+    only?.focus({ preventScroll: true });
   };
 }
 
-async function renderRoute(): Promise<void> {
+async function renderRoute(background = false): Promise<void> {
   const parsed = parseRoute();
   currentRoute = parsed.route;
   currentParams = parsed.params;
   const token = ++renderToken;
-  const restoreFocus = focusRestore;
-  focusRestore = null;
+  const routeHash = location.hash;
   const view = document.getElementById("view");
   if (!view) return;
   view.dataset.route = parsed.route;
   liveRefresh.onRendered();
   const target = document.createElement("div");
   target.style.display = "contents";
-  view.replaceChildren(target);
-  setNavOpen(false);
+  if (!background) {
+    view.replaceChildren(target);
+    setNavOpen(false);
+  }
   syncNav();
   document.title = `${routeLabel(parsed.route)} | Argus`;
   try {
@@ -329,17 +329,48 @@ async function renderRoute(): Promise<void> {
           ),
         );
     }
-    if (token !== renderToken) {
-      target.remove();
-      return;
+    if (token !== renderToken || routeHash !== location.hash || !session.user || !view.isConnected) return;
+    if (background) {
+      const failure = target.querySelector<HTMLElement>(".error-state");
+      if (failure) {
+        toast(failure.querySelector("p")?.textContent ?? "Live update failed", "error");
+        return;
+      }
+      if (hasRefreshInteraction() || document.visibilityState !== "visible") {
+        liveRefresh.request();
+        return;
+      }
+      const restoreFocus = captureViewFocus();
+      const x = window.scrollX;
+      const y = window.scrollY;
+      const scrolls = [...view.querySelectorAll<HTMLElement>(".table-wrap, .tabs, pre")]
+        .map((element) => ({ left: element.scrollLeft, top: element.scrollTop }));
+      const disclosures = new Map([...view.querySelectorAll("details")]
+        .map((element) => [element.querySelector("summary")?.textContent ?? "", element.open]));
+      view.replaceChildren(target);
+      view.classList.add("live-swap");
+      for (const element of target.querySelectorAll("details")) {
+        const open = disclosures.get(element.querySelector("summary")?.textContent ?? "");
+        if (open !== undefined) element.open = open;
+      }
+      for (const [index, element] of [...target.querySelectorAll<HTMLElement>(".table-wrap, .tabs, pre")].entries()) {
+        const saved = scrolls[index];
+        if (saved) {
+          element.scrollLeft = saved.left;
+          element.scrollTop = saved.top;
+        }
+      }
+      restoreFocus();
+      requestAnimationFrame(() => view.classList.remove("live-swap"));
+      window.scrollTo({ left: x, top: y, behavior: "instant" });
     }
-    restoreFocus?.();
   } catch (error) {
-    if (token !== renderToken) {
-      target.remove();
+    if (token !== renderToken || routeHash !== location.hash || !session.user || !view.isConnected) return;
+    if (background) {
+      toast(error instanceof Error ? error.message : "Live update failed", "error");
       return;
     }
-    view.replaceChildren(
+    target.replaceChildren(
       h("div", { class: "error-state" },
         h("h3", {}, "Dashboard error"),
         h("p", {}, error instanceof Error ? error.message : String(error)),
@@ -347,24 +378,28 @@ async function renderRoute(): Promise<void> {
       ),
     );
   }
-  setNavOpen(false);
+  if (!background) setNavOpen(false);
 }
 
 function hasOpenOverlay(): boolean {
   return Boolean(document.querySelector(".modal-overlay, .drawer-overlay"));
 }
 
+function hasRefreshInteraction(): boolean {
+  return hasOpenOverlay() || Boolean(document.activeElement?.matches("#view input, #view textarea, #view select, #view [contenteditable='true']"));
+}
+
 const liveRefresh = createLiveRefresh({
   getRoute: () => currentRoute,
-  isOverlayOpen: hasOpenOverlay,
+  isOverlayOpen: hasRefreshInteraction,
   isVisible: () => document.visibilityState === "visible",
   isActive: () => Boolean(session.user) && !loggingOut,
-  render: () => {
-    void renderRoute();
-  },
+  render: () => renderRoute(true),
 });
 
 function loginView(errorMessage?: string): void {
+  ++renderToken;
+  liveRefresh.dispose();
   closeOverlays();
   setNavOpen(false);
   disconnectEvents();
@@ -487,8 +522,13 @@ window.addEventListener("visibilitychange", () => {
 });
 
 window.addEventListener("argus:overlays-closed", () => {
-  focusRestore = captureViewFocus();
-  if (!liveRefresh.onOverlaysClosed()) focusRestore = null;
+  liveRefresh.onOverlaysClosed();
+});
+
+document.addEventListener("focusout", () => {
+  queueMicrotask(() => {
+    if (!hasRefreshInteraction()) liveRefresh.onOverlaysClosed();
+  });
 });
 
 document.addEventListener("click", (event) => {

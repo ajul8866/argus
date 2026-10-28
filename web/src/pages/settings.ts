@@ -39,9 +39,6 @@ const SETTING_DEFS: Array<{ key: string; label: string; description: string; typ
   { key: "audit.max_concurrent_agents", label: "Concurrent agents", description: "Global scheduler ceiling; audited projects may set lower limits.", type: "number" },
   { key: "audit.task_timeout_ms", label: "Task timeout (ms)", description: "Harness execution deadline; cancellation leaves durable evidence.", type: "number" },
   { key: "audit.require_distinct_harness_for_retest", label: "Prefer distinct retest harness", description: "Harness diversity is recorded but never substitutes for fresh contexts.", type: "boolean" },
-  { key: "security.allow_shell_tools", label: "Allow shell tools", description: "Permit command execution when a runtime includes a shell tool. Task approval follows the setting below.", type: "boolean" },
-  { key: "security.allow_writable_workspace", label: "Allow writable workspaces", description: "Permit audits to request file changes in their workspace copies, with task approval.", type: "boolean" },
-  { key: "security.require_approval_for_shell", label: "Require approval for shell", description: "Every shell task remains blocked until an administrator decides.", type: "boolean" },
   { key: "security.sandbox_mode", label: "Sandbox mode", description: "auto tries Bubblewrap; none is explicit workspace-copy isolation in the host/container.", type: "sandbox" },
   { key: "reports.organization", label: "Report organization", description: "Shown on every exported report.", type: "text" },
   { key: "reports.classification", label: "Report classification", description: "Shown on every exported report.", type: "text" },
@@ -121,17 +118,6 @@ export async function renderSettings(root: HTMLElement): Promise<void> {
       }
     }
 
-    const setBooleanControl = (key: string, on: boolean) => {
-      const control = controls.get(key);
-      if (!(control instanceof HTMLButtonElement)) return;
-      control.classList.toggle("on", on);
-      control.setAttribute("aria-checked", String(on));
-    };
-    const resetDangerousToggles = () => {
-      setBooleanControl("security.allow_shell_tools", settings["security.allow_shell_tools"] === true);
-      setBooleanControl("security.allow_writable_workspace", settings["security.allow_writable_workspace"] === true);
-    };
-
     const saveSettings = async () => {
       const saveButton = root.querySelector<HTMLButtonElement>("[data-save-settings]");
       if (saveButton?.disabled) return;
@@ -158,21 +144,7 @@ export async function renderSettings(root: HTMLElement): Promise<void> {
           toast("No changes to save.", "info");
           return;
         }
-        if (updates["security.allow_shell_tools"] === true) {
-          if (!(await confirmAction("Enable shell tools?", "This permits agents assigned shell tools to request command execution. Each task still requires explicit administrator approval, but the risk surface expands.", "Enable shell tools"))) {
-            resetDangerousToggles();
-            queueMicrotask(() => saveButton?.focus());
-            return;
-          }
-        }
-        if (updates["security.allow_writable_workspace"] === true) {
-          if (!(await confirmAction("Enable writable workspaces?", "This lets an audit request a writable workspace copy for agents, so approved tasks can create scratch files and run PoCs inside the disposable copy. The imported snapshot and evidence quotes stay read-only, but each task still needs its own approval and the risk surface expands.", "Enable writable workspaces"))) {
-            resetDangerousToggles();
-            queueMicrotask(() => saveButton?.focus());
-            return;
-          }
-        }
-        await api("/api/settings", { method: "PUT", body: { settings: updates, confirm_shell: updates["security.allow_shell_tools"] === true, confirm_writable_workspace: updates["security.allow_writable_workspace"] === true } });
+        await api("/api/settings", { method: "PUT", body: { settings: updates } });
         toast("Runtime settings saved.", "success");
         await renderSettings(root);
       } catch (error) {
@@ -208,7 +180,7 @@ export async function renderSettings(root: HTMLElement): Promise<void> {
           ))),
           disclosure("How execution and credentials are protected", section("Security model", h("div", { class: "narrative" },
             h("p", {}, "All assessments are restricted to authorized repositories. Scope is enforced by copying only in-scope files into isolated workspaces; agent prompts never define authorization."),
-            h("p", {}, "Harness tools are read-only by default. Shell access is globally disabled, requires administrator enablement, and remains blocked per task until approval is recorded. Writable workspaces are also disabled by default, require an explicit per-audit request and a per-task approval, and never make the imported snapshot writable."),
+            h("p", {}, "Each task runs with the harness's native tools in its own writable workspace copy; evidence is checked against the imported snapshot."),
             h("p", { class: "muted small" }, "Credentials are encrypted at rest with AES-256-GCM. Values are write-only through the API and are injected only into harness child processes."),
           ))),
         ),

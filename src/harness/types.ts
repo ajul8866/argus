@@ -10,7 +10,6 @@ export type HarnessCapabilities = {
   structuredOutput: boolean;
   cancellation: boolean;
   modelSelection: boolean;
-  permissionConfig: boolean;
   sessionIdentity: boolean;
   costReporting: boolean;
   rpc: boolean;
@@ -22,8 +21,6 @@ export type HarnessConfig = {
   executable: string;
   provider: string | null;
   model: string | null;
-  permission_mode: string;
-  allowed_tools: string[];
   env: Record<string, string>;
   extra_args: string[];
 };
@@ -50,15 +47,12 @@ export type HarnessTask = {
   workspace: string;
   model: string | null;
   provider?: string | null;
-  allowedTools: string[];
   timeoutMs: number;
   schema?: unknown;
   maxBudgetUsd?: number | null;
   resumeSessionRef?: string | null;
   metadata?: Record<string, unknown>;
   resources?: SessionResources;
-  /** Set only when an administrator-approved writable workspace was granted for this task. */
-  workspaceWritable?: boolean;
 };
 
 export type HarnessUsage = {
@@ -157,7 +151,6 @@ export const PI_CAPABILITIES: HarnessCapabilities = {
   structuredOutput: true,
   cancellation: true,
   modelSelection: true,
-  permissionConfig: true,
   sessionIdentity: true,
   costReporting: true,
   rpc: true,
@@ -172,7 +165,6 @@ export const CLAUDE_CAPABILITIES: HarnessCapabilities = {
   structuredOutput: true,
   cancellation: true,
   modelSelection: true,
-  permissionConfig: true,
   sessionIdentity: true,
   costReporting: true,
   rpc: false,

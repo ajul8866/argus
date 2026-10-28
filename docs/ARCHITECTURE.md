@@ -110,8 +110,8 @@ finding or report fact.
 
 #### Pi
 
-- Spawned as `pi --mode rpc --no-session --no-mcp ...` with `cwd` set to the
-  read-only workspace.
+- Spawned as `pi --mode rpc --no-session ...` with the built-in native tools
+  enabled and `cwd` set to its writable session copy.
 - Strict JSONL framing: commands in on stdin with unique IDs; responses and
   session events out on stdout; stderr is diagnostics only. Lines are split
   only on LF, never on Unicode separators.
@@ -227,18 +227,17 @@ operation, preserving include/exclude short-circuit behavior.
    (no symlinks) within scope and size caps are included.
 3. A snapshot is copied under `$ARGUS_DATA_DIR/repos/<project>/<id>` (or a git
    archive for a ref) and the inventory is rebuilt from the snapshot.
-4. Each task gets a fresh read-only copy under
+4. Each task gets a fresh writable copy under
    `$ARGUS_DATA_DIR/workspaces/<audit>/<session>`.
 5. If Bubblewrap is available, the harness runs with a new session, new PID/IPC/
    UTS namespaces, a cleared environment, a tmpfs `/tmp`, read-only system
-   binds, a sanitized home, and the workspace as a read-only bind. The host
-   home, Argus data, other repositories, and credentials files are not mounted.
+   binds, a sanitized home, and the session copy as a read-write bind. The host
+   home, Argus data, other repositories, and credential files are not mounted.
 6. Otherwise `workspace-copy` mode is recorded with a warning. The container/
-   host remains the isolation boundary, and tools remain read-only.
+   host remains the isolation boundary.
 
-The harness still needs provider network access. Argus enforces network
-boundaries at the tool-policy level: no Bash/WebFetch/WebSearch and no MCP by
-default. This is a residual risk of LLM harnesses, documented in SECURITY.md.
+The harness needs provider network access, and local reproductions may need
+package registries. The imported snapshot remains the evidence authority.
 
 ## 5. UI architecture
 

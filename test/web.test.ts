@@ -234,52 +234,103 @@ describe("deferred refresh while a dialog is open", () => {
   type Clock = {
     schedule: (run: () => void, delayMs: number) => { cancel: () => void };
     fire: () => void;
+    advance: (ms: number) => void;
     readonly scheduled: boolean;
+    readonly scheduleCount: number;
     readonly delayMs: number | null;
+    readonly deadline: number | null;
   };
 
   function clock(): Clock {
-    let queued: { run: () => void; delayMs: number } | null = null;
+    type Entry = { run: () => void; delayMs: number; deadline: number };
+    let now = 0;
+    let nextId = 1;
+    let scheduleCount = 0;
+    const queued = new Map<number, Entry>();
     return {
       schedule(run, delayMs) {
-        const entry = { run, delayMs };
-        queued = entry;
-        return { cancel: () => { if (queued === entry) queued = null; } };
+        scheduleCount += 1;
+        const id = nextId;
+        nextId += 1;
+        queued.set(id, { run, delayMs, deadline: now + delayMs });
+        return { cancel: () => { queued.delete(id); } };
       },
       fire() {
-        const entry = queued;
-        queued = null;
-        entry?.run();
+        const first = queued.entries().next();
+        if (first.done) return;
+        queued.delete(first.value[0]);
+        first.value[1].run();
       },
-      get scheduled() { return queued !== null; },
-      get delayMs() { return queued?.delayMs ?? null; },
+      advance(ms) {
+        now += ms;
+        for (;;) {
+          const due = [...queued.entries()].find(([, entry]) => entry.deadline <= now);
+          if (!due) return;
+          queued.delete(due[0]);
+          due[1].run();
+        }
+      },
+      get scheduled() { return queued.size > 0; },
+      get scheduleCount() { return scheduleCount; },
+      get delayMs() {
+        const first = queued.values().next();
+        return first.done ? null : first.value.delayMs;
+      },
+      get deadline() {
+        const first = queued.values().next();
+        return first.done ? null : first.value.deadline;
+      },
     };
   }
 
-  function harness(initial: { route?: string; overlayOpen?: boolean; visible?: boolean; active?: boolean } = {}) {
+  function harness(initial: {
+    route?: string;
+    overlayOpen?: boolean;
+    visible?: boolean;
+    active?: boolean;
+    deferRender?: boolean;
+  } = {}) {
     let route = initial.route ?? "audits";
     let overlayOpen = initial.overlayOpen ?? false;
     let visible = initial.visible ?? true;
     let active = initial.active ?? true;
     let renders = 0;
+    const completions: Array<() => void> = [];
     const timer = clock();
     const refresh = createLiveRefresh({
       getRoute: () => route,
       isOverlayOpen: () => overlayOpen,
       isVisible: () => visible,
       isActive: () => active,
-      render: () => { renders += 1; },
+      render: () => {
+        renders += 1;
+        if (!initial.deferRender) return;
+        const gate = Promise.withResolvers<void>();
+        completions.push(() => gate.resolve());
+        return gate.promise;
+      },
       schedule: timer.schedule,
     });
     return {
       refresh,
       timer,
       renders: () => renders,
+      pendingRenders: () => completions.length,
+      async completeRender() {
+        const resolve = completions.shift();
+        if (!resolve) throw new Error("no render is pending");
+        resolve();
+        await flushMicrotasks();
+      },
       setRoute: (value: string) => { route = value; },
       setOverlayOpen: (value: boolean) => { overlayOpen = value; },
       setVisible: (value: boolean) => { visible = value; },
       setActive: (value: boolean) => { active = value; },
     };
+  }
+
+  async function flushMicrotasks(): Promise<void> {
+    for (let i = 0; i < 25; i += 1) await Promise.resolve();
   }
 
   test("events that arrive while a task drawer is open refresh the audit when it closes", () => {
@@ -451,6 +502,121 @@ describe("deferred refresh while a dialog is open", () => {
     page.refresh.dispose();
     page.timer.fire();
     expect(page.renders()).toBe(0);
+  });
+
+  test("a stream of live events cannot postpone the first scheduled refresh", () => {
+    const page = harness();
+    page.refresh.request();
+    page.timer.advance(500);
+    page.refresh.request();
+    page.timer.advance(500);
+    page.refresh.request();
+    expect(page.timer.scheduleCount).toBe(1);
+    expect(page.timer.scheduled).toBe(true);
+    expect(page.timer.deadline).toBe(LIVE_REFRESH_DEBOUNCE_MS);
+
+    const remaining = LIVE_REFRESH_DEBOUNCE_MS - 1_000;
+    page.timer.advance(remaining - 1);
+    expect(page.renders()).toBe(0);
+    page.timer.advance(1);
+    expect(page.renders()).toBe(1);
+    page.timer.advance(60_000);
+    expect(page.renders()).toBe(1);
+  });
+
+  test("an async render stays single-flight and runs one catch-up for signals it missed", async () => {
+    const page = harness({ deferRender: true });
+    page.refresh.request();
+    page.timer.fire();
+    expect(page.renders()).toBe(1);
+    expect(page.pendingRenders()).toBe(1);
+
+    page.refresh.request();
+    page.refresh.request();
+
+    page.timer.fire();
+    await flushMicrotasks();
+    expect(page.renders()).toBe(1);
+    expect(page.pendingRenders()).toBe(1);
+
+    await page.completeRender();
+    page.timer.fire();
+    await flushMicrotasks();
+    expect(page.renders()).toBe(2);
+    expect(page.pendingRenders()).toBe(1);
+
+    await page.completeRender();
+    page.timer.fire();
+    await flushMicrotasks();
+    expect(page.renders()).toBe(2);
+    expect(page.pendingRenders()).toBe(0);
+    expect(page.timer.scheduled).toBe(false);
+  });
+
+  test("onRendered cancels a scheduled live refresh so navigation is not refreshed twice", () => {
+    const page = harness();
+    page.refresh.request();
+    expect(page.timer.scheduled).toBe(true);
+    page.refresh.onRendered();
+    expect(page.timer.scheduled).toBe(false);
+    page.timer.fire();
+    expect(page.renders()).toBe(0);
+  });
+
+  test("a route navigation during a pending async render suppresses the stale catch-up", async () => {
+    const page = harness({ deferRender: true });
+    page.refresh.request();
+    page.timer.fire();
+    expect(page.renders()).toBe(1);
+
+    page.refresh.request();
+    page.refresh.request();
+    page.refresh.onRendered();
+    expect(page.timer.scheduled).toBe(false);
+
+    await page.completeRender();
+    page.timer.fire();
+    await flushMicrotasks();
+    expect(page.renders()).toBe(1);
+    expect(page.pendingRenders()).toBe(0);
+  });
+
+  test("live events after navigation still catch up when the old render settles", async () => {
+    const page = harness({ deferRender: true });
+    page.refresh.request();
+    page.timer.fire();
+    expect(page.renders()).toBe(1);
+
+    page.refresh.onRendered();
+    page.refresh.request();
+    await page.completeRender();
+    page.timer.fire();
+    await flushMicrotasks();
+    expect(page.renders()).toBe(2);
+    expect(page.pendingRenders()).toBe(1);
+
+    await page.completeRender();
+    page.timer.fire();
+    await flushMicrotasks();
+    expect(page.renders()).toBe(2);
+    expect(page.pendingRenders()).toBe(0);
+  });
+
+  test("dispose during a pending async render suppresses the stale catch-up", async () => {
+    const page = harness({ deferRender: true });
+    page.refresh.request();
+    page.timer.fire();
+    expect(page.renders()).toBe(1);
+
+    page.refresh.request();
+    page.refresh.dispose();
+    expect(page.timer.scheduled).toBe(false);
+
+    await page.completeRender();
+    page.timer.fire();
+    await flushMicrotasks();
+    expect(page.renders()).toBe(1);
+    expect(page.pendingRenders()).toBe(0);
   });
 });
 

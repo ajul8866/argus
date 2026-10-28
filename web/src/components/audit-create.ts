@@ -30,7 +30,6 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
     await openProjectCreate();
     return null;
   }
-  const writablePolicy = settings["security.allow_writable_workspace"] === true;
   const projectSelect = select("project_id", projects.map((project) => ({ value: project.id, label: project.name })), defaultProjectId ?? projects[0]!.id);
   const repositorySelect = select("repository_id", []);
   const repositoryHint = h("p", { class: "modal-copy", role: "status" });
@@ -58,7 +57,7 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
     h("div", { class: "stack" }, targetSelect, targetHint),
     "Dynamic audits need an active authorization and at least one test identity.",
   );
-  let targets: Array<{ id: string; label: string; base_url: string; environment: string; status: string }> = [];
+  let targets: Array<{ id: string; label: string; baseUrl: string; environment: string; status: string }> = [];
   async function loadTargets(): Promise<void> {
     targetSelect.replaceChildren();
     targetHint.textContent = "Loading targets…";
@@ -66,7 +65,7 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
       const { targets: rows } = await api<{ targets: typeof targets }>(`/api/projects/${projectSelect.value}/targets`);
       targets = rows.filter((row) => row.status === "active");
       targetSelect.replaceChildren(
-        ...targets.map((row) => h("option", { value: row.id }, `${row.label} — ${row.base_url} (${row.environment})`)),
+        ...targets.map((row) => h("option", { value: row.id }, `${row.label} — ${row.baseUrl} (${row.environment})`)),
       );
       targetHint.textContent = targets.length
         ? "Requests run through the broker under the recorded authorization."
@@ -81,7 +80,6 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
     if (dynamic) void loadTargets();
   }
   const startNow = h("input", { type: "checkbox", name: "start_now", checked: true });
-  const writableWorkspace = h("input", { type: "checkbox", name: "writable_workspace" });
   const errorBox = h("div", { class: "login-error hidden", role: "alert", tabindex: "-1" });
   const submitButton = h("button", { class: "btn btn-primary", type: "submit", disabled: true }, "Start audit");
   let loadingRepositories = false;
@@ -133,7 +131,6 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
         if (control.value !== defaults.get(control.name)) overrides[control.name] = Number(control.value);
       }
       if (maxCost.value.trim()) overrides.max_cost_usd = Number(maxCost.value);
-      if (writablePolicy && writableWorkspace.checked) overrides.writable_workspace = true;
       try {
         const mode = modeSelect.value as "static" | "dynamic" | "hybrid";
         if (mode !== "static" && !targetSelect.value) {
@@ -171,12 +168,11 @@ export async function openAuditCreate(defaultProjectId?: string): Promise<string
   repositoryHint,
   disclosure("Advanced audit settings",
     h("div", { class: "form-grid" },
-      field("Saved source snapshot", repositorySelect, "The latest import is selected automatically."),
+      field("Saved source snapshot", repositorySelect, "Each task works in its own writable copy; evidence is checked against this import."),
       field("Cost limit (USD)", maxCost),
       field("Assessment areas", maxAreas), field("Candidates per area", maxCandidates),
       field("Confirmation limit", maxConfirmations), field("Concurrent agents", maxConcurrent),
       h("label", { class: "checkbox full" }, startNow, "Start immediately"),
-      writablePolicy ? h("label", { class: "checkbox full" }, writableWorkspace, "Request a writable workspace (requires task approval)") : null,
     ),
   ),
   h("div", { class: "form-actions" }, button("Cancel", () => instance.close(), "secondary"), submitButton));
@@ -283,7 +279,8 @@ export async function importRepository(projectId: string, ref?: string): Promise
       `Repository imported: ${result.repository.file_count} files${result.repository.commit_sha ? ` at ${result.repository.commit_sha.slice(0, 10)}` : ""}.`,
       "success",
     );
-    location.hash = `#/projects/${projectId}`;
+    if (location.hash === `#/projects/${projectId}`) window.dispatchEvent(new HashChangeEvent("hashchange"));
+    else location.hash = `#/projects/${projectId}`;
   } catch (error) {
     toast(error instanceof Error ? error.message : "Import failed", "error");
   }

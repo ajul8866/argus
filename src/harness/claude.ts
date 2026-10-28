@@ -211,7 +211,7 @@ export class ClaudeCodeHarnessAdapter implements HarnessAdapter {
       "stream-json",
       "--verbose",
       "--permission-mode",
-      this.harnessConfig.permission_mode || "plan",
+      "acceptEdits",
       "--permission-prompts",
       "none",
       "--strict-mcp-config",
@@ -227,17 +227,20 @@ export class ClaudeCodeHarnessAdapter implements HarnessAdapter {
     else if (this.harnessConfig.model) args.push("--model", this.harnessConfig.model);
     if (task.schema) args.push("--json-schema", JSON.stringify(task.schema));
     if (task.maxBudgetUsd && task.maxBudgetUsd > 0) args.push("--max-budget-usd", String(task.maxBudgetUsd));
-    const tools = [
-      ...task.allowedTools,
-      ...(task.resources?.servers ?? []).map((server) => `mcp__${server.key}__*`),
-    ];
-    const builtinTools = tools.filter((tool) => !tool.startsWith("mcp__")).map((tool) => tool.split("(")[0]!);
-    args.push("--tools", [...new Set(builtinTools)].join(","));
-    if (tools.length > 0) args.push("--allowedTools", tools.join(","));
-    const disallowed = ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch"].filter(
-      (tool) => !tools.some((allowed) => allowed === tool || allowed.startsWith(`${tool}(`)),
-    );
-    if (disallowed.length > 0) args.push("--disallowedTools", disallowed.join(","));
+    const mcpTools = (task.resources?.servers ?? []).map((server) => `mcp__${server.key}__*`);
+    args.push("--allowedTools", [
+      "Read",
+      "Grep",
+      "Glob",
+      "LS",
+      "Bash",
+      "Edit",
+      "Write",
+      "NotebookEdit",
+      "WebFetch",
+      "WebSearch",
+      ...mcpTools,
+    ].join(","));
     if (this.harnessConfig.extra_args.length > 0) args.push(...this.harnessConfig.extra_args);
 
     const plan = await buildSandboxPlan({
@@ -250,7 +253,6 @@ export class ClaudeCodeHarnessAdapter implements HarnessAdapter {
       harnessConfig: this.harnessConfig,
       credentialEnv: this.credentialEnv,
       resources: task.resources,
-      workspaceWritable: task.workspaceWritable === true,
     });
 
     let proc: ReturnType<typeof Bun.spawn>;

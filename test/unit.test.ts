@@ -20,8 +20,8 @@ import { credentialEnvironment, decryptSecret, encryptSecret, type StoredCredent
 import { MAP_SCHEMA, validateAgainstSchema } from "../src/orchestrator/schemas.ts";
 import { detectRepositoryRoots, listRepositoryFolders } from "../src/repo/directories.ts";
 import { Database } from "bun:sqlite";
-import { migrations } from "../src/db/migrations.ts";
-import { DEFAULT_AGENTS } from "../src/settings.ts";
+import { LEGACY_PLATFORM_GUARD, LEGACY_ROLE_BODIES, migrations } from "../src/db/migrations.ts";
+import { ROLE_INSTRUCTIONS } from "../src/settings.ts";
 import { readJson } from "../src/api/http.ts";
 
 const fixture = join(import.meta.dir, "fixtures", "vulnerable-app");
@@ -60,29 +60,72 @@ function testConfig(dataDir: string): Config {
   };
 }
 
-test("upgrading runtime tool inheritance preserves custom role restrictions and shell choices", () => {
-  const directory = mkdtempSync(join(tmpdir(), "argus-tools-upgrade-"));
+test("migration retires policy columns, settings, and approvals while upgrading built-in role instructions", () => {
+  const directory = mkdtempSync(join(tmpdir(), "argus-policy-upgrade-"));
   const legacy = new Database(join(directory, "test.sqlite"));
   legacy.exec("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)");
-  for (const migration of migrations.filter((entry) => entry.version < 3)) {
+  for (const migration of migrations.filter((entry) => entry.version < 13)) {
     legacy.exec(migration.sql);
     legacy.query("INSERT INTO schema_migrations VALUES (?, ?, ?)").run(migration.version, migration.name, new Date().toISOString());
   }
-  for (const agent of DEFAULT_AGENTS) {
-    legacy.query(`INSERT INTO agent_defs (role,label,harness,system_instructions,allowed_tools,max_duration_ms,max_retries,concurrency_limit,allow_shell,enabled,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(agent.role, agent.label, agent.harness, agent.system_instructions,
-      JSON.stringify(agent.allowed_tools), agent.max_duration_ms, agent.max_retries, agent.concurrency_limit, 0, 1, new Date().toISOString());
+  const guard = LEGACY_PLATFORM_GUARD;
+  const mapperBody = LEGACY_ROLE_BODIES.codebase_mapper!;
+  const insertAgent = legacy.query(
+    `INSERT INTO agent_defs (role,label,harness,model,system_instructions,allowed_tools,inherit_tools,max_duration_ms,max_retries,concurrency_limit,budget_usd,allow_shell,enabled,updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  );
+  insertAgent.run("codebase_mapper", "Codebase Mapper", "pi", null, `${guard}\n\n${mapperBody}`, '["read"]', 1, 720000, 1, 1, 8, 0, 1, "2026-01-01T00:00:00.000Z");
+  insertAgent.run("security_researcher", "Security Researcher", "pi", "custom/model", `${guard}\n\nCustom researcher instructions.`, '["read","bash"]', 0, 720000, 1, 2, 8, 1, 1, "2026-01-01T00:00:00.000Z");
+  insertAgent.run("independent_validator", "Independent Validator", "claude-code", null, "Administrator-authored validator instructions.", '["Read"]', 0, 720000, 1, 2, 10, 0, 1, "2026-01-01T00:00:00.000Z");
+  const insertSetting = legacy.query("INSERT INTO settings (key, value, updated_at, updated_by) VALUES (?, ?, ?, NULL)");
+  for (const key of ["security.allow_shell_tools", "security.allow_writable_workspace", "security.require_approval_for_shell"]) {
+    insertSetting.run(key, "true", "2026-01-01T00:00:00.000Z");
   }
-  legacy.exec(`UPDATE agent_defs SET allowed_tools = '["read"]' WHERE role = 'security_researcher';
-    UPDATE agent_defs SET allow_shell = 1 WHERE role = 'retest_auditor';`);
+  insertSetting.run("security.sandbox_mode", '"none"', "2026-01-01T00:00:00.000Z");
+  legacy.query("INSERT INTO harnesses (id, kind, label, executable, version, status, detail, capabilities, config, detected_at, updated_at) VALUES ('pi','pi','Pi','pi',NULL,'unknown','', '{}', ?, ?, ?)").run(
+    JSON.stringify({ executable: "pi", provider: "magpie", model: "auto/model", permission_mode: "plan", allowed_tools: ["read"], env: {}, extra_args: [] }),
+    "2026-01-01T00:00:00.000Z",
+    "2026-01-01T00:00:00.000Z",
+  );
+  const insertTask = legacy.query(
+    `INSERT INTO tasks (id, audit_id, phase, kind, task_key, title, status, priority, payload, attempts, requires_approval, approval_id, created_at)
+     VALUES (?, 'a1', 1, 'phase1.map', ?, 'Task', 'waiting_approval', 0, '{}', 0, 1, ?, '2026-01-01T00:00:00.000Z')`,
+  );
+  insertTask.run("retired", "retired", "retired-approval");
+  insertTask.run("retained", "retained", "retained-approval");
+  const insertApproval = legacy.query(
+    "INSERT INTO approvals (id, audit_id, task_id, action, scope, status, created_at) VALUES (?, 'a1', ?, ?, 'scope', 'pending', '2026-01-01T00:00:00.000Z')",
+  );
+  insertApproval.run("retired-approval", "retired", "allow_shell_tools");
+  insertApproval.run("retained-approval", "retained", "external_target_action");
   legacy.close();
   const upgraded = new Store(testConfig(directory), "test.sqlite");
   try {
-    expect(upgraded.get("SELECT inherit_tools FROM agent_defs WHERE role = 'codebase_mapper'")).toEqual({ inherit_tools: 1 });
-    expect(upgraded.get("SELECT inherit_tools FROM agent_defs WHERE role = 'independent_validator'")).toEqual({ inherit_tools: 1 });
-    expect(upgraded.get("SELECT inherit_tools, allowed_tools FROM agent_defs WHERE role = 'security_researcher'")).toEqual({ inherit_tools: 0, allowed_tools: '["read"]' });
-    expect(upgraded.get("SELECT inherit_tools, allow_shell FROM agent_defs WHERE role = 'retest_auditor'")).toEqual({ inherit_tools: 0, allow_shell: 1 });
-    expect(upgraded.all("SELECT version FROM schema_migrations ORDER BY version")).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }]);
+    const columns = upgraded.all<{ name: string }>("PRAGMA table_info(agent_defs)").map((column) => column.name);
+    expect(columns).not.toContain("allowed_tools");
+    expect(columns).not.toContain("inherit_tools");
+    expect(columns).not.toContain("allow_shell");
+    expect(upgraded.get<{ system_instructions: string }>("SELECT system_instructions FROM agent_defs WHERE role = 'codebase_mapper'")?.system_instructions)
+      .toBe(ROLE_INSTRUCTIONS.codebase_mapper);
+    expect(upgraded.get<{ system_instructions: string }>("SELECT system_instructions FROM agent_defs WHERE role = 'security_researcher'")?.system_instructions)
+      .toBe("Custom researcher instructions.");
+    expect(upgraded.get<{ system_instructions: string }>("SELECT system_instructions FROM agent_defs WHERE role = 'independent_validator'")?.system_instructions)
+      .toBe("Administrator-authored validator instructions.");
+    expect(upgraded.all("SELECT key FROM settings WHERE key LIKE 'security.%'")).toEqual([{ key: "security.sandbox_mode" }]);
+    expect(JSON.parse(upgraded.get<{ config: string }>("SELECT config FROM harnesses WHERE kind = 'pi'")!.config)).toEqual({
+      executable: "pi", provider: "magpie", model: "auto/model", env: {}, extra_args: [],
+    });
+    expect(upgraded.get("SELECT status, reason FROM approvals WHERE id = 'retired-approval'")).toMatchObject({ status: "denied" });
+    expect(upgraded.get("SELECT status FROM approvals WHERE id = 'retained-approval'")).toMatchObject({ status: "pending" });
+    expect(upgraded.get("SELECT status, requires_approval, approval_id FROM tasks WHERE id = 'retired'")).toEqual({
+      status: "queued", requires_approval: 0, approval_id: null,
+    });
+    expect(upgraded.get("SELECT status, requires_approval FROM tasks WHERE id = 'retained'")).toEqual({ status: "waiting_approval", requires_approval: 1 });
+    expect(upgraded.all("SELECT version FROM schema_migrations ORDER BY version").map((row) => row.version)).toEqual(
+      Array.from({ length: 14 }, (_, index) => index + 1),
+    );
+    expect(upgraded.all("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'verifications' ORDER BY name"))
+      .toEqual([{ name: "verifications_no_delete" }, { name: "verifications_no_update" }]);
   } finally {
     upgraded.close();
     rmSync(directory, { recursive: true, force: true });
@@ -474,7 +517,7 @@ describe("repository import", () => {
     expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
   });
 
-  test("workspaces are read-only by default and owner-writable only on explicit request", async () => {
+  test("import snapshots stay read-only while session copies allow local changes", async () => {
     const scope = { include: ["**/*.js", "**/*.json", "README.md"], exclude: ["src/routes/media.js", "node_modules/**"] };
     const inventory = await buildInventory(fixture, { scope, maxFiles: 100, maxFileBytes: 1_000_000 });
     const readOnly = join(dir, "workspace-read-only");
@@ -484,6 +527,12 @@ describe("repository import", () => {
 
     expect((await stat(join(readOnly, "src/lib/db.js"))).mode & 0o777).toBe(0o400);
     expect((await stat(join(writable, "src/lib/db.js"))).mode & 0o777).toBe(0o600);
+    const original = await Bun.file(join(fixture, "src/lib/db.js")).text();
+    await Bun.write(join(writable, "src/lib/db.js"), "session-specific reproduction\n");
+    await Bun.write(join(writable, "scratch.txt"), "local fixture\n");
+    expect(await Bun.file(join(readOnly, "src/lib/db.js")).text()).toBe(original);
+    expect(await Bun.file(join(fixture, "src/lib/db.js")).text()).toBe(original);
+    expect(await Bun.file(join(writable, "scratch.txt")).text()).toBe("local fixture\n");
     expect((await stat(readOnly)).mode & 0o777).toBe(0o700);
     expect((await stat(writable)).mode & 0o777).toBe(0o700);
     expect((await stat(join(writable, "ARGUS_SCOPE.json"))).mode & 0o777).toBe(0o400);

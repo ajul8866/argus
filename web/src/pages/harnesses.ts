@@ -12,7 +12,6 @@ import {
   modal,
   pageHeader,
   section,
-  select,
   statusBadge,
   toast,
 } from "../ui.ts";
@@ -30,8 +29,6 @@ type Harness = {
     executable: string;
     provider: string | null;
     model: string | null;
-    permission_mode: string;
-    allowed_tools: string[];
     extra_args: string[];
   };
   models: Array<{ id: string; label: string }>;
@@ -92,7 +89,7 @@ export async function renderHarnesses(root: HTMLElement): Promise<void> {
           h("div", { class: "small" }, harness.detail),
           h("div", { class: "tiny muted", style: { marginTop: "var(--space-2xs)" } }, harness.auth.detail),
         ),
-        h("p", { class: "small muted" }, `${harness.config.allowed_tools.length} runtime tools: ${harness.config.allowed_tools.join(", ") || "none"}. Use for audits applies this runtime, its default model, and its tools to every audit role. Later tool changes apply automatically.`),
+        h("p", { class: "small muted" }, "Use for audits assigns this runtime and its default model to every audit role. Tasks run with the runtime's native tools in their own writable workspace copy."),
         disclosure("Technical details",
         h("div", {},
           h("div", { class: "tiny muted", style: { marginBottom: "var(--space-2xs)" } }, "Capabilities"),
@@ -105,8 +102,6 @@ export async function renderHarnesses(root: HTMLElement): Promise<void> {
           h("dl", { class: "kv" },
             h("dt", {}, "Provider"), h("dd", {}, harness.config.provider ?? "harness default"),
             h("dt", {}, "Model"), h("dd", { class: "mono" }, harness.config.model ?? "harness default"),
-            h("dt", {}, "Permission mode"), h("dd", {}, harness.config.permission_mode),
-            h("dt", {}, "Allowed tools"), h("dd", { class: "mono tiny" }, harness.config.allowed_tools.join(", ") || "none"),
           ),
         ),
         harness.models.length
@@ -168,17 +163,6 @@ function openHarnessConfig(harness: Harness, refresh: () => void): void {
   const model = input("model", { value: harness.config.model ?? "", placeholder: "provider/model or default" });
   provider.required = harness.kind === "pi";
   model.required = harness.kind === "pi";
-  const permission = select(
-    "permission_mode",
-    [
-      { value: "plan", label: "plan (read-only)" },
-      { value: "dontAsk", label: "dontAsk" },
-      { value: "acceptEdits", label: "acceptEdits (not recommended)" },
-      { value: "manual", label: "manual" },
-    ],
-    harness.config.permission_mode,
-  );
-  const tools = input("allowed_tools", { value: harness.config.allowed_tools.join(",") });
   const extraArgs = input("extra_args", { value: harness.config.extra_args.join(",") });
   const errorBox = h("div", { class: "login-error hidden" });
   const instance = modal(
@@ -195,8 +179,6 @@ function openHarnessConfig(harness: Harness, refresh: () => void): void {
               executable: executable.value.trim(),
               provider: provider.value.trim() || null,
               model: model.value.trim() || null,
-              permission_mode: permission.value,
-              allowed_tools: tools.value.split(",").map((tool) => tool.trim()).filter(Boolean),
               extra_args: extraArgs.value.split(",").map((arg) => arg.trim()).filter(Boolean),
             },
           });
@@ -215,8 +197,7 @@ function openHarnessConfig(harness: Harness, refresh: () => void): void {
       field("Model", model, harness.kind === "pi" ? "Model ID from your provider." : "Leave empty to use the runtime default."),
     ),
     disclosure("Advanced runtime settings", h("div", { class: "form-grid" },
-      field("Executable", executable), field("Permission mode", permission),
-      field("Allowed tools", tools, "Inherited by audit roles. An empty list disables native tools."), field("Extra arguments", extraArgs),
+      field("Executable", executable), field("Extra arguments", extraArgs),
     )),
     h("div", { class: "form-actions" },
       button("Cancel", () => instance.close(), "secondary"),

@@ -60,15 +60,16 @@ tasks can call the provider and consume credits.
 ### Startup
 
 ```
-pi --mode rpc --no-session --no-mcp \
+pi --mode rpc --no-session \
    --provider <provider> --model <model> \
    --append-system-prompt <platform+role policy> \
-   --no-builtin-tools --tools read,grep,find,ls
+   --tools +grep,+find,+ls
 ```
 
 The executable is resolved with `which` and, under Bubblewrap, with `realpath`
-so binding a symlink cannot confuse the managed Pi launcher. The working
-directory is the read-only workspace.
+so binding a symlink cannot confuse the managed Pi launcher. Native defaults
+(read, bash, edit, write) stay enabled; only the off-by-default search tools are
+added. The working directory is the task's writable session copy.
 
 The command above is the default with no linked MCP servers. With assigned
 local skills, Argus snapshots their text resources under the sanitized HOME
@@ -117,17 +118,18 @@ are written to that HOME's `.pi/agent/mcp.json`; `--no-mcp` is replaced by
 ```
 claude -p <prompt> \
   --output-format stream-json --verbose \
-  --permission-mode plan --permission-prompts none \
+  --permission-mode acceptEdits --permission-prompts none \
   --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
   --append-system-prompt <platform+role policy> \
   --session-id <uuid> \
-  --tools Read,Grep,Glob,LS \
-  --allowedTools Read,Grep,Glob,LS \
-  --disallowedTools Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch \
+  --allowedTools Read,Grep,Glob,LS,Bash,Edit,Write,... \
   --json-schema <schema>
 ```
 
-`--model`, `--max-budget-usd`, and extra safe arguments are added when configured.
+The fixed native allowlist includes Bash, Edit, Write, and the search tools;
+there is no static disallowed list and no permission-bypass flag.
+
+`--model` and `--max-budget-usd` are added when configured.
 Permission-bypass modes/arguments are rejected by the API.
 
 The implementation passes a mode-0600 MCP configuration file inside the

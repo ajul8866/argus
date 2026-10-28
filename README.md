@@ -162,8 +162,10 @@ its own candidate. Model output is schema-validated, and confirmed claims need
 matching source evidence. Failed tasks and inconclusive results remain in the
 audit history.
 
-Default audit tools are read-only. Bubblewrap can enforce process isolation
-on supported Linux hosts; workspace-copy mode has a weaker boundary.
+Audit agents use their runtime's native tools in an isolated writable copy, so
+they can build fixtures and run local reproductions. The imported snapshot
+stays read-only and is the source of evidence. Bubblewrap can enforce process
+isolation on supported Linux hosts; workspace-copy mode has a weaker boundary.
 Selected MCP servers have their own capabilities and permissions. Read the
 [security model](docs/SECURITY.md) before auditing sensitive repositories or
 exposing the dashboard through a reverse proxy.

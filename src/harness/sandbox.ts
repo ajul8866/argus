@@ -138,10 +138,9 @@ export async function buildSandboxPlan(options: {
   harnessConfig: HarnessConfig;
   credentialEnv: Record<string, string>;
   resources?: SessionResources;
-  workspaceWritable?: boolean;
 }): Promise<SandboxPlan> {
   const { config, kind, runId, workspacePath, harnessConfig } = options;
-  const workspaceWritable = options.workspaceWritable === true;
+  const workspaceWritable = true;
   const home = prepareHarnessHome(config, kind, runId, harnessConfig);
   try {
     writeSessionResources(home, kind, options.resources ?? { skills: [], servers: [] });
@@ -161,18 +160,16 @@ export async function buildSandboxPlan(options: {
   if (!available) {
     warnings.push(
       config.sandboxMode === "auto"
-        ? "bubblewrap is unavailable; execution used workspace-copy isolation (read-only tools + scrubbed environment)."
+        ? "bubblewrap is unavailable; execution used workspace-copy isolation (scrubbed environment, no mount namespace)."
         : "ARGUS_SANDBOX=none explicitly disabled bubblewrap; execution is not namespace-isolated.",
     );
   }
 
-  if (workspaceWritable) {
-    warnings.push(
-      available
-        ? "A writable workspace was explicitly approved for this task; the workspace bind mount is read-write."
-        : "A writable workspace was explicitly approved for this task; without bubblewrap only file permissions restrict writes, and the host/container remains the isolation boundary.",
-    );
-  }
+  warnings.push(
+    available
+      ? "Each task runs in an isolated writable workspace copy."
+      : "Each task runs in an isolated writable workspace copy; without bubblewrap the host remains the isolation boundary.",
+  );
   if (mode === "workspace-copy") {
     return {
       command: [options.executable, ...options.args],

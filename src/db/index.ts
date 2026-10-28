@@ -36,6 +36,7 @@ export class Store {
       try {
         this.db.transaction(() => {
           this.db.exec(migration.sql);
+          migration.apply?.(this.db);
           this.db
             .query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
             .run(migration.version, migration.name, new Date().toISOString());

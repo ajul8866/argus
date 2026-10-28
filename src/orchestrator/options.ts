@@ -25,8 +25,11 @@ export function validateAuditOverrides(store: Store, overrides: unknown): void {
       throw badRequest(`${key} must be an integer between ${minimum} and ${maximum}`);
     }
   }
-  for (const key of ["writable_workspace", "require_distinct_harness_for_retest"]) {
-    if (overrides[key] !== undefined && typeof overrides[key] !== "boolean") throw badRequest(`${key} must be a boolean`);
+  if ("writable_workspace" in overrides) {
+    throw badRequest("writable_workspace is no longer supported. Every agent task receives an isolated writable workspace.");
+  }
+  if (overrides.require_distinct_harness_for_retest !== undefined && typeof overrides.require_distinct_harness_for_retest !== "boolean") {
+    throw badRequest("require_distinct_harness_for_retest must be a boolean");
   }
   const budget = overrides.max_cost_usd;
   if (budget !== undefined && budget !== null && (typeof budget !== "number" || !Number.isFinite(budget) || budget < 0)) {

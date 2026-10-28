@@ -209,12 +209,7 @@ export class PiHarnessAdapter implements HarnessAdapter {
       "--append-system-prompt",
       task.systemPrompt,
     ];
-    const tools = [
-      ...task.allowedTools,
-      ...(task.resources?.servers ?? []).map((server) => `mcp__${server.key}__*`),
-    ];
-    args.push("--no-builtin-tools");
-    if (tools.length > 0) args.push("--tools", tools.join(","));
+    args.push("--tools", "+grep,+find,+ls");
     if (task.resumeSessionRef) {
       args.push("--resume", task.resumeSessionRef);
     }
@@ -230,7 +225,6 @@ export class PiHarnessAdapter implements HarnessAdapter {
       harnessConfig: { ...this.harnessConfig, model: task.model || this.harnessConfig.model },
       credentialEnv: this.credentialEnv,
       resources: task.resources,
-      workspaceWritable: task.workspaceWritable === true,
     });
 
     let proc: ReturnType<typeof Bun.spawn>;

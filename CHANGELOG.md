@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Changed
+
+- Audit sessions use native Pi/Claude tools in an isolated writable copy. Role
+  and harness tool allowlists, shell/writable approvals, and their settings are
+  removed. The imported snapshot remains read-only and authoritative for
+  evidence quotes.
+- Live dashboard refreshes render off-screen and commit only current data, so
+  running audits no longer flash loading, reset scroll/focus, or starve updates
+  under a continuous event stream.
+
+### Fixed
+
+- HTML reports no longer throw on fenced code blocks.
+- Hybrid audits cannot complete before exploration closes and candidates are
+  confirmed. Cancelling a running persistence/report task no longer ends as
+  completed.
+- Verification append-only triggers are restored after the dynamic-schema
+  rebuild; nested dependency directories are excluded from inventories.
+- Project target rendering, import refresh, and default authorization time
+  handling are corrected.
+
+
 ## [0.0.2](https://github.com/ajul8866/argus/releases/tag/v0.0.2) — 2026-10-26
 
 ### Changed

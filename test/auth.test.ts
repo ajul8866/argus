@@ -13,7 +13,7 @@ import { AuditEngine } from "../src/orchestrator/engine.ts";
 import { EvidenceStore } from "../src/orchestrator/evidence.ts";
 import { DEFAULT_EXCLUDES } from "../src/repo/inventory.ts";
 import { ReportService } from "../src/reports/generator.ts";
-import { getSetting, harnessConfig, saveHarnessConfig, seedDefaults, setSetting } from "../src/settings.ts";
+import { getSetting, harnessConfig, seedDefaults } from "../src/settings.ts";
 import { TokenService } from "../src/auth/tokens.ts";
 import { GraphStore } from "../src/dynamic/graph.ts";
 import { now } from "../src/util.ts";
@@ -564,26 +564,25 @@ test("folder discovery requires an auditor and only lists folders within configu
   expect((await api(request())).status).toBe(403);
 });
 
-test("one explicit runtime assignment configures all audit roles to inherit its tools", async () => {
+test("one explicit runtime assignment configures all active audit roles", async () => {
   const { api, headers } = await projectClient();
-  store.run("UPDATE agent_defs SET model = 'old/model', enabled = 0, allow_shell = 1 WHERE role = 'codebase_mapper'");
+  store.run("UPDATE agent_defs SET model = 'old/model', enabled = 0 WHERE role = 'codebase_mapper'");
   const beforeSystemRoles = store.all("SELECT * FROM agent_defs WHERE role IN ('findings_manager','report_writer')");
   const response = await api(new Request("http://localhost/api/harnesses/claude-code/assign", { method: "POST", headers }));
   expect(response.status).toBe(200);
-  const roles = store.all<{ harness: string; model: string | null; allowed_tools: string; allow_shell: number; enabled: number }>(
+  const roles = store.all<{ harness: string; model: string | null; enabled: number }>(
     "SELECT * FROM agent_defs WHERE role IN ('codebase_mapper','security_researcher','independent_validator','retest_auditor')",
   );
   expect(roles).toHaveLength(4);
   for (const role of roles) {
-    expect(role).toMatchObject({ harness: "claude-code", model: null, enabled: 1, allow_shell: 0 });
-    expect(JSON.parse(role.allowed_tools)).toEqual(["Read", "Grep", "Glob", "LS"]);
+    expect(role).toMatchObject({ harness: "claude-code", model: null, enabled: 1 });
   }
   expect(store.all("SELECT * FROM agent_defs WHERE role IN ('findings_manager','report_writer')")).toEqual(beforeSystemRoles);
   expect(getSetting(store, "audit.require_distinct_harness_for_retest", true)).toBe(false);
   expect(store.get("SELECT id FROM audit_log WHERE action = 'harness.assigned'")).toBeDefined();
 });
 
-test("runtime assignment keeps every configured tool and rejects unauthorized changes", async () => {
+test("runtime assignment still requires authentication, CSRF and an administrator", async () => {
   const { api, headers, userId } = await projectClient();
   const request = (requestHeaders = headers) => new Request("http://localhost/api/harnesses/pi/assign", { method: "POST", headers: requestHeaders });
   expect((await api(request({ ...headers, cookie: "" }))).status).toBe(401);
@@ -591,56 +590,78 @@ test("runtime assignment keeps every configured tool and rejects unauthorized ch
   store.run("UPDATE users SET role = 'auditor' WHERE id = ?", userId);
   expect((await api(request())).status).toBe(403);
   store.run("UPDATE users SET role = 'admin' WHERE id = ?", userId);
-  setSetting(store, "security.allow_shell_tools", true, userId);
-  saveHarnessConfig(store, "pi", { ...harnessConfig(store, "pi"), allowed_tools: ["read", "bash", "edit", "write"] });
   expect((await api(request())).status).toBe(200);
-  const agents = async () => (await (await api(new Request("http://localhost/api/agents", { headers }))).json()).agents as Array<{ role: string; allowed_tools: string[]; inherit_tools: boolean }>;
-  expect((await agents()).find((agent) => agent.role === "independent_validator")).toMatchObject({ allowed_tools: ["read", "bash", "edit", "write"], inherit_tools: true });
-  const changed = ["read", "grep", "find", "ls", "bash", "edit", "write", "mcp__local__*"];
-  expect((await api(new Request("http://localhost/api/harnesses/pi", {
-    method: "PUT", headers, body: JSON.stringify({ allowed_tools: changed }),
-  }))).status).toBe(200);
-  expect((await agents()).find((agent) => agent.role === "independent_validator")?.allowed_tools).toEqual(changed);
-  saveHarnessConfig(store, "pi", { ...harnessConfig(store, "pi"), allowed_tools: [] });
-  expect((await api(request())).status).toBe(200);
-  expect((await agents()).find((agent) => agent.role === "independent_validator")?.allowed_tools).toEqual([]);
+  const agents = (await (await api(new Request("http://localhost/api/agents", { headers }))).json()).agents;
+  expect(agents.find((agent: { role: string }) => agent.role === "independent_validator")).toMatchObject({ harness: "pi" });
 });
 
-test("roles inherit all nine runtime tools unless an explicit role restriction is saved", async () => {
-  const { api, headers } = await projectClient();
-  setSetting(store, "security.allow_shell_tools", true, null);
-  const tools = ["Read", "Grep", "Glob", "LS", "Bash", "Edit", "Write", "WebFetch", "WebSearch"];
-  saveHarnessConfig(store, "claude-code", { ...harnessConfig(store, "claude-code"), allowed_tools: tools });
-  const agents = await (await api(new Request("http://localhost/api/agents", { headers }))).json();
-  expect(agents.agents.find((agent: { role: string }) => agent.role === "independent_validator")).toMatchObject({ allowed_tools: tools, inherit_tools: true });
+test("roles save instructions and execution limits while rejecting retired tool controls", async () => {
+  const { api, headers, userId } = await projectClient();
   const update = (body: Record<string, unknown>) => api(new Request("http://localhost/api/agents/independent_validator", {
     method: "PUT", headers, body: JSON.stringify(body),
   }));
-  let response = await update({ allowed_tools: ["Read"] });
+  const saved = { model: "test-model", system_instructions: "Review project-specific authorization paths.", max_retries: 2, max_duration_ms: 20_000, budget_usd: 3 };
+  const response = await update(saved);
   expect(response.status).toBe(200);
-  expect((await response.json()).agent).toMatchObject({ inherit_tools: false, allowed_tools: ["Read"] });
-  response = await update({ model: "test-model" });
-  expect((await response.json()).agent).toMatchObject({ inherit_tools: false, allowed_tools: ["Read"] });
-  response = await update({ inherit_tools: true });
-  expect((await response.json()).agent).toMatchObject({ inherit_tools: true, allowed_tools: tools });
-  response = await update({ inherit_tools: false, allowed_tools: [] });
-  expect((await response.json()).agent).toMatchObject({ inherit_tools: false, allowed_tools: [] });
-  expect((await update({ inherit_tools: "yes" })).status).toBe(400);
+  const agent = (await response.json()).agent;
+  expect(agent).toMatchObject(saved);
+  for (const key of ["allowed_tools", "inherit_tools", "allow_shell"]) {
+    expect(agent).not.toHaveProperty(key);
+    const rejected = await update({ [key]: false });
+    expect(rejected.status).toBe(400);
+    expect((await rejected.json()).error.message).toContain(`${key} is no longer supported`);
+  }
+  store.run("UPDATE users SET role = 'auditor' WHERE id = ?", userId);
+  expect((await update({ model: "unauthorized" })).status).toBe(403);
+  expect(store.get("SELECT model FROM agent_defs WHERE role = 'independent_validator'")).toEqual({ model: "test-model" });
 });
 
-test("sensitive settings require confirmation only when newly enabled", async () => {
-  const { api, headers } = await projectClient();
-  const update = (settings: Record<string, unknown>, confirmations = {}) => api(new Request("http://localhost/api/settings", {
-    method: "PUT", headers, body: JSON.stringify({ settings, ...confirmations }),
+test("settings reject retired policy controls and keep sandbox validation and admin authorization", async () => {
+  const { api, headers, userId } = await projectClient();
+  const update = (settings: Record<string, unknown>, extra = {}) => api(new Request("http://localhost/api/settings", {
+    method: "PUT", headers, body: JSON.stringify({ settings, ...extra }),
   }));
-  const settings = { "security.allow_shell_tools": true, "security.allow_writable_workspace": true };
-  expect((await update(settings)).status).toBe(400);
-  expect(getSetting(store, "security.allow_shell_tools", false)).toBe(false);
-  expect((await update(settings, { confirm_shell: true, confirm_writable_workspace: true })).status).toBe(200);
-  expect((await update(settings)).status).toBe(200);
-  expect((await update({ "reports.organization": "My team" })).status).toBe(200);
-  expect((await update({ "security.allow_shell_tools": false, "security.allow_writable_workspace": false })).status).toBe(200);
-  expect((await update(settings)).status).toBe(400);
+  for (const key of ["security.allow_shell_tools", "security.allow_writable_workspace", "security.require_approval_for_shell"]) {
+    const response = await update({ [key]: true });
+    expect(response.status).toBe(400);
+    expect((await response.json()).error.message).toContain(`Unknown setting: ${key}`);
+    expect(store.get("SELECT key FROM settings WHERE key = ?", key)).toBeNull();
+  }
+  expect((await update({}, { confirm_shell: true })).status).toBe(400);
+  expect((await update({}, { confirm_writable_workspace: true })).status).toBe(400);
+  expect((await update({ "security.sandbox_mode": "invalid" })).status).toBe(400);
+  expect((await update({ "reports.organization": "My team", "security.sandbox_mode": "none" })).status).toBe(200);
+  store.run("UPDATE users SET role = 'viewer' WHERE id = ?", userId);
+  expect((await update({ "reports.organization": "Unauthorized" })).status).toBe(403);
+  expect(getSetting(store, "reports.organization", "")).toBe("My team");
+});
+
+test("harness configuration drops legacy controls from responses and saves regular runtime options", async () => {
+  const { api, headers, userId } = await projectClient();
+  const update = (body: Record<string, unknown>) => api(new Request("http://localhost/api/harnesses/pi", {
+    method: "PUT", headers, body: JSON.stringify(body),
+  }));
+  store.run("UPDATE harnesses SET config = ? WHERE kind = 'pi'", JSON.stringify({
+    ...harnessConfig(store, "pi"), allowed_tools: ["read"], permission_mode: "plan", unknown_policy: true,
+  }));
+  const options = { provider: "test-provider", model: "test-model", env: { LOG_LEVEL: "debug" }, extra_args: ["--verbose"] };
+  const response = await update(options);
+  expect(response.status).toBe(200);
+  expect(harnessConfig(store, "pi")).toMatchObject(options);
+  const saved = JSON.parse(store.get<{ config: string }>("SELECT config FROM harnesses WHERE kind = 'pi'")!.config);
+  expect(saved).toMatchObject(options);
+  const returned = (await response.json()).config;
+  expect(returned.env).toEqual({ LOG_LEVEL: "[redacted]" });
+  for (const key of ["allowed_tools", "permission_mode", "unknown_policy"]) {
+    expect(returned).not.toHaveProperty(key);
+    expect(saved).not.toHaveProperty(key);
+  }
+  for (const body of [{ allowed_tools: [] }, { permission_mode: "plan" }, { extra_args: ["--dangerously-skip-permissions"] }]) {
+    expect((await update(body)).status).toBe(400);
+  }
+  store.run("UPDATE users SET role = 'auditor' WHERE id = ?", userId);
+  expect((await update({ model: "unauthorized" })).status).toBe(403);
+  expect(harnessConfig(store, "pi").model).toBe("test-model");
 });
 
 test("dynamic target, authorization, and identity routes enforce roles and hide secrets", async () => {

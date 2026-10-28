@@ -16,7 +16,7 @@ import { DEFAULT_EXCLUDES } from "../repo/inventory.ts";
 import { importRepository } from "../repo/import.ts";
 import { assertAuthorizedRoot, readScopedFile } from "../repo/workspace.ts";
 import { listRepositoryFolders } from "../repo/directories.ts";
-import { agentDefinition, getSetting, harnessConfig, listAgents, listSettings, saveHarnessConfig, setSetting } from "../settings.ts";
+import { agentDefinition, harnessConfig, listAgents, listSettings, saveHarnessConfig, setSetting } from "../settings.ts";
 import { decryptSecret, encryptSecret, type StoredCredential } from "../security/credentials.ts";
 import { redactObject, redactSecrets } from "../security/redact.ts";
 import { readRegularFile } from "../security/regular-file.ts";
@@ -1199,7 +1199,7 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
               ...row,
               detail: redactSecrets(String(row.detail ?? "")).text,
               capabilities: parseJson(String(row.capabilities ?? "{}"), {}),
-              config: redactHarnessConfig(parseJson<HarnessConfig>(String(row.config ?? "{}"), {} as HarnessConfig)),
+              config: redactHarnessConfig(harnessConfig(deps.store, row.kind as HarnessKind)),
               models: detection?.models ?? [],
               auth: detection?.auth ?? { ready: false, detail: "" },
             };
@@ -1213,13 +1213,12 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         const action = harnessMatch[2];
         if (method === "POST" && action === "assign") {
           const current = requireRole("admin");
-          const config = harnessConfig(deps.store, kind);
           const roles = ["codebase_mapper", "security_researcher", "independent_validator", "retest_auditor"];
           deps.store.transaction(() => {
             for (const role of roles) {
               deps.store.run(
-                "UPDATE agent_defs SET harness = ?, model = NULL, allowed_tools = ?, inherit_tools = 1, allow_shell = 0, enabled = 1, updated_at = ? WHERE role = ?",
-                kind, toJson(config.allowed_tools), now(), role,
+                "UPDATE agent_defs SET harness = ?, model = NULL, enabled = 1, updated_at = ? WHERE role = ?",
+                kind, now(), role,
               );
             }
             setSetting(deps.store, "audit.require_distinct_harness_for_retest", false, current.id);
@@ -1235,7 +1234,7 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         if (method === "PUT" && !action) {
           const current = requireRole("admin");
           const body = await readJson(request);
-          const config = validateHarnessConfig(body, deps.store);
+          const config = validateHarnessConfig(body);
           saveHarnessConfig(deps.store, kind, { ...harnessConfig(deps.store, kind), ...config } as HarnessConfig);
           deps.manager.invalidate(kind);
           deps.auth.logAction(current.email, "harness.configured", kind, redactHarnessConfig(config), ip);
@@ -1280,23 +1279,15 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
       if (agentMatch && method === "PUT") {
         const current = requireRole("admin");
         const body = await readJson(request);
+        for (const key of ["allowed_tools", "inherit_tools", "allow_shell"]) {
+          if (key in body) throw badRequest(`${key} is no longer supported. Agent roles use the selected harness's native tools.`);
+        }
         const role = agentMatch[1]!;
         const existing = deps.store.get("SELECT * FROM agent_defs WHERE role = ?", role);
         if (!existing) throw notFound("Agent role not found");
         const harness = body.harness === undefined ? null : requireString(body, "harness", 30);
         if (harness && !["pi", "claude-code"].includes(harness)) throw badRequest("harness must be pi or claude-code");
         const model = body.model === undefined ? undefined : optionalString(body, "model", 300);
-        const allowedTools =
-          body.allowed_tools === undefined
-            ? null
-            : requireStringArray(body, "allowed_tools");
-        if (body.inherit_tools !== undefined && typeof body.inherit_tools !== "boolean") throw badRequest("inherit_tools must be a boolean");
-        const inheritTools = typeof body.inherit_tools === "boolean" ? Number(body.inherit_tools) : allowedTools !== null ? 0 : null;
-        if (inheritTools !== 1 && allowedTools && allowedTools.some((tool) => /^(bash|Bash)(?:$|\()/.test(tool))) {
-          if (!getSetting(deps.store, "security.allow_shell_tools", false)) {
-            throw badRequest("Shell tools are disabled globally. Enable them in Settings and require approval first.");
-          }
-        }
         const enabled = typeof body.enabled === "boolean" ? (body.enabled ? 1 : 0) : null;
         const budget = body.budget_usd === undefined ? undefined : body.budget_usd === null ? null : Number(body.budget_usd);
         const duration = body.max_duration_ms === undefined ? undefined : Number(body.max_duration_ms);
@@ -1311,8 +1302,7 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
         }
         deps.store.run(
           `UPDATE agent_defs SET harness = COALESCE(?, harness), model = CASE WHEN ? THEN ? ELSE model END,
-             allowed_tools = COALESCE(?, allowed_tools), inherit_tools = COALESCE(?, inherit_tools),
-             allow_shell = CASE WHEN ? THEN 0 ELSE allow_shell END, enabled = COALESCE(?, enabled),
+             enabled = COALESCE(?, enabled),
              system_instructions = COALESCE(?, system_instructions), max_retries = COALESCE(?, max_retries),
              budget_usd = CASE WHEN ? THEN ? ELSE budget_usd END,
              max_duration_ms = COALESCE(?, max_duration_ms), updated_at = ?
@@ -1320,9 +1310,6 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
           typeof harness === "string" ? harness : null,
           body.model !== undefined ? 1 : 0,
           model ?? null,
-          allowedTools ? toJson(allowedTools) : null,
-          inheritTools,
-          inheritTools !== null ? 1 : 0,
           enabled,
           systemInstructions,
           retries ?? null,
@@ -1357,19 +1344,14 @@ export function createApi(deps: ApiDeps): (request: Request, peerAddress?: strin
       if (path === "/api/settings" && method === "PUT") {
         const current = requireRole("admin");
         const body = await readJson(request);
+        for (const key of ["confirm_shell", "confirm_writable_workspace"]) {
+          if (key in body) throw badRequest(`${key} is no longer supported. Audit workspaces are writable without task approvals.`);
+        }
         const updates = body.settings;
         if (!updates || typeof updates !== "object" || Array.isArray(updates)) throw badRequest("settings object required");
         const entries = Object.entries(updates as Record<string, unknown>);
         for (const [key, value] of entries) {
           if (!(key in DEFAULT_SETTINGS)) throw badRequest(`Unknown setting: ${key}`);
-          if (key === "security.allow_shell_tools" && value === true && !getSetting(deps.store, key, false) && body.confirm_shell !== true) {
-            throw badRequest("Enabling shell tools requires confirm_shell: true and task-level approval");
-          }
-          if (key === "security.allow_writable_workspace" && value === true && !getSetting(deps.store, key, false) && body.confirm_writable_workspace !== true) {
-            throw badRequest(
-              "Enabling writable audit workspaces requires confirm_writable_workspace: true, a per-audit request, and per-task approval",
-            );
-          }
           const validationError = validateSettingValue(key, value);
           if (validationError) throw badRequest(validationError);
         }
@@ -1845,8 +1827,11 @@ function redactHarnessConfig(config: Partial<HarnessConfig>): Record<string, unk
   };
 }
 
-function validateHarnessConfig(body: Record<string, unknown>, store: Store): Partial<HarnessConfig> {
+function validateHarnessConfig(body: Record<string, unknown>): Partial<HarnessConfig> {
   const config: Partial<HarnessConfig> = {};
+  for (const key of ["permission_mode", "allowed_tools"]) {
+    if (key in body) throw badRequest(`${key} is no longer supported. Harness sessions use their native tools and permissions.`);
+  }
   if (body.executable !== undefined) {
     const executable = requireString(body, "executable", 500);
     if (executable.includes("..") || executable.includes("\0")) throw badRequest("Invalid executable path");
@@ -1854,20 +1839,6 @@ function validateHarnessConfig(body: Record<string, unknown>, store: Store): Par
   }
   if (body.provider !== undefined) config.provider = optionalString(body, "provider", 100);
   if (body.model !== undefined) config.model = optionalString(body, "model", 300);
-  if (body.permission_mode !== undefined) {
-    const mode = requireString(body, "permission_mode", 50);
-    if (!["plan", "acceptEdits", "dontAsk", "manual"].includes(mode)) {
-      throw badRequest("permission_mode must be plan, acceptEdits, dontAsk, or manual; bypassPermissions is forbidden");
-    }
-    config.permission_mode = mode;
-  }
-  if (body.allowed_tools !== undefined) {
-    const tools = requireStringArray(body, "allowed_tools");
-    if (tools.some((tool) => /^(bash|Bash)(?:$|\()/.test(tool)) && !getSetting(store, "security.allow_shell_tools", false)) {
-      throw badRequest("Shell tools are disabled. Enable security.allow_shell_tools with explicit confirmation first.");
-    }
-    config.allowed_tools = tools;
-  }
   if (body.extra_args !== undefined) {
     const args = requireStringArray(body, "extra_args");
     if (args.some((arg) => /dangerously-skip-permissions|bypassPermissions/i.test(arg))) {
@@ -1907,14 +1878,7 @@ function validateSettingValue(key: string, value: unknown): string | null {
     }
     return null;
   }
-  if (
-    [
-      "audit.require_distinct_harness_for_retest",
-      "security.allow_shell_tools",
-      "security.allow_writable_workspace",
-      "security.require_approval_for_shell",
-    ].includes(key)
-  ) {
+  if (key === "audit.require_distinct_harness_for_retest") {
     return typeof value === "boolean" ? null : `${key} must be a boolean`;
   }
   if (key === "security.sandbox_mode") {

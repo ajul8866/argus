@@ -1,3 +1,5 @@
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { Config } from "../config.ts";
 import type { Store } from "../db/index.ts";
 import { now, parseJson, toJson } from "../util.ts";
@@ -8,7 +10,6 @@ import { harnessConfig, storedCredentials } from "../settings.ts";
 import { redactSecrets } from "../security/redact.ts";
 import type {
   HarnessAdapter,
-  HarnessConfig,
   HarnessDetection,
   HarnessEvent,
   HarnessKind,
@@ -24,11 +25,6 @@ export class HarnessManager {
     private readonly config: Config,
     private readonly store: Store,
   ) {}
-
-  private credentialEnv(provider: string | null): Record<string, string> {
-    const credentials = storedCredentials(this.store);
-    return credentialEnvironment(this.config, credentials, provider ?? undefined);
-  }
 
   adapter(kind: HarnessKind): HarnessAdapter {
     const config = harnessConfig(this.store, kind);
@@ -81,7 +77,8 @@ export class HarnessManager {
     const adapter = this.adapter(kind);
     const config = harnessConfig(this.store, kind);
     const runId = crypto.randomUUID();
-    const workspace = this.config.dataDir;
+    const workspace = join(this.config.dataDir, "workspaces", "harness-check", runId);
+    await mkdir(workspace, { recursive: true, mode: 0o700 });
     const task: HarnessTask = {
       runId,
       auditId: "harness-test",
@@ -94,7 +91,6 @@ export class HarnessManager {
       workspace,
       model: config.model,
       provider: config.provider,
-      allowedTools: [],
       timeoutMs: 90_000,
       schema: {
         type: "object",
@@ -107,23 +103,29 @@ export class HarnessManager {
         additionalProperties: false,
       },
     };
-    let text = "";
-    const result = await adapter.run(task, {
-      onEvent: (event: HarnessEvent) => {
-        if (event.type === "text_delta" && event.text) text += event.text;
-      },
-    });
-    if (!result.structured) {
-      const raw = text.trim();
-      if (raw) {
-        try {
-          result.structured = JSON.parse(raw);
-        } catch {
-          // leave unset; caller reports the failure
+    try {
+      await writeFile(join(workspace, "connection.txt"), "Argus harness connectivity check\n", { mode: 0o600 });
+      let text = "";
+      const result = await adapter.run(task, {
+        onEvent: (event: HarnessEvent) => {
+          if (event.type === "text_delta" && event.text) text += event.text;
+        },
+      });
+      if (!result.structured) {
+        const raw = text.trim();
+        if (raw) {
+          try {
+            result.structured = JSON.parse(raw);
+          } catch {
+            // leave unset; caller reports the failure
+          }
         }
       }
+      return { detection, result };
+    } finally {
+      await adapter.cleanup(runId);
+      await rm(workspace, { recursive: true, force: true });
     }
-    return { detection, result };
   }
 
   async run(

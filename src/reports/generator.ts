@@ -936,6 +936,7 @@ function markdownToHtml(markdown: string): string {
   let inList = false;
   let inTable = false;
   let inCode = false;
+  let fenceLength = 0;
   const closeList = () => {
     if (inList) {
       out.push("</ul>");

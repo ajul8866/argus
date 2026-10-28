@@ -20,7 +20,7 @@ export type LiveRefresh = {
 };
 
 /**
- * Debounce live-route refreshes from SSE and from returning to the tab.
+ * Coalesce live signals without postponing updates under a continuous event stream.
  * An open dialog or drawer holds the render until the last overlay closes.
  */
 export function createLiveRefresh(deps: {
@@ -28,11 +28,12 @@ export function createLiveRefresh(deps: {
   isOverlayOpen: () => boolean;
   isVisible: () => boolean;
   isActive: () => boolean;
-  render: () => void;
+  render: () => void | Promise<void>;
   schedule?: (run: () => void, delayMs: number) => Cancel;
 }): LiveRefresh {
   let pending = false;
   let timer: Cancel | null = null;
+  let rendering = false;
   const schedule = deps.schedule ?? ((run: () => void, delayMs: number): Cancel => {
     const id = setTimeout(run, delayMs);
     return { cancel: () => clearTimeout(id) };
@@ -43,15 +44,32 @@ export function createLiveRefresh(deps: {
     timer = null;
   }
 
+  function finishRender(): void {
+    rendering = false;
+    if (pending) refresh.request();
+  }
+
   function renderNow(): boolean {
     if (!deps.isActive()) return false;
+    if (rendering) {
+      pending = true;
+      return false;
+    }
     pending = false;
     clearTimer();
-    deps.render();
+    rendering = true;
+    try {
+      const completion = deps.render();
+      if (completion) void completion.then(finishRender, finishRender);
+      else finishRender();
+    } catch (error) {
+      finishRender();
+      throw error;
+    }
     return true;
   }
 
-  return {
+  const refresh: LiveRefresh = {
     request() {
       if (!deps.isActive()) return;
       const route = deps.getRoute();
@@ -61,7 +79,8 @@ export function createLiveRefresh(deps: {
         return;
       }
       if (!shouldRefreshOnReturn(route, false)) return;
-      clearTimer();
+      pending = true;
+      if (timer || rendering) return;
       timer = schedule(() => {
         timer = null;
         const current = deps.getRoute();
@@ -105,6 +124,7 @@ export function createLiveRefresh(deps: {
 
     onRendered() {
       pending = false;
+      clearTimer();
     },
 
     dispose() {
@@ -112,4 +132,5 @@ export function createLiveRefresh(deps: {
       pending = false;
     },
   };
+  return refresh;
 }

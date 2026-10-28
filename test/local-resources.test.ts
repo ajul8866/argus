@@ -218,6 +218,7 @@ for (const kind of ["pi", "claude-code"] as const) {
     const code = `#!/usr/bin/env bun
 import {readFileSync,writeFileSync} from 'node:fs';
 import {join} from 'node:path';
+writeFileSync('resource-scratch.txt', 'local resource session wrote a scratch file');
 const args=process.argv.slice(2);
 const configPath=${JSON.stringify(kind === "pi" ? null : "claude")}
   ? args[args.indexOf('--mcp-config')+1] : join(process.env.HOME,'.pi/agent/mcp.json');
@@ -251,32 +252,27 @@ if(${JSON.stringify(kind)}==='claude-code') {
     const harnessConfig = { ...DEFAULT_HARNESS_CONFIG[kind], executable };
     const adapter = kind === "pi" ? new PiHarnessAdapter(config, harnessConfig, {}) : new ClaudeCodeHarnessAdapter(config, harnessConfig, {});
     const result = await adapter.run({ runId: "session", auditId: "audit", taskId: "task", role: "codebase_mapper",
-      prompt: "Return JSON", systemPrompt: "Test", workspace: project, model: "test-model", allowedTools: [kind === "pi" ? "read" : "Read"], timeoutMs: 5_000, resources }, { onEvent() {} });
+      prompt: "Return JSON", systemPrompt: "Test", workspace: project, model: "test-model", timeoutMs: 5_000, resources }, { onEvent() {} });
     expect(result.status).toBe("completed");
+    expect(await Bun.file(join(project, "resource-scratch.txt")).text()).toBe("local resource session wrote a scratch file");
     const captured = await Bun.file(capture).json();
     expect(Object.keys(captured.mcp.mcpServers)).toEqual(["argus_server_id"]);
     expect(captured.mcp.mcpServers.argus_server_id.headers.Authorization).toBe("private-token-value");
-    expect(captured.args.join(" ")).toContain("mcp__argus_server_id__*");
+    expect(captured.args.join(" ")).not.toContain("private-token-value");
+    if (kind === "pi") {
+      expect(captured.args.join(" ")).toContain("--tools +grep,+find,+ls");
+      expect(captured.args).not.toContain("--no-builtin-tools");
+      expect(captured.args).not.toContain("--no-mcp");
+    } else {
+      expect(captured.args).toContain("--strict-mcp-config");
+      expect(captured.args.join(" ")).toContain("Bash");
+      expect(captured.args.join(" ")).toContain("Edit");
+    }
     expect(captured.args.join(" ")).not.toContain("private-token-value");
     expect(captured.skill).toBe("Bounded reference snapshot");
     if (kind === "pi") {
       expect(captured.args).not.toContain("--no-mcp");
-      expect(captured.args).toContain("--no-approve");
     } else expect(captured.args).toContain("--strict-mcp-config");
     expect(existsSync(join(config.dataDir, "harness-homes/session"))).toBe(false);
-    for (const nativeTools of [kind === "pi" ? ["read", "grep", "find", "ls", "bash", "edit", "write"] : ["Read", "Grep", "Glob", "LS", "Bash", "Edit", "Write", "WebFetch", "WebSearch"], []]) {
-      const next = await adapter.run({ runId: "session", auditId: "audit", taskId: "tools", role: "codebase_mapper",
-        prompt: "Return JSON", systemPrompt: "Test", workspace: project, model: "test-model", allowedTools: nativeTools, timeoutMs: 5_000, resources }, { onEvent() {} });
-      expect(next.status).toBe("completed");
-      const args: string[] = (await Bun.file(capture).json()).args;
-      const toolList = args[args.indexOf("--tools") + 1];
-      expect(toolList).toBe(kind === "pi" ? [...nativeTools, "mcp__argus_server_id__*"].join(",") : nativeTools.join(","));
-      if (kind === "pi") expect(args).toContain("--no-builtin-tools");
-      else {
-        const disallowed = args[args.indexOf("--disallowedTools") + 1] ?? "";
-        for (const tool of nativeTools) expect(disallowed.split(",")).not.toContain(tool);
-        if (nativeTools.length === 0) expect(disallowed).toContain("Bash");
-      }
-    }
   }, 15_000);
 }

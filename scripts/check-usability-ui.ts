@@ -71,7 +71,7 @@ try {
   const auditForm = page.getByRole("dialog", { name: "New audit", exact: true });
   await auditForm.getByRole("button", { name: "Start audit", exact: true }).waitFor({ state: "visible" });
   check(await auditForm.locator('input:visible, select:visible, textarea:visible').count() === 0, "single-project audit must need no configuration");
-  check(await auditForm.locator('[name="writable_workspace"]').count() === 0, "disabled write policy must not add a dead checkbox");
+  check(await auditForm.locator('[name="writable_workspace"]').count() === 0, "removed write policy must not add a checkbox");
   for (const width of [320, 768, 1024, 1440]) {
     await page.setViewportSize({ width, height: 960 });
     check(await auditForm.evaluate((element) => element.scrollWidth <= element.clientWidth), `${width}: audit form overflows`);
@@ -91,23 +91,21 @@ try {
   await page.getByRole("button", { name: "Save settings", exact: true }).waitFor();
   check(await page.locator(".setting-row:visible").count() === 3, "settings should show only three common defaults");
   await page.locator("summary").filter({ hasText: "Advanced execution settings" }).click();
-  await page.getByRole("switch", { name: "Allow shell tools", exact: true }).click();
-  await page.getByRole("switch", { name: "Allow writable workspaces", exact: true }).click();
-  await page.getByRole("button", { name: "Save settings", exact: true }).click();
-  await page.getByRole("button", { name: "Enable shell tools", exact: true }).click();
-  const enabled = page.waitForResponse((response) => response.url().endsWith("/api/settings") && response.request().method() === "PUT");
-  await page.getByRole("button", { name: "Enable writable workspaces", exact: true }).click();
-  check((await enabled).status() === 200, "first enablement must save after confirmation");
+  check(await page.locator('[data-setting-key="security.sandbox_mode"]').count() === 1, "sandbox choice must remain");
+  for (const removed of ["security.allow_shell_tools", "security.allow_writable_workspace", "security.require_approval_for_shell"]) {
+    check(await page.locator(`[data-setting-key="${removed}"]`).count() === 0, `${removed} must not be configurable`);
+  }
   await page.getByLabel("Report organization", { exact: true }).fill("Changed organization");
   const changed = page.waitForResponse((response) => response.url().endsWith("/api/settings") && response.request().method() === "PUT");
   await page.getByRole("button", { name: "Save settings", exact: true }).click();
-  check((await changed).status() === 200, "unrelated settings must save without repeated enablement dialogs");
+  check((await changed).status() === 200, "settings must save without policy confirmations");
   check(Object.keys(writes.at(-1)!.settings).join() === "reports.organization", "only changed settings should be sent");
+  check(!Object.hasOwn(writes.at(-1)!, "confirm_shell") && !Object.hasOwn(writes.at(-1)!, "confirm_writable_workspace"), "settings writes must not send removed confirmation fields");
   await page.getByLabel("Report organization", { exact: true }).waitFor();
   const beforeNoChange = writes.length;
   await page.getByRole("button", { name: "Save settings", exact: true }).click();
   await page.getByText("No changes to save.", { exact: true }).waitFor();
-  check(writes.length === beforeNoChange, "unchanged settings must not write or require confirmation");
+  check(writes.length === beforeNoChange, "unchanged settings must not write");
 
   await page.locator("summary").filter({ hasText: "Add credential (optional)" }).click();
   check(await page.locator('[name="provider"]:visible').count() === 0, "provider scoping must be optional");
@@ -127,27 +125,27 @@ try {
   const assigned = page.waitForResponse((response) => response.url().endsWith("/api/harnesses/pi/assign"));
   await pi.getByRole("button", { name: "Use for audits", exact: true }).click();
   check((await assigned).status() === 200, "one runtime assignment must succeed");
-  const agents = await (await page.request.get(`${base}/api/agents`)).json() as { agents: Array<{ role: string; harness: string; model: string | null; allow_shell: boolean; inherit_tools: boolean }> };
+  const agents = await (await page.request.get(`${base}/api/agents`)).json() as { agents: Array<{ role: string; harness: string; model: string | null }> };
   const roles = agents.agents.filter((agent) => ["codebase_mapper", "security_researcher", "independent_validator", "retest_auditor"].includes(agent.role));
-  check(roles.length === 4 && roles.every((agent) => agent.harness === "pi" && agent.model === null && agent.inherit_tools), "all roles must inherit runtime tools and model");
+  check(roles.length === 4 && roles.every((agent) => agent.harness === "pi" && agent.model === null), "all roles must use the assigned runtime and model");
   await pi.getByRole("button", { name: "Configure", exact: true }).click();
   const config = page.getByRole("dialog", { name: "Configure Pi Coding Agent", exact: true });
   check(await config.locator("input:visible, select:visible").count() === 2, "runtime setup should show provider and model only");
   await config.locator("summary").click();
-  await config.locator('[name="allowed_tools"]').fill("read,grep,find,ls,bash,edit,write");
-  const toolSave = page.waitForResponse((response) => response.url().endsWith("/api/harnesses/pi") && response.request().method() === "PUT");
-  await config.getByRole("button", { name: "Save configuration", exact: true }).click();
-  check((await toolSave).status() === 200, "expanded runtime tools must save");
+  check(await config.locator('[name="allowed_tools"], [name="permission_mode"]').count() === 0, "removed tool policy controls must not appear");
+  check(await config.locator('[name="executable"]').isVisible(), "executable must remain configurable");
+  await config.getByRole("button", { name: "Cancel", exact: true }).click();
 
   await page.goto(`${base}/#/agents`);
   await page.getByRole("heading", { name: "Agents", exact: true }).waitFor();
-  check(await page.getByText("7 tools · from runtime", { exact: true }).count() === 4, "every role must show the updated runtime tools without another assignment");
+  check(await page.getByRole("columnheader", { name: "Tools", exact: true }).count() === 0, "tool allowlist column must be removed");
   await page.getByRole("button", { name: "Edit", exact: true }).first().click();
   const roleForm = page.locator('[role="dialog"]');
   check(await roleForm.locator("input:visible, select:visible, textarea:visible").count() === 2, "role form should show runtime and model only");
   check(await roleForm.locator('[name="concurrency_limit"]').count() === 0, "nonfunctional role concurrency control must be removed");
   await roleForm.locator("summary").click();
-  check(await roleForm.locator('[name="allowed_tools"]').isDisabled(), "roles must inherit tools unless a restriction is explicitly selected");
+  check(await roleForm.locator('[name="allowed_tools"], [name="inherit_tools"]').count() === 0, "removed tool policy controls must not appear");
+  check(await roleForm.getByText(/native tools in its own writable workspace copy/).count() === 1, "role form should state the native-tool workspace behavior");
   await roleForm.getByLabel("Max duration (seconds)", { exact: true }).fill("1");
   await roleForm.locator("summary").click();
   await roleForm.getByRole("button", { name: "Save role", exact: true }).click();
@@ -190,7 +188,7 @@ try {
   check(forbiddenRequests.length === 0, "viewer settings must not request administrator resources");
   await viewerContext.close();
   check(errors.length === 0, `Browser errors: ${errors.join("; ")}`);
-  console.log("Usability UI passed: automatic import, default audit setup, start-failure recovery, changed-only settings, one-time enablement, optional credentials, one-runtime setup, advanced controls, keyboard validation, and all 13 routes at 320/768/1024/1440px. No model calls were made.");
+  console.log("Usability UI passed: automatic import, default audit setup, start-failure recovery, changed-only settings, optional credentials, one-runtime setup, native-tool defaults, keyboard validation, and all 13 routes at 320/768/1024/1440px. No model calls were made.");
   console.log(`Screenshots: ${screenshots}`);
 } finally {
   await browser?.close();

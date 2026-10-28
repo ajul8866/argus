@@ -410,6 +410,7 @@ a.table-title:hover { text-decoration: underline; text-decoration-color: var(--c
 .toast-success { border-color: color-mix(in oklab, var(--color-ok) 45%, transparent); background: var(--color-ok-soft); color: var(--color-ok); }
 .toast-error { border-color: color-mix(in oklab, var(--color-bad) 45%, transparent); background: var(--color-bad-soft); color: var(--color-bad); }
 @keyframes toast-in { from { transform: translateY(6px); opacity: 0; } }
+.live-swap *, .live-swap *::before, .live-swap *::after { animation: none !important; transition: none !important; }
 
 .modal-overlay, .drawer-overlay { position: fixed; inset: 0; z-index: var(--z-modal); display: flex; align-items: center; justify-content: center; padding: var(--space-md); background: color-mix(in oklab, var(--color-paper-3) 88%, transparent); }
 .modal-overlay:focus, .drawer-overlay:focus { outline: none; }

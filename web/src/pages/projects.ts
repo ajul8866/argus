@@ -195,9 +195,9 @@ export async function renderProjectDetail(root: HTMLElement, projectId: string):
             h("thead", {}, h("tr", {}, h("th", {}, "Target"), h("th", {}, "Environment"), h("th", { class: "col-optional" }, "Methods"), h("th", {}, "Status"), h("th", {}, ""))),
             h("tbody", {}, ...targets.map((target) =>
               h("tr", {},
-                h("td", {}, h("div", { class: "table-title mono" }, target.base_url), h("div", { class: "table-sub" }, target.label)),
+                h("td", {}, h("div", { class: "table-title mono" }, target.baseUrl), h("div", { class: "table-sub" }, target.label)),
                 h("td", { class: "small" }, target.environment),
-                h("td", { class: "small mono col-optional" }, [...target.allowed_methods, ...(target.authorized_actions?.methods ?? [])].join(", ") || "none"),
+                h("td", { class: "small mono col-optional" }, target.allowedMethods.join(", ") || "none"),
                 h("td", {}, statusBadge(target.status)),
                 h("td", {}, h("a", { class: "btn btn-sm btn-secondary", href: `#/coverage?project=${projectId}&target=${target.id}` }, "Coverage")),
               ),
@@ -258,13 +258,10 @@ export async function renderProjectDetail(root: HTMLElement, projectId: string):
 type TargetRow = {
   id: string;
   label: string;
-  base_url: string;
+  baseUrl: string;
   environment: string;
   status: string;
-  allowed_methods: string[];
-  authorized_actions?: { methods?: string[] } | null;
-  authorization_count?: number;
-  identity_count?: number;
+  allowedMethods: string[];
 };
 
 function openTargetCreate(projectId: string): void {
@@ -279,7 +276,7 @@ function openTargetCreate(projectId: string): void {
   const reference = input("reference", { required: true });
   const validUntil = input("valid_until", {
     type: "datetime-local",
-    value: new Date(Date.now() + 7 * 24 * 3_600_000).toISOString().slice(0, 16),
+    value: new Date(Date.now() + 7 * 24 * 3_600_000 - new Date().getTimezoneOffset() * 60_000).toISOString().slice(0, 16),
     required: true,
   });
   const identityA = input("identity_a", { placeholder: "user_a secret reference" });

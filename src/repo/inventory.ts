@@ -216,8 +216,13 @@ export async function gitInfo(
   const resolvedGitDirectory = gitDirectory === undefined ? await resolveGitDirectory(path) : gitDirectory;
   // Only report repository metadata when git stays inside the audited root.
   // Otherwise a `.git` pointer (or a parent repository found by discovery)
-  // would attribute an unrelated commit to this worktree import.
-  if (!resolvedGitDirectory || !isInside(root, resolvedGitDirectory)) {
+  // would attribute an unrelated commit to this worktree import. The worktree
+  // `commondir` indirection must stay inside that root too.
+  if (resolvedGitDirectory === null || !isInside(root, resolvedGitDirectory)) {
+    return { commit: null, branch: null };
+  }
+  const commonDirectory = await resolveGitCommonDirectory(resolvedGitDirectory);
+  if (commonDirectory === null || !isInside(root, commonDirectory)) {
     return { commit: null, branch: null };
   }
   const run = (args: string[]): Promise<string | null> =>

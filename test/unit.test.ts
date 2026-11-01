@@ -611,6 +611,7 @@ describe("repository import", () => {
         await expect(importRepository({ config, store }, commonProject, ref, "tester"))
           .rejects.toThrow("outside the authorized repository");
       }
+      expect(await gitInfo(handoff)).toEqual({ commit: null, branch: null });
     } finally {
       rmSync(victim, { recursive: true, force: true });
     }

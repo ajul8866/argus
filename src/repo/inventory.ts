@@ -1,6 +1,6 @@
-import { readdir, readFile, stat } from "node:fs/promises";
-import { extname, join, relative } from "node:path";
-import { createScopeMatcher, normalizePath, sha256, toJson, truncate } from "../util.ts";
+import { readdir, readFile, realpath, stat } from "node:fs/promises";
+import { extname, join, relative, resolve } from "node:path";
+import { createScopeMatcher, isInside, normalizePath, sha256, toJson, truncate } from "../util.ts";
 import type { Scope } from "../util.ts";
 
 export const DEFAULT_EXCLUDES = [
@@ -144,21 +144,84 @@ export function clampText(value: unknown, max = 4000): string {
   return truncate(typeof value === "string" ? value : "", max);
 }
 
-export async function gitInfo(path: string): Promise<{ commit: string | null; branch: string | null }> {
-  const run = async (args: string[]): Promise<string | null> => {
-    try {
-      const proc = Bun.spawn(["git", ...args], {
-        cwd: path,
-        stdout: "pipe",
-        stderr: "ignore",
-        env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
-      });
-      const [output, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-      return code === 0 ? output.trim() : null;
-    } catch {
-      return null;
-    }
-  };
+const GIT_ENV = (): Record<string, string> => ({
+  PATH: process.env.PATH ?? "/usr/bin:/bin",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_ATTR_NOSYSTEM: "1",
+});
+
+async function runGit(path: string, args: string[]): Promise<string | null> {
+  try {
+    const proc = Bun.spawn(["git", ...args], {
+      cwd: path,
+      stdout: "pipe",
+      stderr: "ignore",
+      env: GIT_ENV(),
+    });
+    const [output, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    return code === 0 ? output.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the git directory git would use for `path` and canonicalize it.
+ * Git honours a `.git` file containing a `gitdir:` pointer, so callers must
+ * contain the result before trusting it: a hand-off directory inside an
+ * authorized root can otherwise redirect git at any repository on the host.
+ */
+export async function resolveGitDirectory(path: string): Promise<string | null> {
+  const output = await runGit(path, ["rev-parse", "--absolute-git-dir"]);
+  if (!output) return null;
+  try {
+    return await realpath(output);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Worktree-style git directories redirect object and ref lookup through a
+ * `commondir` file. Canonicalize that indirection too, because a git directory
+ * that passes the root check can still point its object store elsewhere. A
+ * normal repository has no `commondir` file and is its own common directory.
+ */
+export async function resolveGitCommonDirectory(gitDirectory: string): Promise<string | null> {
+  let content: string;
+  try {
+    content = await readFile(join(gitDirectory, "commondir"), "utf8");
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? gitDirectory : null;
+  }
+  try {
+    const target = content.trim();
+    return await realpath(target ? resolve(gitDirectory, target) : gitDirectory);
+  } catch {
+    return null;
+  }
+}
+
+export async function gitInfo(
+  path: string,
+  gitDirectory?: string | null,
+): Promise<{ commit: string | null; branch: string | null }> {
+  let root: string;
+  try {
+    root = await realpath(path);
+  } catch {
+    return { commit: null, branch: null };
+  }
+  const resolvedGitDirectory = gitDirectory === undefined ? await resolveGitDirectory(path) : gitDirectory;
+  // Only report repository metadata when git stays inside the audited root.
+  // Otherwise a `.git` pointer (or a parent repository found by discovery)
+  // would attribute an unrelated commit to this worktree import.
+  if (!resolvedGitDirectory || !isInside(root, resolvedGitDirectory)) {
+    return { commit: null, branch: null };
+  }
+  const run = (args: string[]): Promise<string | null> =>
+    runGit(path, [`--git-dir=${resolvedGitDirectory}`, ...args]);
   const [commit, branch] = await Promise.all([
     run(["rev-parse", "HEAD"]),
     run(["rev-parse", "--abbrev-ref", "HEAD"]),

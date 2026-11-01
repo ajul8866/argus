@@ -30,6 +30,12 @@ LLM agents. Use it only on repositories you are authorized to assess.
 - Git-ref imports resolve the ref once, archive that immutable commit, and copy
   only in-scope regular files into a read-only snapshot. Excluded files,
   oversized files, and symlinks are not retained in the snapshot.
+- Git directory resolution is canonicalized and the resolved git directory must
+  remain inside the project's authorized repository root. A `.git` file whose
+  `gitdir:` pointer redirects git elsewhere on the host, or a git directory
+  whose common object store redirects elsewhere, is rejected before any
+  worktree metadata or archive contents are read. Repository metadata is
+  recorded only when the git directory stays inside that root.
 
 ## Execution isolation
 

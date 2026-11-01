@@ -22,6 +22,9 @@
   rebuild; nested dependency directories are excluded from inventories.
 - Project target rendering, import refresh, and default authorization time
   handling are corrected.
+- Repository import rejects a `.git` file whose `gitdir:` pointer escapes the
+  authorized repository root, and a folder import no longer records a parent
+  repository's commit.
 
 
 ## [0.0.2](https://github.com/ajul8866/argus/releases/tag/v0.0.2) — 2026-10-26

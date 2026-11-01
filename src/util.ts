@@ -68,10 +68,13 @@ export function safeJoin(root: string, relative: string): string {
   return target;
 }
 
-export function assertInside(root: string, target: string): void {
+export function isInside(root: string, target: string): boolean {
   const rootWithSep = root.endsWith(sep) ? root : `${root}${sep}`;
-  const resolved = resolve(target);
-  if (resolved !== resolve(root) && !resolved.startsWith(rootWithSep)) {
+  return target === root || target.startsWith(rootWithSep);
+}
+
+export function assertInside(root: string, target: string): void {
+  if (!isInside(resolve(root), resolve(target))) {
     throw forbidden("Path is outside the authorized root");
   }
 }

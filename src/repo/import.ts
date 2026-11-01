@@ -1,10 +1,10 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { Config } from "../config.ts";
 import type { Store } from "../db/index.ts";
 import { runCommand } from "../harness/process.ts";
-import { badRequest, now, parseJson, toJson, uid } from "../util.ts";
-import { DEFAULT_EXCLUDES, buildInventory, gitInfo } from "./inventory.ts";
+import { badRequest, isInside, now, parseJson, toJson, uid } from "../util.ts";
+import { DEFAULT_EXCLUDES, buildInventory, gitInfo, resolveGitCommonDirectory, resolveGitDirectory } from "./inventory.ts";
 import { assertAuthorizedRoot, createWorkspace } from "./workspace.ts";
 
 export async function importRepository(
@@ -23,7 +23,34 @@ export async function importRepository(
   imported_at: string;
 }> {
   const sourceRoot = await assertAuthorizedRoot(project.source_path, deps.config.allowedRoots, deps.config.dataDir);
-  const git = await gitInfo(sourceRoot);
+  // `assertAuthorizedRoot` validates the directory the auditor nominated, but
+  // git performs its own repository discovery and follows a `.git` file's
+  // `gitdir:` pointer. Canonicalize the directory git would actually use and
+  // require it to stay inside the authorized repository root, so a hand-off
+  // directory cannot redirect the import at another repository on the host.
+  const gitDirectory = await resolveGitDirectory(sourceRoot);
+  const hasGitEntry = await lstat(join(sourceRoot, ".git")).then(
+    () => true,
+    () => false,
+  );
+  const gitDirectoryInsideRoot = gitDirectory !== null && isInside(sourceRoot, gitDirectory);
+  if (hasGitEntry && gitDirectory === null) {
+    throw badRequest("Failed to locate the git directory");
+  }
+  if (hasGitEntry && !gitDirectoryInsideRoot) {
+    throw badRequest("The repository's git directory is outside the authorized repository");
+  }
+  // Worktree-style layouts redirect the object store through a `commondir`
+  // file, so require that indirection to stay inside the authorized root too.
+  const gitCommonDirectory = gitDirectoryInsideRoot && gitDirectory
+    ? await resolveGitCommonDirectory(gitDirectory)
+    : null;
+  if (gitDirectoryInsideRoot && (!gitCommonDirectory || !isInside(sourceRoot, gitCommonDirectory))) {
+    throw badRequest("The repository's git directory is outside the authorized repository");
+  }
+  const git = gitDirectoryInsideRoot && gitDirectory
+    ? await gitInfo(sourceRoot, gitDirectory)
+    : { commit: null, branch: null };
   const scope = {
     include: parseJson<string[]>(project.scope_include, ["**/*"]),
     exclude: [...new Set([...DEFAULT_EXCLUDES, ...parseJson<string[]>(project.scope_exclude, [])])],
@@ -40,12 +67,25 @@ export async function importRepository(
   let staging: string | null = null;
   try {
     if (ref) {
+      if (!gitDirectory) throw badRequest("Git refs require a git repository");
+      if (!gitDirectoryInsideRoot) {
+        throw badRequest("The repository's git directory is outside the authorized repository");
+      }
       if (!git.commit) throw badRequest("Git refs require a git repository");
       if (!/^[A-Za-z0-9][A-Za-z0-9._/@^~:-]{0,199}$/.test(ref)) {
         throw badRequest("Invalid git ref");
       }
       const resolved = await runCommand(
-        ["git", "-C", sourceRoot, "rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`],
+        [
+          "git",
+          `--git-dir=${gitDirectory}`,
+          "-C",
+          sourceRoot,
+          "rev-parse",
+          "--verify",
+          "--end-of-options",
+          `${ref}^{commit}`,
+        ],
         {
           timeoutMs: 20_000,
           env: {
@@ -63,14 +103,18 @@ export async function importRepository(
       await mkdir(extractedRoot, { mode: 0o700 });
       // Archive with every repository-local command-bearing configuration
       // entry overridden, so a filter/tar/fsmonitor driver shipped inside the
-      // audited repository cannot execute during `git archive`.
-      const gitDir = await runCommand(
-        ["git", "-C", sourceRoot, "rev-parse", "--absolute-git-dir"],
-        { timeoutMs: 20_000 },
-      );
-      if (gitDir.code !== 0) throw badRequest("Failed to locate the git directory");
+      // audited repository cannot execute during `git archive`. The validated
+      // git directory is passed explicitly so later repository discovery
+      // cannot be redirected elsewhere between this check and the archive.
       const localConfig = await runCommand(
-        ["git", "--git-dir", gitDir.stdout.trim(), "config", "--local", "--name-only", "--list"],
+        [
+          "git",
+          `--git-dir=${gitDirectory}`,
+          "config",
+          "--local",
+          "--name-only",
+          "--list",
+        ],
         { timeoutMs: 20_000 },
       );
       const dangerousKey =
@@ -83,6 +127,7 @@ export async function importRepository(
       const archived = await runCommand(
         [
           "git",
+          `--git-dir=${gitDirectory}`,
           ...overrides,
           "-c",
           "core.fsmonitor=",

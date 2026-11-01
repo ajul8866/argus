@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -612,6 +612,153 @@ describe("repository import", () => {
           .rejects.toThrow("outside the authorized repository");
       }
       expect(await gitInfo(handoff)).toEqual({ commit: null, branch: null });
+    } finally {
+      rmSync(victim, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects symlinked refs and object stores inside an in-root git directory", async () => {
+    const victim = mkdtempSync(join(tmpdir(), "argus-symlink-victim-"));
+    try {
+      const victimCommit = createGitRepository(victim, { "confidential.ts": "OFF_ROOT_SECRET=hunter2\n" });
+
+      const objectsHandoff = join(dir, "symlinked-objects");
+      mkdirSync(join(objectsHandoff, ".git", "refs", "heads"), { recursive: true });
+      writeFileSync(join(objectsHandoff, ".git", "HEAD"), "ref: refs/heads/main\n");
+      writeFileSync(join(objectsHandoff, ".git", "refs", "heads", "main"), `${victimCommit}\n`);
+      writeFileSync(join(objectsHandoff, "mine.ts"), "export const mine = true;\n");
+      symlinkSync(join(victim, ".git", "objects"), join(objectsHandoff, ".git", "objects"));
+      const objectsProject = {
+        ...project,
+        source_path: objectsHandoff,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      };
+      await expect(importRepository({ config, store }, objectsProject, "main", "tester"))
+        .rejects.toThrow("outside the authorized repository");
+
+      const refsHandoff = join(dir, "symlinked-refs");
+      mkdirSync(join(refsHandoff, ".git", "objects"), { recursive: true });
+      writeFileSync(join(refsHandoff, ".git", "HEAD"), "ref: refs/heads/main\n");
+      writeFileSync(join(refsHandoff, ".git", "config"), "[core]\n\trepositoryformatversion = 0\n");
+      writeFileSync(join(refsHandoff, "mine.ts"), "export const mine = true;\n");
+      symlinkSync(join(victim, ".git", "refs"), join(refsHandoff, ".git", "refs"));
+      const refsProject = { ...objectsProject, source_path: refsHandoff };
+      await expect(importRepository({ config, store }, refsProject, "main", "tester"))
+        .rejects.toThrow("outside the authorized repository");
+      await expect(importRepository({ config, store }, refsProject, null, "tester"))
+        .rejects.toThrow("outside the authorized repository");
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+    } finally {
+      rmSync(victim, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an alternates file that points the object store outside the root", async () => {
+    const victim = mkdtempSync(join(tmpdir(), "argus-alternates-victim-"));
+    try {
+      const victimCommit = createGitRepository(victim, { "confidential.ts": "OFF_ROOT_SECRET=hunter2\n" });
+      const handoff = join(dir, "alternates-git");
+      mkdirSync(join(handoff, ".git", "refs", "heads"), { recursive: true });
+      mkdirSync(join(handoff, ".git", "objects", "info"), { recursive: true });
+      writeFileSync(join(handoff, ".git", "HEAD"), "ref: refs/heads/main\n");
+      writeFileSync(join(handoff, ".git", "refs", "heads", "main"), `${victimCommit}\n`);
+      writeFileSync(join(handoff, ".git", "objects", "info", "alternates"), `${join(victim, ".git", "objects")}\n`);
+      writeFileSync(join(handoff, "mine.ts"), "export const mine = true;\n");
+      const alternatesProject = {
+        ...project,
+        source_path: handoff,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      };
+      await expect(importRepository({ config, store }, alternatesProject, "main", "tester"))
+        .rejects.toThrow("outside the authorized repository");
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+    } finally {
+      rmSync(victim, { recursive: true, force: true });
+    }
+  });
+
+  test("ignores repository filter configuration from includes and config.worktree", async () => {
+    const marker = join(dir, "filter-executed");
+    const driver = join(dir, "filter-driver.sh");
+    writeFileSync(driver, `#!/bin/sh\ntouch "${marker}"\nexec cat\n`);
+    chmodSync(driver, 0o755);
+    const repository = join(dir, "filtered-repository");
+    createGitRepository(repository, {
+      ".gitattributes": "* filter=evil\n",
+      "src/app.ts": "export const value = 1;\n",
+    });
+    const gitDirectory = join(repository, ".git");
+    const included = join(dir, "filter-include.cfg");
+    writeFileSync(included, `[filter "evil"]\n\tprocess = ${driver}\n`);
+    appendFileSync(
+      join(gitDirectory, "config"),
+      `[include]\n\tpath = ${included}\n[core]\n\trepositoryformatversion = 1\n[extensions]\n\tworktreeConfig = true\n`,
+    );
+    writeFileSync(join(gitDirectory, "config.worktree"), `[filter "evil"]\n\tprocess = ${driver}\n`);
+    const filteredProject = {
+      ...project,
+      source_path: repository,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    };
+    const imported = await importRepository({ config, store }, filteredProject, "HEAD", "tester");
+    expect(imported.file_count).toBe(2);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  test("a concurrent commondir rewrite cannot redirect an in-progress import", async () => {
+    const handoff = join(dir, "commondir-handoff");
+    const inside = join(handoff, "common");
+    const insideCommit = createGitRepository(inside, { "mine.ts": "export const mine = true;\n" });
+    const victim = mkdtempSync(join(tmpdir(), "argus-commondir-victim-"));
+    try {
+      const victimCommit = createGitRepository(victim, { "confidential.ts": "OFF_ROOT_SECRET=hunter2\n" });
+      mkdirSync(join(handoff, ".git"), { recursive: true });
+      writeFileSync(join(handoff, ".git", "HEAD"), "ref: refs/heads/main\n");
+      const commondir = join(handoff, ".git", "commondir");
+      const flip = (target: string) => {
+        const temporary = `${commondir}.${Math.random().toString(36).slice(2)}`;
+        writeFileSync(temporary, `${target}\n`);
+        renameSync(temporary, commondir);
+      };
+      flip(join(inside, ".git"));
+      const racingProject = {
+        ...project,
+        source_path: handoff,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      };
+      const control = await importRepository({ config, store }, racingProject, "main", "tester");
+      expect(control.commit_sha).toBe(insideCommit);
+      const writer = setInterval(() => {
+        try {
+          flip(Math.random() < 0.5 ? join(inside, ".git") : join(victim, ".git"));
+        } catch {
+          // The importer may be replacing the same file; the next tick retries.
+        }
+      }, 1);
+      try {
+        for (let attempt = 0; attempt < 10; attempt += 1) {
+          try {
+            const imported = await importRepository({ config, store }, racingProject, "main", "tester");
+            expect(imported.commit_sha).toBe(insideCommit);
+            expect(await Bun.file(join(imported.path, "confidential.ts")).exists()).toBe(false);
+          } catch (error) {
+            expect((error as { code?: string }).code).toBe("bad_request");
+          }
+        }
+      } finally {
+        clearInterval(writer);
+      }
+      const rows = store.all<{ commit_sha: string | null; inventory: string }>(
+        "SELECT commit_sha, inventory FROM repositories",
+      );
+      for (const row of rows) {
+        expect(row.commit_sha).not.toBe(victimCommit);
+        expect(row.inventory.includes("confidential.ts")).toBe(false);
+      }
     } finally {
       rmSync(victim, { recursive: true, force: true });
     }

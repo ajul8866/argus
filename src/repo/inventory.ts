@@ -1,6 +1,6 @@
-import { readdir, readFile, realpath, stat } from "node:fs/promises";
+import { cp, lstat, mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { extname, join, relative, resolve } from "node:path";
-import { createScopeMatcher, isInside, normalizePath, sha256, toJson, truncate } from "../util.ts";
+import { badRequest, createScopeMatcher, isInside, normalizePath, sha256, toJson, truncate } from "../util.ts";
 import type { Scope } from "../util.ts";
 
 export const DEFAULT_EXCLUDES = [
@@ -144,6 +144,8 @@ export function clampText(value: unknown, max = 4000): string {
   return truncate(typeof value === "string" ? value : "", max);
 }
 
+const GIT_ESCAPE = "The repository's git directory is outside the authorized repository";
+
 const GIT_ENV = (): Record<string, string> => ({
   PATH: process.env.PATH ?? "/usr/bin:/bin",
   GIT_CONFIG_NOSYSTEM: "1",
@@ -163,6 +165,39 @@ async function runGit(path: string, args: string[]): Promise<string | null> {
     return code === 0 ? output.trim() : null;
   } catch {
     return null;
+  }
+}
+
+async function lstatOrNull(path: string) {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw badRequest(GIT_ESCAPE);
+  }
+}
+
+/**
+ * Git follows symlinks and special files inside the git directory when it
+ * opens refs, packs, and loose objects. Reject the whole tree instead of
+ * trusting the resolved directory path alone.
+ */
+async function assertSafeTree(directory: string): Promise<void> {
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch {
+    throw badRequest(GIT_ESCAPE);
+  }
+  for (const entry of entries) {
+    const absolute = join(directory, entry.name);
+    const stats = await lstatOrNull(absolute);
+    if (!stats || stats.isSymbolicLink()) throw badRequest(GIT_ESCAPE);
+    if (stats.isDirectory()) {
+      await assertSafeTree(absolute);
+    } else if (!stats.isFile()) {
+      throw badRequest(GIT_ESCAPE);
+    }
   }
 }
 
@@ -189,11 +224,18 @@ export async function resolveGitDirectory(path: string): Promise<string | null> 
  * normal repository has no `commondir` file and is its own common directory.
  */
 export async function resolveGitCommonDirectory(gitDirectory: string): Promise<string | null> {
+  let stats;
+  try {
+    stats = await lstat(join(gitDirectory, "commondir"));
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? gitDirectory : null;
+  }
+  if (!stats.isFile()) return null;
   let content: string;
   try {
     content = await readFile(join(gitDirectory, "commondir"), "utf8");
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT" ? gitDirectory : null;
+  } catch {
+    return null;
   }
   try {
     const target = content.trim();
@@ -201,6 +243,114 @@ export async function resolveGitCommonDirectory(gitDirectory: string): Promise<s
   } catch {
     return null;
   }
+}
+
+async function gitConfigValue(commonDirectory: string, key: string): Promise<string | null> {
+  const value = await runGit(commonDirectory, [
+    `--git-dir=${commonDirectory}`,
+    "config",
+    "--local",
+    "--no-includes",
+    "--get",
+    key,
+  ]);
+  return value || null;
+}
+
+async function assertSafeGitMetadata(gitDirectory: string, commonDirectory: string): Promise<void> {
+  const head = await lstatOrNull(join(gitDirectory, "HEAD"));
+  if (!head || !head.isFile()) throw badRequest(GIT_ESCAPE);
+  for (const name of ["commondir", "shallow"]) {
+    const stats = await lstatOrNull(join(gitDirectory, name));
+    if (stats && !stats.isFile()) throw badRequest(GIT_ESCAPE);
+  }
+  for (const name of ["packed-refs", "config"]) {
+    const stats = await lstatOrNull(join(commonDirectory, name));
+    if (stats && !stats.isFile()) throw badRequest(GIT_ESCAPE);
+  }
+  for (const name of ["refs", "reftable"]) {
+    const stats = await lstatOrNull(join(commonDirectory, name));
+    if (!stats) continue;
+    if (!stats.isDirectory()) throw badRequest(GIT_ESCAPE);
+    await assertSafeTree(join(commonDirectory, name));
+  }
+}
+
+async function assertSafeObjectStore(objectDirectory: string, sourceRoot: string): Promise<string> {
+  const stats = await lstatOrNull(objectDirectory);
+  if (!stats || !stats.isDirectory()) throw badRequest(GIT_ESCAPE);
+  await assertSafeTree(objectDirectory);
+  // An alternates file names another object store that git would read from.
+  for (const name of ["alternates", "http-alternates"]) {
+    if (await lstatOrNull(join(objectDirectory, "info", name))) throw badRequest(GIT_ESCAPE);
+  }
+  const resolved = await realpath(objectDirectory).catch(() => null);
+  if (!resolved || !isInside(sourceRoot, resolved)) throw badRequest(GIT_ESCAPE);
+  return resolved;
+}
+
+/**
+ * Build a private, self-contained git metadata directory for import. The
+ * audited repository keeps ownership of its object store, refs, and config,
+ * so git must never read them through paths the auditor can rewrite after
+ * validation (a `commondir` swap) or through symlinks inside them.
+ */
+export async function preparePrivateGitDirectory(
+  layout: { gitDirectory: string; commonDirectory: string },
+  options: { sourceRoot: string; staging: string; includeObjects: boolean },
+): Promise<{ gitDirectory: string; objectDirectory: string | null }> {
+  await assertSafeGitMetadata(layout.gitDirectory, layout.commonDirectory);
+  const objectDirectory = options.includeObjects
+    ? await assertSafeObjectStore(join(layout.commonDirectory, "objects"), options.sourceRoot)
+    : null;
+  // Copy only the repository format details import needs. No audited config,
+  // include.path, or config.worktree entry reaches the later git commands.
+  const formatVersion = await gitConfigValue(layout.commonDirectory, "core.repositoryformatversion");
+  const objectFormat = (await gitConfigValue(layout.commonDirectory, "extensions.objectformat"))?.toLowerCase() ?? null;
+  const refStorage = (await gitConfigValue(layout.commonDirectory, "extensions.refstorage"))?.toLowerCase() ?? null;
+  if (formatVersion !== null && !/^[01]$/.test(formatVersion)) throw badRequest(GIT_ESCAPE);
+  if (objectFormat !== null && objectFormat !== "sha1" && objectFormat !== "sha256") throw badRequest(GIT_ESCAPE);
+  if (refStorage !== null && refStorage !== "files" && refStorage !== "reftable") throw badRequest(GIT_ESCAPE);
+  const version = formatVersion === "1" || objectFormat === "sha256" || refStorage === "reftable" ? 1 : 0;
+
+  const privateDirectory = join(options.staging, "gitdir");
+  await mkdir(privateDirectory, { recursive: true, mode: 0o700 });
+  await mkdir(join(privateDirectory, "objects"), { mode: 0o700 });
+  await cp(join(layout.gitDirectory, "HEAD"), join(privateDirectory, "HEAD"), { force: true });
+  for (const name of ["refs", "packed-refs", "reftable"]) {
+    const source = join(layout.commonDirectory, name);
+    const stats = await lstatOrNull(source);
+    if (!stats) continue;
+    if (stats.isDirectory()) {
+      await cp(source, join(privateDirectory, name), { recursive: true, force: true, dereference: false });
+    } else if (stats.isFile()) {
+      await cp(source, join(privateDirectory, name), { force: true, dereference: false });
+    } else {
+      throw badRequest(GIT_ESCAPE);
+    }
+  }
+  // The staging directory is private (0700); reject any symlink that appeared
+  // in the audited tree while it was being copied into it.
+  await assertSafeTree(privateDirectory);
+  const extensions: string[] = [];
+  if (objectFormat === "sha256") extensions.push("\tobjectformat = sha256");
+  if (refStorage === "reftable") extensions.push("\trefstorage = reftable");
+  const config = ["[core]", `\trepositoryformatversion = ${version}`];
+  if (extensions.length > 0) config.push("[extensions]", ...extensions);
+  await writeFile(join(privateDirectory, "config"), `${config.join("\n")}\n`, { mode: 0o600 });
+  return { gitDirectory: privateDirectory, objectDirectory };
+}
+
+export async function gitInfoForDirectory(
+  privateGitDirectory: string,
+): Promise<{ commit: string | null; branch: string | null }> {
+  const run = (args: string[]): Promise<string | null> =>
+    runGit(privateGitDirectory, [`--git-dir=${privateGitDirectory}`, ...args]);
+  const [commit, branch] = await Promise.all([
+    run(["rev-parse", "HEAD"]),
+    run(["rev-parse", "--abbrev-ref", "HEAD"]),
+  ]);
+  return { commit: commit || null, branch: branch || null };
 }
 
 export async function gitInfo(
@@ -225,13 +375,7 @@ export async function gitInfo(
   if (commonDirectory === null || !isInside(root, commonDirectory)) {
     return { commit: null, branch: null };
   }
-  const run = (args: string[]): Promise<string | null> =>
-    runGit(path, [`--git-dir=${resolvedGitDirectory}`, ...args]);
-  const [commit, branch] = await Promise.all([
-    run(["rev-parse", "HEAD"]),
-    run(["rev-parse", "--abbrev-ref", "HEAD"]),
-  ]);
-  return { commit: commit || null, branch: branch || null };
+  return gitInfoForDirectory(resolvedGitDirectory);
 }
 
 export type InventoryOptions = {

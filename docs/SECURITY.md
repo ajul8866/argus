@@ -30,12 +30,16 @@ LLM agents. Use it only on repositories you are authorized to assess.
 - Git-ref imports resolve the ref once, archive that immutable commit, and copy
   only in-scope regular files into a read-only snapshot. Excluded files,
   oversized files, and symlinks are not retained in the snapshot.
-- Git directory resolution is canonicalized and the resolved git directory must
-  remain inside the project's authorized repository root. A `.git` file whose
-  `gitdir:` pointer redirects git elsewhere on the host, or a git directory
-  whose common object store redirects elsewhere, is rejected before any
-  worktree metadata or archive contents are read. Repository metadata is
-  recorded only when the git directory stays inside that root.
+- Git directory resolution is canonicalized and the resolved git directory,
+  common directory, ref store, and object store must remain inside the project's
+  authorized repository root. A `.git` file whose `gitdir:` pointer redirects
+  git elsewhere, a `commondir` redirect, symlinked git metadata, and an
+  `objects/info/alternates` file are rejected before archive contents are read.
+- Git commands run against a private metadata copy with a whitelisted config, so
+  a `commondir` rewrite, `include.path`, or `config.worktree` supplied by the
+  audited repository cannot redirect object lookup or execute a filter driver.
+  Repository metadata is recorded only when the git directory stays inside the
+  authorized root.
 
 ## Execution isolation
 

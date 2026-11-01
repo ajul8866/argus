@@ -23,8 +23,10 @@
 - Project target rendering, import refresh, and default authorization time
   handling are corrected.
 - Repository import rejects a `.git` file whose `gitdir:` pointer escapes the
-  authorized repository root, and a folder import no longer records a parent
-  repository's commit.
+  authorized repository root, as well as symlinked git metadata, `commondir`
+  redirects, and `objects/info/alternates`. Import archives from a private
+  metadata copy with a whitelisted config, and a folder import no longer
+  records a parent repository's commit.
 
 
 ## [0.0.2](https://github.com/ajul8866/argus/releases/tag/v0.0.2) — 2026-10-26

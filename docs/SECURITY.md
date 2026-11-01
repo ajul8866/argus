@@ -34,12 +34,17 @@ LLM agents. Use it only on repositories you are authorized to assess.
   common directory, ref store, and object store must remain inside the project's
   authorized repository root. A `.git` file whose `gitdir:` pointer redirects
   git elsewhere, a `commondir` redirect, symlinked git metadata, and an
-  `objects/info/alternates` file are rejected before archive contents are read.
-- Git commands run against a private metadata copy with a whitelisted config, so
-  a `commondir` rewrite, `include.path`, or `config.worktree` supplied by the
-  audited repository cannot redirect object lookup or execute a filter driver.
-  Repository metadata is recorded only when the git directory stays inside the
-  authorized root.
+  `objects/info/alternates` file are rejected.
+- Git metadata and, for ref imports, the object store are materialized into
+  private staging (hard links where possible, copies across filesystems) before
+  any git command runs. Linux pins the validated directory inodes through
+  `O_NOFOLLOW` descriptors; other platforms reject symlinks during the copy.
+  Git never reads the audited repository again, so a `commondir` rewrite, `.git`
+  swap, symlink, or alternates file written after validation cannot redirect the
+  archive. The private config contains only repository format details, so
+  `include.path`, `config.worktree`, and repository filter drivers cannot
+  execute. Repository metadata is recorded only when the git directory stays
+  inside the authorized root.
 
 ## Execution isolation
 

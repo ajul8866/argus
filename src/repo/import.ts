@@ -16,14 +16,13 @@ import { assertAuthorizedRoot, createWorkspace } from "./workspace.ts";
 
 const GIT_ESCAPE = "The repository's git directory is outside the authorized repository";
 
-function privateGitEnvironment(staging: string, objectDirectory: string | null): Record<string, string> {
+function privateGitEnvironment(staging: string): Record<string, string> {
   return {
     PATH: process.env.PATH ?? "/usr/bin:/bin",
     HOME: staging,
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_CONFIG_GLOBAL: "/dev/null",
     GIT_ATTR_NOSYSTEM: "1",
-    ...(objectDirectory ? { GIT_OBJECT_DIRECTORY: objectDirectory } : {}),
   };
 }
 
@@ -85,8 +84,8 @@ export async function importRepository(
   try {
     if (gitDirectoryInsideRoot && gitDirectory && gitCommonDirectory) {
       staging = await mkdtemp(join(deps.config.dataDir, "repo-import-"));
-      // Every git command below reads a private metadata directory with a
-      // whitelisted config and no `commondir`; it can neither follow a
+      // Every git command below reads a private, materialized repository with
+      // a whitelisted config and no `commondir`; it can neither follow a
       // rewritten pointer nor read command-bearing configuration supplied by
       // the audited repository.
       const privateGit = await preparePrivateGitDirectory(
@@ -106,7 +105,7 @@ export async function importRepository(
             "--end-of-options",
             `${ref}^{commit}`,
           ],
-          { timeoutMs: 20_000, env: privateGitEnvironment(staging, privateGit.objectDirectory) },
+          { timeoutMs: 20_000, env: privateGitEnvironment(staging) },
         );
         if (resolved.code !== 0) throw badRequest(`Unknown git ref: ${ref}`);
         commit = resolved.stdout.trim();
@@ -130,7 +129,7 @@ export async function importRepository(
             archivePath,
             commit,
           ],
-          { timeoutMs: 180_000, env: privateGitEnvironment(staging, privateGit.objectDirectory) },
+          { timeoutMs: 180_000, env: privateGitEnvironment(staging) },
         );
         if (archived.code !== 0 || archived.timedOut) {
           throw badRequest(`Failed to archive ${ref}: ${archived.stderr.slice(0, 500)}`);

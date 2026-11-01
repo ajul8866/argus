@@ -536,9 +536,11 @@ describe("repository import", () => {
       scope_include: JSON.stringify(["**/*.js", "**/*.json", "README.md"]),
       scope_exclude: JSON.stringify(["src/routes/media.js"]),
     };
+    const sourceConfig = await Bun.file(join(repository, ".git", "config")).text();
     const imported = await importRepository({ config, store }, gitProject, "HEAD", "tester@argus.local");
     expect(imported.commit_sha).toBe(commit);
     expect(imported.branch).toBe("HEAD");
+    expect(await Bun.file(join(repository, ".git", "config")).text()).toBe(sourceConfig);
     expect(imported.file_count).toBe(2);
     expect(await Bun.file(join(imported.path, "src/lib/db.js")).text()).toContain("SELECT id");
     expect(await Bun.file(join(imported.path, "src/routes/media.js")).exists()).toBe(false);
@@ -757,6 +759,52 @@ describe("repository import", () => {
       );
       for (const row of rows) {
         expect(row.commit_sha).not.toBe(victimCommit);
+        expect(row.inventory.includes("confidential.ts")).toBe(false);
+      }
+    } finally {
+      rmSync(victim, { recursive: true, force: true });
+    }
+  });
+
+  test("an alternates file written after validation cannot redirect an in-progress ref import", async () => {
+    const victim = mkdtempSync(join(tmpdir(), "argus-alternates-race-"));
+    try {
+      const victimCommit = createGitRepository(victim, { "confidential.ts": "OFF_ROOT_SECRET=hunter2\n" });
+      const handoff = join(dir, "alternates-race");
+      mkdirSync(join(handoff, ".git", "refs", "heads"), { recursive: true });
+      mkdirSync(join(handoff, ".git", "objects", "info"), { recursive: true });
+      writeFileSync(join(handoff, ".git", "HEAD"), "ref: refs/heads/main\n");
+      writeFileSync(join(handoff, ".git", "config"), "[core]\n\trepositoryformatversion = 0\n");
+      writeFileSync(join(handoff, ".git", "refs", "heads", "main"), `${victimCommit}\n`);
+      writeFileSync(join(handoff, "mine.ts"), "export const mine = true;\n");
+      const alternates = join(handoff, ".git", "objects", "info", "alternates");
+      const racingProject = {
+        ...project,
+        source_path: handoff,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      };
+      const writer = setInterval(() => {
+        try {
+          writeFileSync(alternates, `${join(victim, ".git", "objects")}\n`);
+        } catch {
+          // The importer may be reading the tree; the next tick retries.
+        }
+      }, 1);
+      try {
+        for (let attempt = 0; attempt < 10; attempt += 1) {
+          try {
+            const imported = await importRepository({ config, store }, racingProject, "main", "tester");
+            expect(await Bun.file(join(imported.path, "confidential.ts")).exists()).toBe(false);
+          } catch (error) {
+            expect((error as { code?: string }).code).toBe("bad_request");
+          }
+        }
+      } finally {
+        clearInterval(writer);
+      }
+      const rows = store.all<{ inventory: string }>("SELECT inventory FROM repositories");
+      for (const row of rows) {
         expect(row.inventory.includes("confidential.ts")).toBe(false);
       }
     } finally {

@@ -38,13 +38,15 @@ LLM agents. Use it only on repositories you are authorized to assess.
 - Git metadata and, for ref imports, the object store are materialized into
   private staging (hard links where possible, copies across filesystems) before
   any git command runs. Linux pins the validated directory inodes through
-  `O_NOFOLLOW` descriptors; other platforms reject symlinks during the copy.
-  Git never reads the audited repository again, so a `commondir` rewrite, `.git`
-  swap, symlink, or alternates file written after validation cannot redirect the
-  archive. The private config contains only repository format details, so
-  `include.path`, `config.worktree`, and repository filter drivers cannot
-  execute. Repository metadata is recorded only when the git directory stays
-  inside the authorized root.
+  `O_NOFOLLOW` descriptors, resolves each opened descriptor back to its real
+  path, and requires it to remain inside the authorized root; other platforms
+  reject symlinks during the copy. Git never reads the audited repository
+  again, so a `commondir` rewrite, `.git` swap, symlink, or alternates file
+  written after validation cannot redirect the archive. The private config
+  contains only repository format details, so `include.path`,
+  `config.worktree`, and repository filter drivers cannot execute.
+  Repository metadata is recorded only when the git directory stays inside
+  the authorized root.
 
 ## Execution isolation
 

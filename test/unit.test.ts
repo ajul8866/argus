@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -809,6 +809,68 @@ describe("repository import", () => {
       }
     } finally {
       rmSync(victim, { recursive: true, force: true });
+    }
+  });
+
+  test("an ancestor-directory symlink swap cannot redirect a pinned git copy", async () => {
+    const handoff = join(dir, "ancestor-race");
+    const directory = join(handoff, "hd");
+    const safeDirectory = join(handoff, "hd.safe");
+    const linkEntry = join(handoff, "hd.link");
+    const victimRoot = mkdtempSync(join(tmpdir(), "argus-ancestor-victim-"));
+    try {
+      const insideCommit = createGitRepository(join(directory, "x"), { "mine.ts": "export const mine = true;\n" });
+      const victimCommit = createGitRepository(join(victimRoot, "x"), { "confidential.ts": "OFF_ROOT_SECRET=hunter2\n" });
+      writeFileSync(join(handoff, ".git"), "gitdir: hd/x/.git\n");
+      const racingProject = {
+        ...project,
+        source_path: handoff,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      };
+      const control = await importRepository({ config, store }, racingProject, "main", "tester");
+      expect(control.commit_sha).toBe(insideCommit);
+      symlinkSync(victimRoot, linkEntry);
+      const swap = () => {
+        try {
+          if (!existsSync(directory)) {
+            if (existsSync(safeDirectory)) renameSync(safeDirectory, directory);
+            return;
+          }
+          if (lstatSync(directory).isDirectory()) {
+            renameSync(directory, safeDirectory);
+            if (existsSync(linkEntry)) renameSync(linkEntry, directory);
+          } else {
+            renameSync(directory, linkEntry);
+            if (existsSync(safeDirectory)) renameSync(safeDirectory, directory);
+          }
+        } catch {
+          // The importer may observe the directory mid-swap; the next tick retries.
+        }
+      };
+      const writer = setInterval(swap, 1);
+      try {
+        for (let attempt = 0; attempt < 10; attempt += 1) {
+          try {
+            const imported = await importRepository({ config, store }, racingProject, "main", "tester");
+            expect(imported.commit_sha).not.toBe(victimCommit);
+            expect(await Bun.file(join(imported.path, "confidential.ts")).exists()).toBe(false);
+          } catch (error) {
+            expect((error as { code?: string }).code).toBe("bad_request");
+          }
+        }
+      } finally {
+        clearInterval(writer);
+      }
+      const rows = store.all<{ commit_sha: string | null; inventory: string }>(
+        "SELECT commit_sha, inventory FROM repositories",
+      );
+      for (const row of rows) {
+        expect(row.commit_sha).not.toBe(victimCommit);
+        expect(row.inventory.includes("confidential.ts")).toBe(false);
+      }
+    } finally {
+      rmSync(victimRoot, { recursive: true, force: true });
     }
   });
 

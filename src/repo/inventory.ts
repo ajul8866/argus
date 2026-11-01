@@ -181,12 +181,28 @@ async function lstatOrNull(path: string) {
   }
 }
 
-async function openPinnedDirectory(path: string) {
+async function openPinnedDirectory(path: string, root: string) {
+  let handle;
   try {
-    return await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   } catch {
     throw badRequest(GIT_ESCAPE);
   }
+  // `O_NOFOLLOW` only constrains the final path component, and the path was
+  // resolved by name again here. Verify that the descriptor that was actually
+  // opened still refers to a directory inside the authorized root before using
+  // it, otherwise an ancestor symlink race can substitute another repository.
+  let pinnedPath: string | null = null;
+  try {
+    pinnedPath = await realpath(FD_ROOT ? `${FD_ROOT}/${handle.fd}` : path);
+  } catch {
+    pinnedPath = null;
+  }
+  if (!pinnedPath || !isInside(root, pinnedPath)) {
+    await handle.close().catch(() => undefined);
+    throw badRequest(GIT_ESCAPE);
+  }
+  return handle;
 }
 
 /**
@@ -194,7 +210,9 @@ async function openPinnedDirectory(path: string) {
  * symlink. Hard links are preferred so large object stores are cheap; when
  * the filesystems differ the bytes are copied through a no-follow handle.
  */
-async function materializeFile(source: string, destination: string): Promise<void> {
+async function materializeFile(source: string, destination: string, root: string): Promise<void> {
+  const resolved = await realpath(source).catch(() => null);
+  if (!resolved || !isInside(root, resolved)) throw badRequest(GIT_ESCAPE);
   let linked = false;
   try {
     await link(source, destination);
@@ -244,7 +262,9 @@ async function materializeFile(source: string, destination: string): Promise<voi
  * replaced with a symlink or another repository after validation cannot
  * redirect the copy. Each nested directory is opened with O_NOFOLLOW.
  */
-async function materializeTreeFromPath(source: string, destination: string): Promise<void> {
+async function materializeTreeFromPath(source: string, destination: string, root: string): Promise<void> {
+  const resolved = await realpath(source).catch(() => null);
+  if (!resolved || !isInside(root, resolved)) throw badRequest(GIT_ESCAPE);
   const stats = await lstatOrNull(source);
   if (!stats || !stats.isDirectory() || stats.isSymbolicLink()) throw badRequest(GIT_ESCAPE);
   let entries;
@@ -260,18 +280,18 @@ async function materializeTreeFromPath(source: string, destination: string): Pro
     if (!entryStats || entryStats.isSymbolicLink()) throw badRequest(GIT_ESCAPE);
     if (entryStats.isDirectory()) {
       await mkdir(destinationEntry, { mode: 0o700 });
-      await materializeTreeFromPath(sourceEntry, destinationEntry);
+      await materializeTreeFromPath(sourceEntry, destinationEntry, root);
     } else if (entryStats.isFile()) {
-      await materializeFile(sourceEntry, destinationEntry);
+      await materializeFile(sourceEntry, destinationEntry, root);
     } else {
       throw badRequest(GIT_ESCAPE);
     }
   }
 }
 
-async function materializeTree(source: string, destination: string): Promise<void> {
-  if (!FD_ROOT) return materializeTreeFromPath(source, destination);
-  const handle = await openPinnedDirectory(source);
+async function materializeTree(source: string, destination: string, root: string): Promise<void> {
+  if (!FD_ROOT) return materializeTreeFromPath(source, destination, root);
+  const handle = await openPinnedDirectory(source, root);
   try {
     const pinned = `${FD_ROOT}/${handle.fd}`;
     let entries;
@@ -287,9 +307,9 @@ async function materializeTree(source: string, destination: string): Promise<voi
       if (!stats || stats.isSymbolicLink()) throw badRequest(GIT_ESCAPE);
       if (stats.isDirectory()) {
         await mkdir(destinationEntry, { mode: 0o700 });
-        await materializeTree(sourceEntry, destinationEntry);
+        await materializeTree(sourceEntry, destinationEntry, root);
       } else if (stats.isFile()) {
-        await materializeFile(sourceEntry, destinationEntry);
+        await materializeFile(sourceEntry, destinationEntry, root);
       } else {
         throw badRequest(GIT_ESCAPE);
       }
@@ -404,10 +424,10 @@ export async function preparePrivateGitDirectory(
   const objectDirectory = options.includeObjects
     ? await resolveObjectStore(join(layout.commonDirectory, "objects"), options.sourceRoot)
     : null;
-  const gitHandle = FD_ROOT ? await openPinnedDirectory(layout.gitDirectory) : null;
+  const gitHandle = FD_ROOT ? await openPinnedDirectory(layout.gitDirectory, options.sourceRoot) : null;
   try {
     const commonHandle = FD_ROOT && layout.commonDirectory !== layout.gitDirectory
-      ? await openPinnedDirectory(layout.commonDirectory)
+      ? await openPinnedDirectory(layout.commonDirectory, options.sourceRoot)
       : null;
     try {
       const gitPinned = FD_ROOT && gitHandle ? `${FD_ROOT}/${gitHandle.fd}` : layout.gitDirectory;
@@ -417,22 +437,22 @@ export async function preparePrivateGitDirectory(
       const privateDirectory = join(options.staging, "gitdir");
       await mkdir(privateDirectory, { recursive: true, mode: 0o700 });
       await mkdir(join(privateDirectory, "objects"), { mode: 0o700 });
-      await materializeFile(join(gitPinned, "HEAD"), join(privateDirectory, "HEAD"));
+      await materializeFile(join(gitPinned, "HEAD"), join(privateDirectory, "HEAD"), options.sourceRoot);
       for (const name of ["refs", "reftable"]) {
         const stats = await lstatOrNull(join(commonPinned, name));
         if (!stats) continue;
         if (!stats.isDirectory() || stats.isSymbolicLink()) throw badRequest(GIT_ESCAPE);
         await mkdir(join(privateDirectory, name), { mode: 0o700 });
-        await materializeTree(join(commonPinned, name), join(privateDirectory, name));
+        await materializeTree(join(commonPinned, name), join(privateDirectory, name), options.sourceRoot);
       }
       for (const name of ["packed-refs", "config"]) {
         const stats = await lstatOrNull(join(commonPinned, name));
         if (!stats) continue;
         if (!stats.isFile() || stats.isSymbolicLink()) throw badRequest(GIT_ESCAPE);
-        await materializeFile(join(commonPinned, name), join(privateDirectory, name));
+        await materializeFile(join(commonPinned, name), join(privateDirectory, name), options.sourceRoot);
       }
       if (objectDirectory) {
-        await materializeTree(objectDirectory, join(privateDirectory, "objects"));
+        await materializeTree(objectDirectory, join(privateDirectory, "objects"), options.sourceRoot);
         await assertNoAlternates(join(privateDirectory, "objects"));
       }
       // Copy only the repository format details import needs. The audited

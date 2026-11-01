@@ -1,11 +1,30 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { Config } from "../config.ts";
 import type { Store } from "../db/index.ts";
 import { runCommand } from "../harness/process.ts";
-import { badRequest, now, parseJson, toJson, uid } from "../util.ts";
-import { DEFAULT_EXCLUDES, buildInventory, gitInfo } from "./inventory.ts";
+import { badRequest, isInside, now, parseJson, toJson, uid } from "../util.ts";
+import {
+  DEFAULT_EXCLUDES,
+  buildInventory,
+  gitInfoForDirectory,
+  preparePrivateGitDirectory,
+  resolveGitCommonDirectory,
+  resolveGitDirectory,
+} from "./inventory.ts";
 import { assertAuthorizedRoot, createWorkspace } from "./workspace.ts";
+
+const GIT_ESCAPE = "The repository's git directory is outside the authorized repository";
+
+function privateGitEnvironment(staging: string): Record<string, string> {
+  return {
+    PATH: process.env.PATH ?? "/usr/bin:/bin",
+    HOME: staging,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_ATTR_NOSYSTEM: "1",
+  };
+}
 
 export async function importRepository(
   deps: { config: Config; store: Store },
@@ -23,14 +42,38 @@ export async function importRepository(
   imported_at: string;
 }> {
   const sourceRoot = await assertAuthorizedRoot(project.source_path, deps.config.allowedRoots, deps.config.dataDir);
-  const git = await gitInfo(sourceRoot);
+  // `assertAuthorizedRoot` validates the directory the auditor nominated, but
+  // git performs its own repository discovery and follows a `.git` file's
+  // `gitdir:` pointer. Canonicalize the directory git would actually use and
+  // require it to stay inside the authorized repository root, so a hand-off
+  // directory cannot redirect the import at another repository on the host.
+  const gitDirectory = await resolveGitDirectory(sourceRoot);
+  const hasGitEntry = await lstat(join(sourceRoot, ".git")).then(
+    () => true,
+    () => false,
+  );
+  const gitDirectoryInsideRoot = gitDirectory !== null && isInside(sourceRoot, gitDirectory);
+  if (hasGitEntry && gitDirectory === null) {
+    throw badRequest("Failed to locate the git directory");
+  }
+  if (hasGitEntry && !gitDirectoryInsideRoot) {
+    throw badRequest(GIT_ESCAPE);
+  }
+  // Worktree-style layouts redirect the object store through a `commondir`
+  // file, so require that indirection to stay inside the authorized root too.
+  const gitCommonDirectory = gitDirectoryInsideRoot && gitDirectory
+    ? await resolveGitCommonDirectory(gitDirectory)
+    : null;
+  if (gitDirectoryInsideRoot && (!gitCommonDirectory || !isInside(sourceRoot, gitCommonDirectory))) {
+    throw badRequest(GIT_ESCAPE);
+  }
   const scope = {
     include: parseJson<string[]>(project.scope_include, ["**/*"]),
     exclude: [...new Set([...DEFAULT_EXCLUDES, ...parseJson<string[]>(project.scope_exclude, [])])],
   };
   let importRoot = sourceRoot;
-  let commit = git.commit;
-  let branch = git.branch;
+  let commit: string | null = null;
+  let branch: string | null = null;
   const snapshotBase = join(
     deps.config.dataDir,
     "repos",
@@ -39,85 +82,71 @@ export async function importRepository(
   );
   let staging: string | null = null;
   try {
-    if (ref) {
-      if (!git.commit) throw badRequest("Git refs require a git repository");
-      if (!/^[A-Za-z0-9][A-Za-z0-9._/@^~:-]{0,199}$/.test(ref)) {
-        throw badRequest("Invalid git ref");
-      }
-      const resolved = await runCommand(
-        ["git", "-C", sourceRoot, "rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`],
-        {
-          timeoutMs: 20_000,
-          env: {
-            PATH: process.env.PATH ?? "/usr/bin:/bin",
-            GIT_CONFIG_NOSYSTEM: "1",
-            GIT_CONFIG_GLOBAL: "/dev/null",
-          },
-        },
-      );
-      if (resolved.code !== 0) throw badRequest(`Unknown git ref: ${ref}`);
-      commit = resolved.stdout.trim();
+    if (gitDirectoryInsideRoot && gitDirectory && gitCommonDirectory) {
       staging = await mkdtemp(join(deps.config.dataDir, "repo-import-"));
-      const archivePath = join(staging, "snapshot.tar");
-      const extractedRoot = join(staging, "source");
-      await mkdir(extractedRoot, { mode: 0o700 });
-      // Archive with every repository-local command-bearing configuration
-      // entry overridden, so a filter/tar/fsmonitor driver shipped inside the
-      // audited repository cannot execute during `git archive`.
-      const gitDir = await runCommand(
-        ["git", "-C", sourceRoot, "rev-parse", "--absolute-git-dir"],
-        { timeoutMs: 20_000 },
+      // Every git command below reads a private, materialized repository with
+      // a whitelisted config and no `commondir`; it can neither follow a
+      // rewritten pointer nor read command-bearing configuration supplied by
+      // the audited repository.
+      const privateGit = await preparePrivateGitDirectory(
+        { gitDirectory, commonDirectory: gitCommonDirectory },
+        { sourceRoot, staging, includeObjects: ref !== null },
       );
-      if (gitDir.code !== 0) throw badRequest("Failed to locate the git directory");
-      const localConfig = await runCommand(
-        ["git", "--git-dir", gitDir.stdout.trim(), "config", "--local", "--name-only", "--list"],
-        { timeoutMs: 20_000 },
-      );
-      const dangerousKey =
-        /^(filter\..*\.(smudge|clean|process)|tar\..*\.command|diff\..*\.(textconv|command)|core\.(fsmonitor|hookspath|pager|editor|sshcommand|alternaterefscommand|gitproxy)|credential\..*\.helper|uploadpack\..*\.(uploadpack|receivepack)|gpg\..*\.program)$/i;
-      const overrides = localConfig.stdout
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((key) => key && dangerousKey.test(key))
-        .flatMap((key) => ["-c", `${key}=`]);
-      const archived = await runCommand(
-        [
-          "git",
-          ...overrides,
-          "-c",
-          "core.fsmonitor=",
-          "-c",
-          `core.hooksPath=${join(staging, "nohooks")}`,
-          "-c",
-          "core.pager=cat",
-          "-C",
-          sourceRoot,
-          "archive",
-          "--format=tar",
-          "--output",
-          archivePath,
-          commit,
-        ],
-        {
-          timeoutMs: 180_000,
-          env: {
-            PATH: process.env.PATH ?? "/usr/bin:/bin",
-            HOME: staging,
-            GIT_CONFIG_NOSYSTEM: "1",
-            GIT_CONFIG_GLOBAL: "/dev/null",
-            GIT_ATTR_NOSYSTEM: "1",
-          },
-        },
-      );
-      if (archived.code !== 0 || archived.timedOut) {
-        throw badRequest(`Failed to archive ${ref}: ${archived.stderr.slice(0, 500)}`);
+      if (ref) {
+        if (!/^[A-Za-z0-9][A-Za-z0-9._/@^~:-]{0,199}$/.test(ref)) {
+          throw badRequest("Invalid git ref");
+        }
+        const resolved = await runCommand(
+          [
+            "git",
+            `--git-dir=${privateGit.gitDirectory}`,
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            `${ref}^{commit}`,
+          ],
+          { timeoutMs: 20_000, env: privateGitEnvironment(staging) },
+        );
+        if (resolved.code !== 0) throw badRequest(`Unknown git ref: ${ref}`);
+        commit = resolved.stdout.trim();
+        branch = ref;
+        const archivePath = join(staging, "snapshot.tar");
+        const extractedRoot = join(staging, "source");
+        await mkdir(extractedRoot, { mode: 0o700 });
+        const archived = await runCommand(
+          [
+            "git",
+            `--git-dir=${privateGit.gitDirectory}`,
+            "-c",
+            "core.fsmonitor=",
+            "-c",
+            `core.hooksPath=${join(staging, "nohooks")}`,
+            "-c",
+            "core.pager=cat",
+            "archive",
+            "--format=tar",
+            "--output",
+            archivePath,
+            commit,
+          ],
+          { timeoutMs: 180_000, env: privateGitEnvironment(staging) },
+        );
+        if (archived.code !== 0 || archived.timedOut) {
+          throw badRequest(`Failed to archive ${ref}: ${archived.stderr.slice(0, 500)}`);
+        }
+        const extracted = await runCommand(["tar", "-xf", archivePath, "-C", extractedRoot], { timeoutMs: 180_000 });
+        if (extracted.code !== 0 || extracted.timedOut) {
+          throw badRequest(`Failed to extract ${ref}: ${extracted.stderr.slice(0, 500)}`);
+        }
+        importRoot = extractedRoot;
+      } else {
+        const info = await gitInfoForDirectory(privateGit.gitDirectory);
+        commit = info.commit;
+        branch = info.branch;
       }
-      const extracted = await runCommand(["tar", "-xf", archivePath, "-C", extractedRoot], { timeoutMs: 180_000 });
-      if (extracted.code !== 0 || extracted.timedOut) {
-        throw badRequest(`Failed to extract ${ref}: ${extracted.stderr.slice(0, 500)}`);
-      }
-      importRoot = extractedRoot;
-      branch = ref;
+    } else if (ref) {
+      if (gitDirectory) throw badRequest(GIT_ESCAPE);
+      throw badRequest("Git refs require a git repository");
     }
     // Snapshot the current worktree so later edits cannot silently change the
     // code that evidence quotes and findings refer to.

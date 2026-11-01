@@ -30,6 +30,23 @@ LLM agents. Use it only on repositories you are authorized to assess.
 - Git-ref imports resolve the ref once, archive that immutable commit, and copy
   only in-scope regular files into a read-only snapshot. Excluded files,
   oversized files, and symlinks are not retained in the snapshot.
+- Git directory resolution is canonicalized and the resolved git directory,
+  common directory, ref store, and object store must remain inside the project's
+  authorized repository root. A `.git` file whose `gitdir:` pointer redirects
+  git elsewhere, a `commondir` redirect, symlinked git metadata, and an
+  `objects/info/alternates` file are rejected.
+- Git metadata and, for ref imports, the object store are materialized into
+  private staging (hard links where possible, copies across filesystems) before
+  any git command runs. Linux pins the validated directory inodes through
+  `O_NOFOLLOW` descriptors, resolves each opened descriptor back to its real
+  path, and requires it to remain inside the authorized root; other platforms
+  reject symlinks during the copy. Git never reads the audited repository
+  again, so a `commondir` rewrite, `.git` swap, symlink, or alternates file
+  written after validation cannot redirect the archive. The private config
+  contains only repository format details, so `include.path`,
+  `config.worktree`, and repository filter drivers cannot execute.
+  Repository metadata is recorded only when the git directory stays inside
+  the authorized root.
 
 ## Execution isolation
 

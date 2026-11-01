@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Config } from "../src/config.ts";
 import { loadConfig, PHASE_NAMES } from "../src/config.ts";
 import { KeyedSerialQueue } from "../src/concurrency.ts";
@@ -38,6 +38,38 @@ describe("HTTP JSON size limits", () => {
     });
   }
 });
+
+function runGit(directory: string, args: string[]): string {
+  const result = Bun.spawnSync(["git", ...args], {
+    cwd: directory,
+    env: {
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: 30_000,
+  });
+  if (result.exitCode !== 0) throw new Error(`Test git failed: ${result.stderr.toString()}`);
+  return result.stdout.toString().trim();
+}
+
+function createGitRepository(directory: string, files: Record<string, string>): string {
+  mkdirSync(directory, { recursive: true });
+  for (const [path, content] of Object.entries(files)) {
+    mkdirSync(dirname(join(directory, path)), { recursive: true });
+    writeFileSync(join(directory, path), content);
+  }
+  runGit(directory, ["init", "-q", "-b", "main", "."]);
+  runGit(directory, ["add", "-A"]);
+  runGit(directory, [
+    "-c", "user.name=Argus tests",
+    "-c", "user.email=tests@example.invalid",
+    "commit", "-qm", "test fixture",
+  ]);
+  return runGit(directory, ["rev-parse", "HEAD"]);
+}
 
 function testConfig(dataDir: string): Config {
   return {
@@ -418,8 +450,6 @@ describe("inventory and evidence gates", () => {
     expect(inventory.frameworks).toContain("Express");
     expect(inventory.endpoints.length).toBeGreaterThanOrEqual(5);
     expect(inventory.auth_boundaries.length).toBeGreaterThan(0);
-    const git = await gitInfo(fixture);
-    expect(git.commit?.length).toBeGreaterThan(10);
   });
 
   test("quote verification rejects fabricated excerpts", async () => {
@@ -494,23 +524,386 @@ describe("repository import", () => {
   });
 
   test("imports a git ref with the resolved commit and requested ref", async () => {
-    const git = await gitInfo(fixture);
-    const imported = await importRepository({ config, store }, project, "HEAD", "tester@argus.local");
-    expect(imported.commit_sha).toBe(git.commit);
+    const repository = join(dir, "authorized-repository");
+    const commit = createGitRepository(repository, {
+      "README.md": "# Repository\n",
+      "src/lib/db.js": "export const query = 'SELECT id';\n",
+      "src/routes/media.js": "export const media = true;\n",
+    });
+    const gitProject = {
+      ...project,
+      source_path: repository,
+      scope_include: JSON.stringify(["**/*.js", "**/*.json", "README.md"]),
+      scope_exclude: JSON.stringify(["src/routes/media.js"]),
+    };
+    const sourceConfig = await Bun.file(join(repository, ".git", "config")).text();
+    const imported = await importRepository({ config, store }, gitProject, "HEAD", "tester@argus.local");
+    expect(imported.commit_sha).toBe(commit);
     expect(imported.branch).toBe("HEAD");
-    expect(imported.file_count).toBe(9);
+    expect(await Bun.file(join(repository, ".git", "config")).text()).toBe(sourceConfig);
+    expect(imported.file_count).toBe(2);
     expect(await Bun.file(join(imported.path, "src/lib/db.js")).text()).toContain("SELECT id");
     expect(await Bun.file(join(imported.path, "src/routes/media.js")).exists()).toBe(false);
     expect((await stat(join(imported.path, "src/lib/db.js"))).mode & 0o777).toBe(0o400);
     const metadata = await Bun.file(join(imported.path, "ARGUS_SCOPE.json")).json();
-    expect(metadata.commit).toBe(git.commit);
+    expect(metadata.commit).toBe(commit);
     expect(metadata.imported_by).toBe("tester@argus.local");
+  });
+
+  test("worktree imports record only a repository rooted inside the project folder", async () => {
+    const repository = join(dir, "worktree-repository");
+    const commit = createGitRepository(repository, { "README.md": "# Repository\n" });
+    const gitProject = {
+      ...project,
+      source_path: repository,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    };
+    const imported = await importRepository({ config, store }, gitProject, null, "tester@argus.local");
+    expect(imported.commit_sha).toBe(commit);
+    expect(imported.branch).toBe("main");
+    expect(await gitInfo(repository)).toEqual({ commit, branch: "main" });
+  });
+
+  test("rejects a .git pointer that redirects git outside the authorized repository", async () => {
+    const victim = mkdtempSync(join(tmpdir(), "argus-offroot-victim-"));
+    try {
+      createGitRepository(victim, { "confidential.ts": "OFF_ROOT_SECRET=hunter2\n" });
+      const handoff = join(dir, "off-root-pointer");
+      mkdirSync(handoff, { recursive: true });
+      writeFileSync(join(handoff, ".git"), `gitdir: ${join(victim, ".git")}\n`);
+      writeFileSync(join(handoff, "mine.ts"), "export const mine = true;\n");
+      const pointerProject = {
+        ...project,
+        source_path: handoff,
+        scope_include: JSON.stringify(["**/*"]),
+      };
+      // Even if the victim repository were reachable through another allowed
+      // root, the project's own authorized repository root is the boundary.
+      const permissive = { ...config, allowedRoots: [...config.allowedRoots, victim] };
+      for (const ref of [null, "HEAD"]) {
+        await expect(importRepository({ config: permissive, store }, pointerProject, ref, "tester"))
+          .rejects.toMatchObject({
+            code: "bad_request",
+            message: expect.stringContaining("outside the authorized repository"),
+          });
+      }
+      expect(await gitInfo(handoff)).toEqual({ commit: null, branch: null });
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+    } finally {
+      rmSync(victim, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a git directory whose common object store escapes the repository root", async () => {
+    const victim = mkdtempSync(join(tmpdir(), "argus-offroot-common-"));
+    try {
+      createGitRepository(victim, { "confidential.ts": "OFF_ROOT_SECRET=hunter2\n" });
+      const handoff = join(dir, "off-root-common");
+      mkdirSync(join(handoff, ".git"), { recursive: true });
+      writeFileSync(join(handoff, ".git", "HEAD"), "ref: refs/heads/main\n");
+      writeFileSync(join(handoff, ".git", "commondir"), `${join(victim, ".git")}\n`);
+      writeFileSync(join(handoff, "mine.ts"), "export const mine = true;\n");
+      const commonProject = {
+        ...project,
+        source_path: handoff,
+        scope_include: JSON.stringify(["**/*"]),
+      };
+      for (const ref of [null, "HEAD"]) {
+        await expect(importRepository({ config, store }, commonProject, ref, "tester"))
+          .rejects.toThrow("outside the authorized repository");
+      }
+      expect(await gitInfo(handoff)).toEqual({ commit: null, branch: null });
+    } finally {
+      rmSync(victim, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects symlinked refs and object stores inside an in-root git directory", async () => {
+    const victim = mkdtempSync(join(tmpdir(), "argus-symlink-victim-"));
+    try {
+      const victimCommit = createGitRepository(victim, { "confidential.ts": "OFF_ROOT_SECRET=hunter2\n" });
+
+      const objectsHandoff = join(dir, "symlinked-objects");
+      mkdirSync(join(objectsHandoff, ".git", "refs", "heads"), { recursive: true });
+      writeFileSync(join(objectsHandoff, ".git", "HEAD"), "ref: refs/heads/main\n");
+      writeFileSync(join(objectsHandoff, ".git", "refs", "heads", "main"), `${victimCommit}\n`);
+      writeFileSync(join(objectsHandoff, "mine.ts"), "export const mine = true;\n");
+      symlinkSync(join(victim, ".git", "objects"), join(objectsHandoff, ".git", "objects"));
+      const objectsProject = {
+        ...project,
+        source_path: objectsHandoff,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      };
+      await expect(importRepository({ config, store }, objectsProject, "main", "tester"))
+        .rejects.toThrow("outside the authorized repository");
+
+      const refsHandoff = join(dir, "symlinked-refs");
+      mkdirSync(join(refsHandoff, ".git", "objects"), { recursive: true });
+      writeFileSync(join(refsHandoff, ".git", "HEAD"), "ref: refs/heads/main\n");
+      writeFileSync(join(refsHandoff, ".git", "config"), "[core]\n\trepositoryformatversion = 0\n");
+      writeFileSync(join(refsHandoff, "mine.ts"), "export const mine = true;\n");
+      symlinkSync(join(victim, ".git", "refs"), join(refsHandoff, ".git", "refs"));
+      const refsProject = { ...objectsProject, source_path: refsHandoff };
+      await expect(importRepository({ config, store }, refsProject, "main", "tester"))
+        .rejects.toThrow("outside the authorized repository");
+      await expect(importRepository({ config, store }, refsProject, null, "tester"))
+        .rejects.toThrow("outside the authorized repository");
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+    } finally {
+      rmSync(victim, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an alternates file that points the object store outside the root", async () => {
+    const victim = mkdtempSync(join(tmpdir(), "argus-alternates-victim-"));
+    try {
+      const victimCommit = createGitRepository(victim, { "confidential.ts": "OFF_ROOT_SECRET=hunter2\n" });
+      const handoff = join(dir, "alternates-git");
+      mkdirSync(join(handoff, ".git", "refs", "heads"), { recursive: true });
+      mkdirSync(join(handoff, ".git", "objects", "info"), { recursive: true });
+      writeFileSync(join(handoff, ".git", "HEAD"), "ref: refs/heads/main\n");
+      writeFileSync(join(handoff, ".git", "refs", "heads", "main"), `${victimCommit}\n`);
+      writeFileSync(join(handoff, ".git", "objects", "info", "alternates"), `${join(victim, ".git", "objects")}\n`);
+      writeFileSync(join(handoff, "mine.ts"), "export const mine = true;\n");
+      const alternatesProject = {
+        ...project,
+        source_path: handoff,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      };
+      await expect(importRepository({ config, store }, alternatesProject, "main", "tester"))
+        .rejects.toThrow("outside the authorized repository");
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+    } finally {
+      rmSync(victim, { recursive: true, force: true });
+    }
+  });
+
+  test("ignores repository filter configuration from includes and config.worktree", async () => {
+    const marker = join(dir, "filter-executed");
+    const driver = join(dir, "filter-driver.sh");
+    writeFileSync(driver, `#!/bin/sh\ntouch "${marker}"\nexec cat\n`);
+    chmodSync(driver, 0o755);
+    const repository = join(dir, "filtered-repository");
+    createGitRepository(repository, {
+      ".gitattributes": "* filter=evil\n",
+      "src/app.ts": "export const value = 1;\n",
+    });
+    const gitDirectory = join(repository, ".git");
+    const included = join(dir, "filter-include.cfg");
+    writeFileSync(included, `[filter "evil"]\n\tprocess = ${driver}\n`);
+    appendFileSync(
+      join(gitDirectory, "config"),
+      `[include]\n\tpath = ${included}\n[core]\n\trepositoryformatversion = 1\n[extensions]\n\tworktreeConfig = true\n`,
+    );
+    writeFileSync(join(gitDirectory, "config.worktree"), `[filter "evil"]\n\tprocess = ${driver}\n`);
+    const filteredProject = {
+      ...project,
+      source_path: repository,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    };
+    const imported = await importRepository({ config, store }, filteredProject, "HEAD", "tester");
+    expect(imported.file_count).toBe(2);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  test("a concurrent commondir rewrite cannot redirect an in-progress import", async () => {
+    const handoff = join(dir, "commondir-handoff");
+    const inside = join(handoff, "common");
+    const insideCommit = createGitRepository(inside, { "mine.ts": "export const mine = true;\n" });
+    const victim = mkdtempSync(join(tmpdir(), "argus-commondir-victim-"));
+    try {
+      const victimCommit = createGitRepository(victim, { "confidential.ts": "OFF_ROOT_SECRET=hunter2\n" });
+      mkdirSync(join(handoff, ".git"), { recursive: true });
+      writeFileSync(join(handoff, ".git", "HEAD"), "ref: refs/heads/main\n");
+      const commondir = join(handoff, ".git", "commondir");
+      const flip = (target: string) => {
+        const temporary = `${commondir}.${Math.random().toString(36).slice(2)}`;
+        writeFileSync(temporary, `${target}\n`);
+        renameSync(temporary, commondir);
+      };
+      flip(join(inside, ".git"));
+      const racingProject = {
+        ...project,
+        source_path: handoff,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      };
+      const control = await importRepository({ config, store }, racingProject, "main", "tester");
+      expect(control.commit_sha).toBe(insideCommit);
+      const writer = setInterval(() => {
+        try {
+          flip(Math.random() < 0.5 ? join(inside, ".git") : join(victim, ".git"));
+        } catch {
+          // The importer may be replacing the same file; the next tick retries.
+        }
+      }, 1);
+      try {
+        for (let attempt = 0; attempt < 10; attempt += 1) {
+          try {
+            const imported = await importRepository({ config, store }, racingProject, "main", "tester");
+            expect(imported.commit_sha).toBe(insideCommit);
+            expect(await Bun.file(join(imported.path, "confidential.ts")).exists()).toBe(false);
+          } catch (error) {
+            expect((error as { code?: string }).code).toBe("bad_request");
+          }
+        }
+      } finally {
+        clearInterval(writer);
+      }
+      const rows = store.all<{ commit_sha: string | null; inventory: string }>(
+        "SELECT commit_sha, inventory FROM repositories",
+      );
+      for (const row of rows) {
+        expect(row.commit_sha).not.toBe(victimCommit);
+        expect(row.inventory.includes("confidential.ts")).toBe(false);
+      }
+    } finally {
+      rmSync(victim, { recursive: true, force: true });
+    }
+  });
+
+  test("an alternates file written after validation cannot redirect an in-progress ref import", async () => {
+    const victim = mkdtempSync(join(tmpdir(), "argus-alternates-race-"));
+    try {
+      const victimCommit = createGitRepository(victim, { "confidential.ts": "OFF_ROOT_SECRET=hunter2\n" });
+      const handoff = join(dir, "alternates-race");
+      mkdirSync(join(handoff, ".git", "refs", "heads"), { recursive: true });
+      mkdirSync(join(handoff, ".git", "objects", "info"), { recursive: true });
+      writeFileSync(join(handoff, ".git", "HEAD"), "ref: refs/heads/main\n");
+      writeFileSync(join(handoff, ".git", "config"), "[core]\n\trepositoryformatversion = 0\n");
+      writeFileSync(join(handoff, ".git", "refs", "heads", "main"), `${victimCommit}\n`);
+      writeFileSync(join(handoff, "mine.ts"), "export const mine = true;\n");
+      const alternates = join(handoff, ".git", "objects", "info", "alternates");
+      const racingProject = {
+        ...project,
+        source_path: handoff,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      };
+      const writer = setInterval(() => {
+        try {
+          writeFileSync(alternates, `${join(victim, ".git", "objects")}\n`);
+        } catch {
+          // The importer may be reading the tree; the next tick retries.
+        }
+      }, 1);
+      try {
+        for (let attempt = 0; attempt < 10; attempt += 1) {
+          try {
+            const imported = await importRepository({ config, store }, racingProject, "main", "tester");
+            expect(await Bun.file(join(imported.path, "confidential.ts")).exists()).toBe(false);
+          } catch (error) {
+            expect((error as { code?: string }).code).toBe("bad_request");
+          }
+        }
+      } finally {
+        clearInterval(writer);
+      }
+      const rows = store.all<{ inventory: string }>("SELECT inventory FROM repositories");
+      for (const row of rows) {
+        expect(row.inventory.includes("confidential.ts")).toBe(false);
+      }
+    } finally {
+      rmSync(victim, { recursive: true, force: true });
+    }
+  });
+
+  test("an ancestor-directory symlink swap cannot redirect a pinned git copy", async () => {
+    const handoff = join(dir, "ancestor-race");
+    const directory = join(handoff, "hd");
+    const safeDirectory = join(handoff, "hd.safe");
+    const linkEntry = join(handoff, "hd.link");
+    const victimRoot = mkdtempSync(join(tmpdir(), "argus-ancestor-victim-"));
+    try {
+      const insideCommit = createGitRepository(join(directory, "x"), { "mine.ts": "export const mine = true;\n" });
+      const victimCommit = createGitRepository(join(victimRoot, "x"), { "confidential.ts": "OFF_ROOT_SECRET=hunter2\n" });
+      writeFileSync(join(handoff, ".git"), "gitdir: hd/x/.git\n");
+      const racingProject = {
+        ...project,
+        source_path: handoff,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      };
+      const control = await importRepository({ config, store }, racingProject, "main", "tester");
+      expect(control.commit_sha).toBe(insideCommit);
+      symlinkSync(victimRoot, linkEntry);
+      const swap = () => {
+        try {
+          if (!existsSync(directory)) {
+            if (existsSync(safeDirectory)) renameSync(safeDirectory, directory);
+            return;
+          }
+          if (lstatSync(directory).isDirectory()) {
+            renameSync(directory, safeDirectory);
+            if (existsSync(linkEntry)) renameSync(linkEntry, directory);
+          } else {
+            renameSync(directory, linkEntry);
+            if (existsSync(safeDirectory)) renameSync(safeDirectory, directory);
+          }
+        } catch {
+          // The importer may observe the directory mid-swap; the next tick retries.
+        }
+      };
+      const writer = setInterval(swap, 1);
+      try {
+        for (let attempt = 0; attempt < 10; attempt += 1) {
+          try {
+            const imported = await importRepository({ config, store }, racingProject, "main", "tester");
+            expect(imported.commit_sha).not.toBe(victimCommit);
+            expect(await Bun.file(join(imported.path, "confidential.ts")).exists()).toBe(false);
+          } catch (error) {
+            expect((error as { code?: string }).code).toBe("bad_request");
+          }
+        }
+      } finally {
+        clearInterval(writer);
+      }
+      const rows = store.all<{ commit_sha: string | null; inventory: string }>(
+        "SELECT commit_sha, inventory FROM repositories",
+      );
+      for (const row of rows) {
+        expect(row.commit_sha).not.toBe(victimCommit);
+        expect(row.inventory.includes("confidential.ts")).toBe(false);
+      }
+    } finally {
+      rmSync(victimRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("plain folder imports inside another repository do not inherit its commit", async () => {
+    const outer = join(dir, "outer-repository");
+    createGitRepository(outer, {
+      "packages/app/mine.ts": "export const mine = true;\n",
+      "secret/other.ts": "export const other = true;\n",
+    });
+    const nested = join(outer, "packages/app");
+    const nestedProject = {
+      ...project,
+      source_path: nested,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    };
+    const imported = await importRepository({ config, store }, nestedProject, null, "tester");
+    expect(imported.commit_sha).toBeNull();
+    expect(imported.branch).toBeNull();
+    expect(imported.file_count).toBe(1);
+    expect(await Bun.file(join(imported.path, "mine.ts")).exists()).toBe(true);
+    expect(await Bun.file(join(imported.path, "secret/other.ts")).exists()).toBe(false);
+    expect(await gitInfo(nested)).toEqual({ commit: null, branch: null });
+    await expect(importRepository({ config, store }, nestedProject, "HEAD", "tester"))
+      .rejects.toThrow("outside the authorized repository");
   });
 
   test("rejects unauthorized roots, unknown refs, and empty scope without persisting a repository", async () => {
     await expect(importRepository({ config: { ...config, allowedRoots: [dir] }, store }, project, null, "tester"))
       .rejects.toMatchObject({ code: "repository_not_authorized" });
-    await expect(importRepository({ config, store }, project, "argus-missing-ref", "tester"))
+    const repository = join(dir, "unknown-ref-repository");
+    createGitRepository(repository, { "README.md": "# Repository\n" });
+    await expect(importRepository({ config, store }, { ...project, source_path: repository }, "argus-missing-ref", "tester"))
       .rejects.toThrow("Unknown git ref");
     await expect(importRepository({ config, store }, { ...project, scope_include: "[]" }, null, "tester"))
       .rejects.toThrow("No in-scope files were found");

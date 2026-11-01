@@ -1,6 +1,7 @@
-import { readdir, readFile, stat } from "node:fs/promises";
-import { extname, join, relative } from "node:path";
-import { createScopeMatcher, normalizePath, sha256, toJson, truncate } from "../util.ts";
+import { constants } from "node:fs";
+import { link, lstat, mkdir, open, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { extname, join, relative, resolve } from "node:path";
+import { badRequest, createScopeMatcher, isInside, normalizePath, sha256, toJson, truncate } from "../util.ts";
 import type { Scope } from "../util.ts";
 
 export const DEFAULT_EXCLUDES = [
@@ -144,26 +145,379 @@ export function clampText(value: unknown, max = 4000): string {
   return truncate(typeof value === "string" ? value : "", max);
 }
 
-export async function gitInfo(path: string): Promise<{ commit: string | null; branch: string | null }> {
-  const run = async (args: string[]): Promise<string | null> => {
+const GIT_ESCAPE = "The repository's git directory is outside the authorized repository";
+// Pinned descriptor paths let the copy pin the validated directory inode on
+// Linux. Other platforms fall back to O_NOFOLLOW-checked path traversal.
+const FD_ROOT = process.platform === "linux" ? "/proc/self/fd" : null;
+
+const GIT_ENV = (): Record<string, string> => ({
+  PATH: process.env.PATH ?? "/usr/bin:/bin",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_ATTR_NOSYSTEM: "1",
+});
+
+async function runGit(path: string, args: string[]): Promise<string | null> {
+  try {
+    const proc = Bun.spawn(["git", ...args], {
+      cwd: path,
+      stdout: "pipe",
+      stderr: "ignore",
+      env: GIT_ENV(),
+    });
+    const [output, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    return code === 0 ? output.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function lstatOrNull(path: string) {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw badRequest(GIT_ESCAPE);
+  }
+}
+
+async function openPinnedDirectory(path: string, root: string) {
+  let handle;
+  try {
+    handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  } catch {
+    throw badRequest(GIT_ESCAPE);
+  }
+  // `O_NOFOLLOW` only constrains the final path component, and the path was
+  // resolved by name again here. Verify that the descriptor that was actually
+  // opened still refers to a directory inside the authorized root before using
+  // it, otherwise an ancestor symlink race can substitute another repository.
+  let pinnedPath: string | null = null;
+  try {
+    pinnedPath = await realpath(FD_ROOT ? `${FD_ROOT}/${handle.fd}` : path);
+  } catch {
+    pinnedPath = null;
+  }
+  if (!pinnedPath || !isInside(root, pinnedPath)) {
+    await handle.close().catch(() => undefined);
+    throw badRequest(GIT_ESCAPE);
+  }
+  return handle;
+}
+
+/**
+ * Copy one git metadata file into private staging without following a
+ * symlink. Hard links are preferred so large object stores are cheap; when
+ * the filesystems differ the bytes are copied through a no-follow handle.
+ */
+async function materializeFile(source: string, destination: string, root: string): Promise<void> {
+  const resolved = await realpath(source).catch(() => null);
+  if (!resolved || !isInside(root, resolved)) throw badRequest(GIT_ESCAPE);
+  let linked = false;
+  try {
+    await link(source, destination);
+    linked = true;
+  } catch {
+    linked = false;
+  }
+  if (linked) {
+    const stats = await lstatOrNull(destination);
+    if (!stats || stats.isSymbolicLink() || !stats.isFile()) throw badRequest(GIT_ESCAPE);
+    return;
+  }
+  let sourceHandle;
+  try {
+    sourceHandle = await open(source, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch {
+    throw badRequest(GIT_ESCAPE);
+  }
+  let destinationHandle;
+  try {
     try {
-      const proc = Bun.spawn(["git", ...args], {
-        cwd: path,
-        stdout: "pipe",
-        stderr: "ignore",
-        env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
-      });
-      const [output, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-      return code === 0 ? output.trim() : null;
+      destinationHandle = await open(destination, "wx", 0o600);
     } catch {
-      return null;
+      throw badRequest(GIT_ESCAPE);
     }
-  };
+    const buffer = Buffer.alloc(1_048_576);
+    let position = 0;
+    for (;;) {
+      const { bytesRead } = await sourceHandle.read(buffer, 0, buffer.length, position);
+      if (bytesRead === 0) break;
+      let offset = 0;
+      while (offset < bytesRead) {
+        const { bytesWritten } = await destinationHandle.write(buffer, offset, bytesRead - offset, position + offset);
+        if (bytesWritten === 0) throw badRequest(GIT_ESCAPE);
+        offset += bytesWritten;
+      }
+      position += bytesRead;
+    }
+  } finally {
+    if (destinationHandle) await destinationHandle.close().catch(() => undefined);
+    await sourceHandle.close().catch(() => undefined);
+  }
+}
+
+/**
+ * Materialize a directory through a pinned descriptor, so a path that is
+ * replaced with a symlink or another repository after validation cannot
+ * redirect the copy. Each nested directory is opened with O_NOFOLLOW.
+ */
+async function materializeTreeFromPath(source: string, destination: string, root: string): Promise<void> {
+  const resolved = await realpath(source).catch(() => null);
+  if (!resolved || !isInside(root, resolved)) throw badRequest(GIT_ESCAPE);
+  const stats = await lstatOrNull(source);
+  if (!stats || !stats.isDirectory() || stats.isSymbolicLink()) throw badRequest(GIT_ESCAPE);
+  let entries;
+  try {
+    entries = await readdir(source, { withFileTypes: true });
+  } catch {
+    throw badRequest(GIT_ESCAPE);
+  }
+  for (const entry of entries) {
+    const sourceEntry = join(source, entry.name);
+    const destinationEntry = join(destination, entry.name);
+    const entryStats = await lstatOrNull(sourceEntry);
+    if (!entryStats || entryStats.isSymbolicLink()) throw badRequest(GIT_ESCAPE);
+    if (entryStats.isDirectory()) {
+      await mkdir(destinationEntry, { mode: 0o700 });
+      await materializeTreeFromPath(sourceEntry, destinationEntry, root);
+    } else if (entryStats.isFile()) {
+      await materializeFile(sourceEntry, destinationEntry, root);
+    } else {
+      throw badRequest(GIT_ESCAPE);
+    }
+  }
+}
+
+async function materializeTree(source: string, destination: string, root: string): Promise<void> {
+  if (!FD_ROOT) return materializeTreeFromPath(source, destination, root);
+  const handle = await openPinnedDirectory(source, root);
+  try {
+    const pinned = `${FD_ROOT}/${handle.fd}`;
+    let entries;
+    try {
+      entries = await readdir(pinned, { withFileTypes: true });
+    } catch {
+      throw badRequest(GIT_ESCAPE);
+    }
+    for (const entry of entries) {
+      const sourceEntry = join(pinned, entry.name);
+      const destinationEntry = join(destination, entry.name);
+      const stats = await lstatOrNull(sourceEntry);
+      if (!stats || stats.isSymbolicLink()) throw badRequest(GIT_ESCAPE);
+      if (stats.isDirectory()) {
+        await mkdir(destinationEntry, { mode: 0o700 });
+        await materializeTree(sourceEntry, destinationEntry, root);
+      } else if (stats.isFile()) {
+        await materializeFile(sourceEntry, destinationEntry, root);
+      } else {
+        throw badRequest(GIT_ESCAPE);
+      }
+    }
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+async function assertNoAlternates(objectDirectory: string): Promise<void> {
+  for (const name of ["alternates", "http-alternates"]) {
+    if (await lstatOrNull(join(objectDirectory, "info", name))) throw badRequest(GIT_ESCAPE);
+  }
+}
+
+/**
+ * Resolve the git directory git would use for `path` and canonicalize it.
+ * Git honours a `.git` file containing a `gitdir:` pointer, so callers must
+ * contain the result before trusting it: a hand-off directory inside an
+ * authorized root can otherwise redirect git at any repository on the host.
+ */
+export async function resolveGitDirectory(path: string): Promise<string | null> {
+  const output = await runGit(path, ["rev-parse", "--absolute-git-dir"]);
+  if (!output) return null;
+  try {
+    return await realpath(output);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Worktree-style git directories redirect object and ref lookup through a
+ * `commondir` file. Canonicalize that indirection too, because a git directory
+ * that passes the root check can still point its object store elsewhere. A
+ * normal repository has no `commondir` file and is its own common directory.
+ */
+export async function resolveGitCommonDirectory(gitDirectory: string): Promise<string | null> {
+  let stats;
+  try {
+    stats = await lstat(join(gitDirectory, "commondir"));
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? gitDirectory : null;
+  }
+  if (!stats.isFile()) return null;
+  let content: string;
+  try {
+    content = await readFile(join(gitDirectory, "commondir"), "utf8");
+  } catch {
+    return null;
+  }
+  try {
+    const target = content.trim();
+    return await realpath(target ? resolve(gitDirectory, target) : gitDirectory);
+  } catch {
+    return null;
+  }
+}
+
+async function gitConfigValue(privateDirectory: string, key: string): Promise<string | null> {
+  const value = await runGit(privateDirectory, [
+    `--git-dir=${privateDirectory}`,
+    "config",
+    "--local",
+    "--no-includes",
+    "--get",
+    key,
+  ]);
+  return value || null;
+}
+
+async function assertSafeGitMetadata(gitDirectory: string, commonDirectory: string): Promise<void> {
+  const head = await lstatOrNull(join(gitDirectory, "HEAD"));
+  if (!head || !head.isFile() || head.isSymbolicLink()) throw badRequest(GIT_ESCAPE);
+  for (const name of ["commondir", "shallow"]) {
+    const stats = await lstatOrNull(join(gitDirectory, name));
+    if (stats && (!stats.isFile() || stats.isSymbolicLink())) throw badRequest(GIT_ESCAPE);
+  }
+  for (const name of ["packed-refs", "config"]) {
+    const stats = await lstatOrNull(join(commonDirectory, name));
+    if (stats && (!stats.isFile() || stats.isSymbolicLink())) throw badRequest(GIT_ESCAPE);
+  }
+  for (const name of ["refs", "reftable"]) {
+    const stats = await lstatOrNull(join(commonDirectory, name));
+    if (stats && (!stats.isDirectory() || stats.isSymbolicLink())) throw badRequest(GIT_ESCAPE);
+  }
+}
+
+async function resolveObjectStore(objectDirectory: string, sourceRoot: string): Promise<string> {
+  const stats = await lstatOrNull(objectDirectory);
+  if (!stats || !stats.isDirectory() || stats.isSymbolicLink()) throw badRequest(GIT_ESCAPE);
+  // Reject alternates before copying; a file created during the copy is
+  // checked again inside the private staging directory.
+  await assertNoAlternates(objectDirectory);
+  const resolved = await realpath(objectDirectory).catch(() => null);
+  if (!resolved || !isInside(sourceRoot, resolved)) throw badRequest(GIT_ESCAPE);
+  return resolved;
+}
+
+/**
+ * Build a private, self-contained git directory for import. Ref semantics and
+ * object contents are materialized through pinned descriptors into private
+ * staging; the audited repository is never consulted again, so a `commondir`
+ * rewrite, a `.git` swap, symlinked objects/refs, or an alternates file written
+ * after validation cannot redirect the later archive.
+ */
+export async function preparePrivateGitDirectory(
+  layout: { gitDirectory: string; commonDirectory: string },
+  options: { sourceRoot: string; staging: string; includeObjects: boolean },
+): Promise<{ gitDirectory: string }> {
+  await assertSafeGitMetadata(layout.gitDirectory, layout.commonDirectory);
+  const objectDirectory = options.includeObjects
+    ? await resolveObjectStore(join(layout.commonDirectory, "objects"), options.sourceRoot)
+    : null;
+  const gitHandle = FD_ROOT ? await openPinnedDirectory(layout.gitDirectory, options.sourceRoot) : null;
+  try {
+    const commonHandle = FD_ROOT && layout.commonDirectory !== layout.gitDirectory
+      ? await openPinnedDirectory(layout.commonDirectory, options.sourceRoot)
+      : null;
+    try {
+      const gitPinned = FD_ROOT && gitHandle ? `${FD_ROOT}/${gitHandle.fd}` : layout.gitDirectory;
+      const commonPinned = FD_ROOT && (commonHandle ?? gitHandle)
+        ? `${FD_ROOT}/${(commonHandle ?? gitHandle)!.fd}`
+        : layout.commonDirectory;
+      const privateDirectory = join(options.staging, "gitdir");
+      await mkdir(privateDirectory, { recursive: true, mode: 0o700 });
+      await mkdir(join(privateDirectory, "objects"), { mode: 0o700 });
+      await materializeFile(join(gitPinned, "HEAD"), join(privateDirectory, "HEAD"), options.sourceRoot);
+      for (const name of ["refs", "reftable"]) {
+        const stats = await lstatOrNull(join(commonPinned, name));
+        if (!stats) continue;
+        if (!stats.isDirectory() || stats.isSymbolicLink()) throw badRequest(GIT_ESCAPE);
+        await mkdir(join(privateDirectory, name), { mode: 0o700 });
+        await materializeTree(join(commonPinned, name), join(privateDirectory, name), options.sourceRoot);
+      }
+      for (const name of ["packed-refs", "config"]) {
+        const stats = await lstatOrNull(join(commonPinned, name));
+        if (!stats) continue;
+        if (!stats.isFile() || stats.isSymbolicLink()) throw badRequest(GIT_ESCAPE);
+        await materializeFile(join(commonPinned, name), join(privateDirectory, name), options.sourceRoot);
+      }
+      if (objectDirectory) {
+        await materializeTree(objectDirectory, join(privateDirectory, "objects"), options.sourceRoot);
+        await assertNoAlternates(join(privateDirectory, "objects"));
+      }
+      // Copy only the repository format details import needs. The audited
+      // config is never used again, so include.path, config.worktree, and
+      // filter drivers cannot reach rev-parse or archive.
+      const formatVersion = await gitConfigValue(privateDirectory, "core.repositoryformatversion");
+      const objectFormat = (await gitConfigValue(privateDirectory, "extensions.objectformat"))?.toLowerCase() ?? null;
+      const refStorage = (await gitConfigValue(privateDirectory, "extensions.refstorage"))?.toLowerCase() ?? null;
+      if (formatVersion !== null && !/^[01]$/.test(formatVersion)) throw badRequest(GIT_ESCAPE);
+      if (objectFormat !== null && objectFormat !== "sha1" && objectFormat !== "sha256") throw badRequest(GIT_ESCAPE);
+      if (refStorage !== null && refStorage !== "files" && refStorage !== "reftable") throw badRequest(GIT_ESCAPE);
+      const version = formatVersion === "1" || objectFormat === "sha256" || refStorage === "reftable" ? 1 : 0;
+      const extensions: string[] = [];
+      if (objectFormat === "sha256") extensions.push("\tobjectformat = sha256");
+      if (refStorage === "reftable") extensions.push("\trefstorage = reftable");
+      const config = ["[core]", `\trepositoryformatversion = ${version}`];
+      if (extensions.length > 0) config.push("[extensions]", ...extensions);
+      // The copied config may be a hard link to the audited repository's file;
+      // replace it instead of truncating the shared inode.
+      await rm(join(privateDirectory, "config"), { force: true });
+      await writeFile(join(privateDirectory, "config"), `${config.join("\n")}\n`, { mode: 0o600 });
+      return { gitDirectory: privateDirectory };
+    } finally {
+      if (commonHandle) await commonHandle.close().catch(() => undefined);
+    }
+  } finally {
+    if (gitHandle) await gitHandle.close().catch(() => undefined);
+  }
+}
+
+export async function gitInfoForDirectory(
+  privateGitDirectory: string,
+): Promise<{ commit: string | null; branch: string | null }> {
+  const run = (args: string[]): Promise<string | null> =>
+    runGit(privateGitDirectory, [`--git-dir=${privateGitDirectory}`, ...args]);
   const [commit, branch] = await Promise.all([
     run(["rev-parse", "HEAD"]),
     run(["rev-parse", "--abbrev-ref", "HEAD"]),
   ]);
   return { commit: commit || null, branch: branch || null };
+}
+
+export async function gitInfo(
+  path: string,
+  gitDirectory?: string | null,
+): Promise<{ commit: string | null; branch: string | null }> {
+  let root: string;
+  try {
+    root = await realpath(path);
+  } catch {
+    return { commit: null, branch: null };
+  }
+  const resolvedGitDirectory = gitDirectory === undefined ? await resolveGitDirectory(path) : gitDirectory;
+  // Only report repository metadata when git stays inside the audited root.
+  // Otherwise a `.git` pointer (or a parent repository found by discovery)
+  // would attribute an unrelated commit to this worktree import. The worktree
+  // `commondir` indirection must stay inside that root too.
+  if (resolvedGitDirectory === null || !isInside(root, resolvedGitDirectory)) {
+    return { commit: null, branch: null };
+  }
+  const commonDirectory = await resolveGitCommonDirectory(resolvedGitDirectory);
+  if (commonDirectory === null || !isInside(root, commonDirectory)) {
+    return { commit: null, branch: null };
+  }
+  return gitInfoForDirectory(resolvedGitDirectory);
 }
 
 export type InventoryOptions = {

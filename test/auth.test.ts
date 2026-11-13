@@ -101,6 +101,40 @@ test("invalid credentials fail and repeated attempts trigger a temporary lock", 
   expect(lastError).toContain("Too many failed sign-in attempts");
 });
 
+test("concurrent sign-in attempts share one lockout budget before password verification", async () => {
+  const passwordAt = 10;
+  const outcomes = await Promise.all(
+    Array.from({ length: 20 }, (_, index) =>
+      auth
+        .login(
+          "admin@test.local",
+          index === passwordAt ? "test-admin-password" : "wrong-password",
+          "198.51.100.10",
+          "test",
+        )
+        .then(() => "authenticated" as const)
+        .catch((error) => (error instanceof Error ? error.message : String(error))),
+    ),
+  );
+
+  expect(outcomes.filter((outcome) => outcome === "authenticated")).toEqual([]);
+  expect(outcomes.filter((outcome) => outcome.includes("Invalid email or password"))).toHaveLength(6);
+  expect(outcomes.filter((outcome) => outcome.includes("Too many failed sign-in attempts"))).toHaveLength(14);
+  await expect(auth.login("admin@test.local", "test-admin-password", "198.51.100.10", "test")).rejects.toThrow(
+    /Too many failed sign-in attempts/,
+  );
+});
+
+test("a correct password still signs in after five sequential failures in the same window", async () => {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    await expect(auth.login("admin@test.local", "wrong-password", "198.51.100.11", "test")).rejects.toThrow(
+      /Invalid email or password/,
+    );
+  }
+  const result = await auth.login("admin@test.local", "test-admin-password", "198.51.100.11", "test");
+  expect(result.user.email).toBe("admin@test.local");
+});
+
 test("retry rejects closed audits and only requeues tasks in a running audit", async () => {
   const { api, headers, engine, userId } = await projectClient();
   const timestamp = new Date().toISOString();

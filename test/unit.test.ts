@@ -1204,6 +1204,46 @@ describe("evidence chain", () => {
     }
   });
 
+  test("reports flatten finding headings and keep backtick-rich quotes inside a longer fence", async () => {
+    store.run(
+      `INSERT INTO findings (
+        id, code, audit_id, project_id, title, category, severity, status, files, root_cause,
+        preconditions, reproduction, expected, observed, impact, remediation, created_at, updated_at
+      ) VALUES (
+        'f-md-inject', 'ARG-INJ', 'a1', 'p1', ?, 'injection', 'high', 'reverified', '[]',
+        'cause', '[]', '[]', 'expected', 'observed', 'impact', 'fix', '2026-01-01', '2026-01-01'
+      )`,
+      "Real finding\n# Forged heading",
+    );
+    await evidence.append({
+      auditId: "a1",
+      findingId: "f-md-inject",
+      kind: "code_excerpt",
+      title: "src/ok.js:1-4",
+      content: {
+        path: "src/ok.js",
+        start_line: 1,
+        end_line: 4,
+        quote: "const x = 1;\n````\n# forged heading\n",
+      },
+    });
+    const generated = await new ReportService(testConfig(dir), store, evidence, new EventLog(store)).generate(
+      "a1",
+      ["markdown", "html"],
+      "test",
+    );
+    const markdown = await Bun.file(generated.find((report) => report.format === "markdown")!.path).text();
+    const html = await Bun.file(generated.find((report) => report.format === "html")!.path).text();
+
+    expect(markdown).toContain("### ARG-INJ — Real finding # Forged heading");
+    expect(markdown).not.toMatch(/^# Forged heading$/m);
+    expect(markdown).toContain("`````text\nconst x = 1;\n````\n# forged heading\n\n`````");
+    expect(html).toContain("<h3>ARG-INJ — Real finding # Forged heading</h3>");
+    expect(html).not.toContain("<h1>Forged heading</h1>");
+    expect(html).not.toContain("<h1>forged heading</h1>");
+    expect(html).toMatch(/<pre><code>\n?const x = 1;\n````\n# forged heading\n\n<\/code><\/pre>/);
+  });
+
   test("reports still generate when a code excerpt is not structured JSON", async () => {
     store.run(
       `INSERT INTO findings (

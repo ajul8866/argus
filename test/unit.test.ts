@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { open, stat } from "node:fs/promises";
+import { open, realpath, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Config } from "../src/config.ts";
@@ -11,9 +11,9 @@ import { buildFallbackPdf } from "../src/reports/pdf.ts";
 import { EventLog } from "../src/events.ts";
 import { EvidenceStore } from "../src/orchestrator/evidence.ts";
 import { ReportService } from "../src/reports/generator.ts";
-import { buildInventory, gitInfo } from "../src/repo/inventory.ts";
+import { DEFAULT_EXCLUDES, buildInventory, gitInfo } from "../src/repo/inventory.ts";
 import { importRepository } from "../src/repo/import.ts";
-import { createWorkspace, readScopedFile, verifyQuote } from "../src/repo/workspace.ts";
+import { assertAuthorizedRoot, createWorkspace, readScopedFile, verifyQuote } from "../src/repo/workspace.ts";
 import { createScopeMatcher, globToRegExp, matchesScope, extractJson, sha256 } from "../src/util.ts";
 import { redactSecrets } from "../src/security/redact.ts";
 import { credentialEnvironment, decryptSecret, encryptSecret, type StoredCredential } from "../src/security/credentials.ts";
@@ -273,6 +273,36 @@ describe("host repository folders", () => {
   });
 });
 
+describe("Argus data directory is not an importable repository", () => {
+  test("rejects the data directory and its secrets even when a parent folder is an allowed root", async () => {
+    const host = mkdtempSync(join(tmpdir(), "argus-data-root-"));
+    try {
+      const dataDir = join(host, "data");
+      const credentials = join(dataDir, "credentials");
+      const snapshots = join(dataDir, "repos", "copied-project");
+      const app = join(host, "app");
+      mkdirSync(credentials, { recursive: true });
+      mkdirSync(snapshots, { recursive: true });
+      mkdirSync(app, { recursive: true });
+      writeFileSync(join(dataDir, "master.key"), "vault-material");
+      const allowed = [host];
+      const denied = { code: "repository_not_authorized", message: "The Argus data directory is not a valid repository location." };
+
+      await expect(assertAuthorizedRoot(dataDir, allowed, dataDir)).rejects.toMatchObject(denied);
+      await expect(assertAuthorizedRoot(credentials, allowed, dataDir)).rejects.toMatchObject(denied);
+      await expect(listRepositoryFolders(allowed, { path: dataDir, dataDir })).rejects.toMatchObject(denied);
+      await expect(listRepositoryFolders(allowed, { path: credentials, dataDir })).rejects.toMatchObject(denied);
+
+      expect(await assertAuthorizedRoot(app, allowed, dataDir)).toBe(await realpath(app));
+      expect(await assertAuthorizedRoot(snapshots, allowed, dataDir)).toBe(await realpath(snapshots));
+      expect(await assertAuthorizedRoot(dataDir, [dataDir], dataDir)).toBe(await realpath(dataDir));
+      expect((await listRepositoryFolders(allowed, { path: app, dataDir })).path).toBe(await realpath(app));
+    } finally {
+      rmSync(host, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("scope and parsing", () => {
   test("glob matcher supports ** and directory paths", () => {
     expect(globToRegExp("**/*.js").test("src/server.js")).toBe(true);
@@ -281,6 +311,17 @@ describe("scope and parsing", () => {
     expect(globToRegExp("src/*.js").test("src/lib/db.js")).toBe(false);
     expect(matchesScope("src/server.js", { include: ["**/*.js"], exclude: ["src/lib/**"] })).toBe(true);
     expect(matchesScope("src/lib/db.js", { include: ["**/*.js"], exclude: ["src/lib/**"] })).toBe(false);
+  });
+
+  test("default exclusions hide nested environment files as well as root ones", () => {
+    const scope = { include: ["**/*"], exclude: DEFAULT_EXCLUDES };
+    expect(matchesScope(".env", scope)).toBe(false);
+    expect(matchesScope(".env.local", scope)).toBe(false);
+    expect(matchesScope("packages/api/.env", scope)).toBe(false);
+    expect(matchesScope("apps/web/.env.production", scope)).toBe(false);
+    expect(matchesScope("src/config.ts", scope)).toBe(true);
+    expect(matchesScope("src/env.ts", scope)).toBe(true);
+    expect(matchesScope("README.md", scope)).toBe(true);
   });
 
   test("reusable scope matching preserves glob semantics and path normalization", () => {
@@ -452,6 +493,31 @@ describe("inventory and evidence gates", () => {
     expect(inventory.auth_boundaries.length).toBeGreaterThan(0);
   });
 
+  test("default inventory skips nested environment files that would leak committed secrets", async () => {
+    const root = mkdtempSync(join(tmpdir(), "argus-env-scope-"));
+    try {
+      mkdirSync(join(root, "packages", "api"), { recursive: true });
+      writeFileSync(join(root, "app.js"), "export const ok = true;\n");
+      writeFileSync(join(root, ".env"), "ROOT_SECRET=1\n");
+      writeFileSync(join(root, "packages", "api", ".env"), "NESTED_SECRET=2\n");
+      writeFileSync(join(root, "packages", "api", ".env.local"), "NESTED_LOCAL=3\n");
+      writeFileSync(join(root, "packages", "api", "server.js"), "export const server = true;\n");
+      const inventory = await buildInventory(root, {
+        scope: { include: ["**/*"], exclude: DEFAULT_EXCLUDES },
+        maxFiles: 100,
+        maxFileBytes: 1_000_000,
+      });
+      const paths = inventory.files.map((file) => file.path);
+      expect(paths).toContain("app.js");
+      expect(paths).toContain("packages/api/server.js");
+      expect(paths).not.toContain(".env");
+      expect(paths).not.toContain("packages/api/.env");
+      expect(paths).not.toContain("packages/api/.env.local");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("quote verification rejects fabricated excerpts", async () => {
     const scope = { include: ["**/*.js"], exclude: [".git/**"] };
     const exact = await verifyQuote(fixture, scope, {
@@ -505,6 +571,20 @@ describe("repository import", () => {
   afterEach(() => {
     store.close();
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("refuses to import the Argus data directory through an allowed parent folder", async () => {
+    const hostConfig = { ...config, allowedRoots: [dirname(dir), fixture] };
+    await expect(importRepository(
+      { config: hostConfig, store },
+      { ...project, source_path: dir },
+      null,
+      "auditor@argus.local",
+    )).rejects.toMatchObject({
+      code: "repository_not_authorized",
+      message: "The Argus data directory is not a valid repository location.",
+    });
+    expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
   });
 
   test("snapshots only in-scope files and records inventory and actor metadata", async () => {

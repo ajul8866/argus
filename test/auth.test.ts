@@ -564,6 +564,63 @@ test("folder discovery requires an auditor and only lists folders within configu
   expect((await api(request())).status).toBe(403);
 });
 
+test("an auditor cannot create a project from the Argus data directory even when a parent folder is allowed", async () => {
+  const host = mkdtempSync(join(tmpdir(), "argus-host-"));
+  const dataDir = join(host, "data");
+  const credentials = join(dataDir, "credentials");
+  const app = join(host, "app");
+  mkdirSync(credentials, { recursive: true });
+  mkdirSync(app, { recursive: true });
+  writeFileSync(join(app, "index.js"), "export {}\n");
+  writeFileSync(join(credentials, "vault"), "master-key-material\n");
+  const settings = { ...config(dataDir), allowedRoots: [host] };
+  const localStore = new Store(settings, "test.sqlite");
+  const localAuth = new AuthService(settings, localStore);
+  try {
+    await localAuth.bootstrap();
+    seedDefaults(localStore, settings);
+    const events = new EventLog(localStore);
+    const manager = new HarnessManager(settings, localStore);
+    const evidence = new EvidenceStore(settings, localStore);
+    const reports = new ReportService(settings, localStore, evidence, events);
+    const engine = new AuditEngine(settings, localStore, manager, evidence, events, reports);
+    const api = createApi({ config: settings, store: localStore, auth: localAuth, events, manager, evidence, reports, engine });
+    await localAuth.createUser("auditor@test.local", "Auditor", "auditor-password-1", "auditor");
+    const login = await localAuth.login("auditor@test.local", "auditor-password-1", "local", "test");
+    const headers = {
+      cookie: `argus_session=${login.token}`,
+      "x-csrf-token": login.csrf,
+      "content-type": "application/json",
+    };
+    const create = (sourcePath: string) => api(new Request("http://localhost/api/projects", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name: "Imported", source_path: sourcePath }),
+    }));
+    const denied = { error: { code: "repository_not_authorized", message: "The Argus data directory is not a valid repository location." } };
+
+    const dataDenied = await create(dataDir);
+    expect(dataDenied.status).toBe(403);
+    expect(await dataDenied.json()).toMatchObject(denied);
+    const credentialsDenied = await create(credentials);
+    expect(credentialsDenied.status).toBe(403);
+    expect(await credentialsDenied.json()).toMatchObject(denied);
+    const listing = await api(new Request(
+      `http://localhost/api/repository-folders?path=${encodeURIComponent(dataDir)}`,
+      { headers },
+    ));
+    expect(listing.status).toBe(403);
+    expect(await listing.json()).toMatchObject(denied);
+
+    const allowed = await create(app);
+    expect(allowed.status).toBe(201);
+    expect(localStore.get<{ count: number }>("SELECT COUNT(*) AS count FROM projects")?.count).toBe(1);
+  } finally {
+    localStore.close();
+    rmSync(host, { recursive: true, force: true });
+  }
+});
+
 test("one explicit runtime assignment configures all active audit roles", async () => {
   const { api, headers } = await projectClient();
   store.run("UPDATE agent_defs SET model = 'old/model', enabled = 0 WHERE role = 'codebase_mapper'");

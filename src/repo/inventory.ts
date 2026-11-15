@@ -474,6 +474,10 @@ export async function preparePrivateGitDirectory(
       // replace it instead of truncating the shared inode.
       await rm(join(privateDirectory, "config"), { force: true });
       await writeFile(join(privateDirectory, "config"), `${config.join("\n")}\n`, { mode: 0o600 });
+      // `git archive` still honours committed `.gitattributes`. Disable
+      // `export-subst` here so a `$Format:%G?$` placeholder cannot invoke gpg.
+      await mkdir(join(privateDirectory, "info"), { recursive: true, mode: 0o700 });
+      await writeFile(join(privateDirectory, "info", "attributes"), "* -export-subst\n", { mode: 0o600 });
       return { gitDirectory: privateDirectory };
     } finally {
       if (commonHandle) await commonHandle.close().catch(() => undefined);

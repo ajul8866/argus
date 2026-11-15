@@ -44,7 +44,9 @@ LLM agents. Use it only on repositories you are authorized to assess.
   again, so a `commondir` rewrite, `.git` swap, symlink, or alternates file
   written after validation cannot redirect the archive. The private config
   contains only repository format details, so `include.path`,
-  `config.worktree`, and repository filter drivers cannot execute.
+  `config.worktree`, and repository filter drivers cannot execute. The private
+  git directory also disables committed `export-subst` attributes, so a
+  signature placeholder cannot run `gpg` during `git archive`.
   Repository metadata is recorded only when the git directory stays inside
   the authorized root.
 

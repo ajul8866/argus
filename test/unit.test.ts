@@ -710,6 +710,110 @@ describe("repository import", () => {
     expect(existsSync(marker)).toBe(false);
   });
 
+  test("does not run local or global git filter commands during a ref import", async () => {
+    const marker = join(dir, "local-filter-ran");
+    const globalMarker = join(dir, "global-filter-ran");
+    const driver = join(dir, "local-filter-driver.sh");
+    writeFileSync(driver, `#!/bin/sh\ntouch "$1"\nexec cat\n`);
+    chmodSync(driver, 0o755);
+
+    const repository = join(dir, "local-filter-repository");
+    createGitRepository(repository, {
+      ".gitattributes": "* filter=evil\n",
+      "src/app.ts": "COMMITTED_BLOB\n",
+    });
+    runGit(repository, ["config", "filter.evil.smudge", `${driver} ${marker}`]);
+    runGit(repository, ["config", "filter.evil.clean", `${driver} ${marker}`]);
+    runGit(repository, ["config", "filter.evil.process", `${driver} ${marker}`]);
+    runGit(repository, ["config", "filter.evil.required", "true"]);
+
+    const globalHome = join(dir, "filter-home");
+    mkdirSync(globalHome, { recursive: true });
+    writeFileSync(
+      join(globalHome, ".gitconfig"),
+      `[filter "evil"]\n\tsmudge = ${driver} ${globalMarker}\n\trequired = true\n`,
+    );
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = globalHome;
+    try {
+      const filteredProject = {
+        ...project,
+        source_path: repository,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      };
+      const imported = await importRepository({ config, store }, filteredProject, "HEAD", "tester");
+      expect(await Bun.file(join(imported.path, "src/app.ts")).text()).toBe("COMMITTED_BLOB\n");
+      expect(existsSync(marker)).toBe(false);
+      expect(existsSync(globalMarker)).toBe(false);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
+  test("does not expand export-subst placeholders during a ref import", async () => {
+    const marker = join(dir, "gpg-ran");
+    const wrapper = join(dir, "bin");
+    mkdirSync(wrapper);
+    writeFileSync(join(wrapper, "gpg"), `#!/bin/sh\ntouch "${marker}"\nexit 0\n`);
+    chmodSync(join(wrapper, "gpg"), 0o755);
+
+    const repository = join(dir, "subst-repository");
+    createGitRepository(repository, {
+      ".gitattributes": "note.js export-subst\n",
+      "note.js": "id:$Format:%H$\n",
+    });
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${wrapper}:${previousPath ?? "/usr/bin:/bin"}`;
+    try {
+      const substProject = {
+        ...project,
+        source_path: repository,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      };
+      const imported = await importRepository({ config, store }, substProject, "HEAD", "tester");
+      expect(await Bun.file(join(imported.path, "note.js")).text()).toBe("id:$Format:%H$\n");
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  });
+
+  test("archives a SHA-256 repository without running its filter driver", async () => {
+    const marker = join(dir, "sha256-filter-ran");
+    const driver = join(dir, "sha256-filter.sh");
+    writeFileSync(driver, `#!/bin/sh\ntouch "${marker}"\nexec cat\n`);
+    chmodSync(driver, 0o755);
+    const repository = join(dir, "sha256-repository");
+    mkdirSync(repository, { recursive: true });
+    writeFileSync(join(repository, ".gitattributes"), "* filter=evil\n");
+    writeFileSync(join(repository, "src.ts"), "SHA256_PLAIN\n");
+    runGit(repository, ["init", "-q", "-b", "main", "--object-format=sha256", "."]);
+    runGit(repository, ["add", "-A"]);
+    runGit(repository, [
+      "-c", "user.name=Argus tests",
+      "-c", "user.email=tests@example.invalid",
+      "commit", "-qm", "test fixture",
+    ]);
+    const commit = runGit(repository, ["rev-parse", "HEAD"]);
+    runGit(repository, ["config", "filter.evil.smudge", driver]);
+    const shaProject = {
+      ...project,
+      source_path: repository,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    };
+    const imported = await importRepository({ config, store }, shaProject, "HEAD", "tester");
+    expect(commit).toHaveLength(64);
+    expect(imported.commit_sha).toBe(commit);
+    expect(await Bun.file(join(imported.path, "src.ts")).text()).toBe("SHA256_PLAIN\n");
+    expect(existsSync(marker)).toBe(false);
+  });
+
   test("a concurrent commondir rewrite cannot redirect an in-progress import", async () => {
     const handoff = join(dir, "commondir-handoff");
     const inside = join(handoff, "common");

@@ -27,6 +27,9 @@
   redirects, and `objects/info/alternates`. Git metadata and ref-import objects
   are materialized into private staging before use, with a whitelisted config;
   a folder import no longer records a parent repository's commit.
+- Git-ref import disables committed `export-subst` and `ident` attributes in
+  private staging, so `$Format:%G?$` cannot invoke `gpg` and `$Id$` cannot
+  rewrite archived snapshot bytes.
 
 
 ## [0.0.2](https://github.com/ajul8866/argus/releases/tag/v0.0.2) — 2026-10-26

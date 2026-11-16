@@ -474,6 +474,11 @@ export async function preparePrivateGitDirectory(
       // replace it instead of truncating the shared inode.
       await rm(join(privateDirectory, "config"), { force: true });
       await writeFile(join(privateDirectory, "config"), `${config.join("\n")}\n`, { mode: 0o600 });
+      // `git archive` still honours committed `.gitattributes`. Disable
+      // `export-subst` and `ident` so `$Format:%G?$` cannot invoke gpg and
+      // `$Id$` cannot rewrite snapshot bytes away from the committed blob.
+      await mkdir(join(privateDirectory, "info"), { recursive: true, mode: 0o700 });
+      await writeFile(join(privateDirectory, "info", "attributes"), "* -export-subst -ident\n", { mode: 0o600 });
       return { gitDirectory: privateDirectory };
     } finally {
       if (commonHandle) await commonHandle.close().catch(() => undefined);

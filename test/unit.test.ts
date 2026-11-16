@@ -710,6 +710,100 @@ describe("repository import", () => {
     expect(existsSync(marker)).toBe(false);
   });
 
+  test("does not run a repository or global fsmonitor command during a ref import", async () => {
+    const localMarker = join(dir, "local-fsmonitor-ran");
+    const globalMarker = join(dir, "global-fsmonitor-ran");
+    const localHook = join(dir, "local-fsmonitor.sh");
+    const globalHook = join(dir, "global-fsmonitor.sh");
+    writeFileSync(localHook, `#!/bin/sh\ntouch "${localMarker}"\nexit 0\n`);
+    writeFileSync(globalHook, `#!/bin/sh\ntouch "${globalMarker}"\nexit 0\n`);
+    chmodSync(localHook, 0o755);
+    chmodSync(globalHook, 0o755);
+
+    const repository = join(dir, "fsmonitor-repository");
+    createGitRepository(repository, { "src/app.ts": "export const value = 1;\n" });
+    runGit(repository, ["config", "core.fsmonitor", localHook]);
+
+    const globalHome = join(dir, "fsmonitor-home");
+    mkdirSync(globalHome, { recursive: true });
+    writeFileSync(join(globalHome, ".gitconfig"), `[core]\n\tfsmonitor = ${globalHook}\n`);
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = globalHome;
+    try {
+      const fsmonitorProject = {
+        ...project,
+        source_path: repository,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      };
+      const imported = await importRepository({ config, store }, fsmonitorProject, "HEAD", "tester");
+      expect(await Bun.file(join(imported.path, "src/app.ts")).text()).toBe("export const value = 1;\n");
+      expect(existsSync(localMarker)).toBe(false);
+      expect(existsSync(globalMarker)).toBe(false);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
+  test("does not run tar.<format>.command from local or global git config during a ref import", async () => {
+    const localMarker = join(dir, "local-tar-command-ran");
+    const globalMarker = join(dir, "global-tar-command-ran");
+    const localDriver = join(dir, "local-tar-command.sh");
+    const globalDriver = join(dir, "global-tar-command.sh");
+    writeFileSync(localDriver, `#!/bin/sh\ntouch "${localMarker}"\nexec cat\n`);
+    writeFileSync(globalDriver, `#!/bin/sh\ntouch "${globalMarker}"\nexec cat\n`);
+    chmodSync(localDriver, 0o755);
+    chmodSync(globalDriver, 0o755);
+
+    const repository = join(dir, "tar-command-repository");
+    createGitRepository(repository, { "src/app.ts": "export const value = 1;\n" });
+    runGit(repository, ["config", "tar.tar.command", localDriver]);
+    runGit(repository, ["config", "tar.ustar.command", localDriver]);
+
+    const globalHome = join(dir, "tar-command-home");
+    mkdirSync(globalHome, { recursive: true });
+    writeFileSync(
+      join(globalHome, ".gitconfig"),
+      `[tar "tar"]\n\tcommand = ${globalDriver}\n[tar "ustar"]\n\tcommand = ${globalDriver}\n`,
+    );
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = globalHome;
+    try {
+      const tarProject = {
+        ...project,
+        source_path: repository,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      };
+      const imported = await importRepository({ config, store }, tarProject, "HEAD", "tester");
+      expect(await Bun.file(join(imported.path, "src/app.ts")).text()).toBe("export const value = 1;\n");
+      expect(existsSync(localMarker)).toBe(false);
+      expect(existsSync(globalMarker)).toBe(false);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
+  test("does not expand ident placeholders during a ref import", async () => {
+    const repository = join(dir, "ident-repository");
+    createGitRepository(repository, {
+      ".gitattributes": "note.js ident\n",
+      "note.js": "id:$Id$\n",
+    });
+    const identProject = {
+      ...project,
+      source_path: repository,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    };
+    const imported = await importRepository({ config, store }, identProject, "HEAD", "tester");
+    expect(await Bun.file(join(imported.path, "note.js")).text()).toBe("id:$Id$\n");
+  });
+
   test("a concurrent commondir rewrite cannot redirect an in-progress import", async () => {
     const handoff = join(dir, "commondir-handoff");
     const inside = join(handoff, "common");

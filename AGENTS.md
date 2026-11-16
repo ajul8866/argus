@@ -2,7 +2,7 @@
 
 Argus (`argus-audit`, v0.0.2) is a self-hosted source-code security audit workspace. It imports an authorized repository snapshot, maps it, discovers candidate vulnerabilities, confirms them in independent harness sessions, persists evidence-backed findings, re-verifies them, and exports deterministic reports. Bun + strict TypeScript + SQLite + a vanilla TypeScript SPA. AGPL-3.0-only.
 
-Deeper references: `docs/ARCHITECTURE.md`, `docs/API.md`, `docs/DATABASE.md`, `docs/HARNESSES.md`, `docs/SECURITY.md`, `docs/DECISIONS.md`.
+Deeper references: `docs/ARCHITECTURE.md`, `docs/API.md`, `docs/DATABASE.md`, `docs/HARNESSES.md`, `docs/SECURITY.md`, `docs/DECISIONS.md`, `docs/DYNAMIC.md`.
 
 ## Project Overview
 
@@ -10,7 +10,7 @@ Deeper references: `docs/ARCHITECTURE.md`, `docs/API.md`, `docs/DATABASE.md`, `d
 - **Evidence is the product.** A finding needs a source quote that matches the imported snapshot and appears on an affected file. Two agreeing models are not sufficient.
 - **Determinism where it matters.** Phase 4 (finding persistence) and Phase 6 (reports) are code, not model calls. Reports read only the database.
 - **Independence.** A discovery session cannot validate its own candidate; retest uses a fresh session, and optionally a distinct harness.
-- **Fail closed.** No silent harness substitution, no permission-bypass flags, read-only workspaces by default, missing prerequisites produce classified task failures.
+- **Fail closed.** No silent harness substitution, no permission-bypass flags, missing prerequisites produce classified task failures. Session copies are writable; the imported snapshot stays the evidence authority.
 - **Single-process coordinator.** SQLite is the source of truth; the UI never fabricates task, finding, harness, or report state.
 
 ## Architecture & Data Flow
@@ -72,6 +72,7 @@ Hand-rolled DOM with the `h()` hyperscript helper (`web/src/ui.ts`), hash routin
 | `src/repo/` | Authorized import, inventory/scope matching, per-session workspace copies |
 | `src/reports/` | Report data assembly, Markdown/JSON/HTML, Chrome and fallback PDF |
 | `src/local/` | On-disk Skill and MCP discovery plus the persisted catalog |
+| `src/dynamic/` | Targets, in-process broker, graphs, PoC confirmation, optional container runtime |
 | `src/security/` | AES-256-GCM credential vault, secret redaction |
 | `src/db/` | `Store` query helper and versioned migrations |
 | `web/src/` | Dashboard source: `main.ts`, `ui.ts`, `api.ts`, `pages/`, `components/` |
@@ -109,13 +110,13 @@ Before handing off a change: `bun run check && bun run build && bash -n install.
 
 - Throw `AppError` (or `Error`) and let `createApi` map it once; there is no `Result` type on the HTTP path. Helpers `badRequest`, `unauthorized`, `forbidden`, `notFound`, `conflict` live in `src/api/http.ts`.
 - Agent output is the exception: `validateAgainstSchema` returns `{ ok: true } | { ok: false }` because failures are classified task outcomes, not HTTP errors.
-- Validate and authorize before doing work (`assertAuthorizedRoot`, role checks, approval checks). Fail closed on missing settings or approvals.
+- Validate and authorize before doing work (`assertAuthorizedRoot`, role checks, CSRF, token scopes). Fail closed on missing settings or out-of-scope targets.
 - Never log or return secrets. Redact through `src/security/redact.ts` before events, task errors, and reports. The vault decrypts only into the harness child environment; API responses expose `last4` only.
 
 **Persistence**
 
 - Use `store.get/all/run/changes(sql, ...params)` and `store.transaction(fn)` with positional `?` placeholders. SQLite calls are synchronous; transaction callbacks must stay synchronous.
-- Migrations are ordered, transactional, forward-only, and applied once. Never edit an applied migration — append a new `{ version, name, sql }` entry. Current versions are 1 and 2.
+- Migrations are ordered, transactional, forward-only, and applied once. Never edit an applied migration — append a new `{ version, name, sql }` entry. Current schema versions are 1–14 in `src/db/migrations.ts`.
 - Evidence, verifications, and finding provenance are append-only via triggers. Do not update/delete those rows; add new records.
 - Store timestamps as ISO strings from `now()`, booleans as INTEGER 0/1, and JSON as `TEXT` via `toJson`/`parseJson`.
 
@@ -159,7 +160,8 @@ Before handing off a change: `bun run check && bun run build && bash -n install.
 | `src/orchestrator/schemas.ts` | Agent JSON contracts and validator |
 | `src/harness/manager.ts` | Harness selection, caching, detection, credential env |
 | `src/harness/pi.ts`, `src/harness/claude.ts` | Real adapter command lines and stream parsing |
-| `src/repo/import.ts`, `src/repo/workspace.ts` | Authorized snapshots and read-only session copies |
+| `src/repo/import.ts`, `src/repo/workspace.ts` | Authorized snapshots and writable session copies |
+| `src/dynamic/targets.ts`, `src/dynamic/executor.ts` | Live-target snapshots and the default GET baseline executor |
 | `src/reports/generator.ts` | Deterministic four-format report generation |
 | `src/local/discovery.ts` | Skill/MCP config discovery and normalization |
 | `web/src/main.ts` | SPA entry, route table, auth shell, SSE refresh |
@@ -194,7 +196,7 @@ Common environment variables (full list in `.env.example` and `src/config.ts`):
 
 ## Testing & QA
 
-- Runner is `bun:test`; the suite is exactly the five files listed in `package.json` `scripts.test`. A new `test/*.test.ts` must be added there or it will not run in CI.
+- Runner is `bun:test`; `package.json` `scripts.test` is `bun test test/*.test.ts`. A new `test/*.test.ts` is included automatically.
 - Tests use temporary directories and private SQLite files (`new Store(config, "test.sqlite")`), close the store, then delete the directory. No test calls a model or the network.
 - `test/engine.test.ts` drives the real six-phase state machine with `fakeManager()`, scripted per-role JSON, and the `test/fixtures/vulnerable-app` snapshot. Extend the scripted results instead of invoking Pi/Claude.
 - The fixture is intentionally vulnerable (hardcoded JWT secret, SQL concatenation, IDOR, command injection, path handling, error leakage, prompt-injection README text). Never deploy it; never "fix" it.

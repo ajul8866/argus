@@ -20,12 +20,10 @@ that starts Argus. Use `ARGUS_PI_BIN` and `ARGUS_CLAUDE_BIN` for custom binary
 paths. In the dashboard, open **Settings → Open AI setup → Configure** and
 select your provider and model. The initial Pi preset may not exist in your
 provider's model catalog. Press **Use for audits** to assign that runtime and
-its model and configured tools to all four audit roles in one action. Roles
-inherit subsequent tool changes automatically; the default four read tools are
-not a fixed ceiling. An optional restriction lives in the role's advanced settings.
-Only the chosen runtime is
-needed; validation still runs in separate sessions. Per-role customization is
-available under **Advanced tools → Agents**.
+its model to all four audit roles in one action. Each role then uses that
+runtime's native tools. Per-role tool allowlists were removed. Only the
+chosen runtime is needed; validation still runs in separate sessions.
+Per-role customization is available under **Advanced tools → Agents**.
 
 Supply the provider's expected environment variable through Argus
 **Settings → Credentials**, or configure the supported harness environment
@@ -52,7 +50,7 @@ tasks can call the provider and consume credits.
 | Resume | supported by Pi; not used for audit steps | `--resume`; not used for audit steps |
 | Cancellation | RPC `abort`, then terminate | process terminate |
 | Cost reporting | usage/cost in message events | `total_cost_usd` in result |
-| Permission control | tool allowlist + no built-in toolset | permission mode + allowed/disallowed tools |
+| Permission control | native tools + extra search tools | `acceptEdits` + native allowlist (health check uses `plan`) |
 | Native subagents | not used | not used |
 
 ## Pi adapter (`src/harness/pi.ts`)
@@ -108,8 +106,8 @@ are written to that HOME's `.pi/agent/mcp.json`; `--no-mcp` is replaced by
 - Provider credentials are injected from the platform vault or an explicit
   config. Pi's own OAuth file is not copied into the sandbox.
 - With `bwrap`, only the managed Pi launcher/install, the Node runtime, system
-  libraries, `/etc` essentials, the sanitized home, and the read-only workspace
-  are mounted. `/root` is otherwise absent.
+  libraries, `/etc` essentials, the sanitized home, and the writable session
+  copy are mounted. `/root` is otherwise absent.
 
 ## Claude Code adapter (`src/harness/claude.ts`)
 

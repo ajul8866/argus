@@ -129,26 +129,26 @@ absence of vulnerabilities. Human review is required.
 - Redaction is pattern-based and best-effort. It will not catch every custom
   secret format. Do not paste credentials into prompts or source fixtures.
 
-## Approvals and destructive actions
+## Approvals and native tools
 
-- `security.allow_shell_tools` is false by default. Enabling it requires an
-  administrator and a second explicit confirmation.
-- Audit roles inherit the runtime's configured tool list unless an administrator
-  saves an explicit role restriction. Changes to runtime tools apply to new
-  sessions; active sessions keep their existing permissions. Empty lists disable
-  native tools rather than falling back to a runtime default.
-- When `security.require_approval_for_shell` is enabled, any role with shell tools
-  causes tasks to be created in `waiting_approval`; an administrator must decide.
-  Denial cancels the task. Execution rechecks global policy and required approval.
-  There is no implicit approval and no fallback to an unrestricted mode.
-- `security.allow_writable_workspace` is false by default and follows the same
-  shape: administrator confirmation, an explicit per-audit request, and a
-  per-task `allow_writable_workspace` approval. A task that requests both shell
-  tools and write access needs both decisions before it can queue.
-- MCP access is an administrator-managed role/skill grant, separate from the
-  per-task shell approval mechanism. Access changes are recorded in the audit
-  log; observed tool starts retain session/task/role provenance. Discovery does
-  not run or probe the configured external services.
+Shell, writable-workspace, and per-role tool-allowlist settings were removed.
+Every harness task receives a fresh isolated writable copy and the selected
+runtime's native tools. `writable_workspace` on an audit, `allowed_tools` /
+`inherit_tools` / `allow_shell` on a role, and `confirm_shell` /
+`confirm_writable_workspace` on settings updates are rejected.
+
+- Pi keeps its built-in read/bash/edit/write tools and adds `grep`/`find`/`ls`.
+- Claude Code audit sessions use `--permission-mode acceptEdits` and the native
+  allowlist including Bash, Edit, Write, NotebookEdit, WebFetch, and WebSearch.
+- There is no task-level approval gate for those tools. Historical
+  `allow_shell_tools` / `allow_writable_workspace` approval rows were retired;
+  the Approvals API remains for leftover rows.
+- MCP access is still an administrator-managed role/skill grant. Access changes
+  are recorded in the audit log; observed tool starts retain session/task/role
+  provenance. Discovery does not run or probe the configured external services.
+- Isolation is the sandbox or container, the imported snapshot remaining
+  read-only, and quote verification against that snapshot. A prompt is not the
+  write boundary.
 
 ## Evidence integrity
 
@@ -197,8 +197,10 @@ absence of vulnerabilities. Human review is required.
 1. **Model correctness.** Static reasoning can miss framework behavior or
    produce a plausible-but-wrong claim. The evidence gate helps, but human
    review is mandatory.
-2. **Prompt injection.** Read-only tools, scope, and validation reduce impact;
-   they do not guarantee the model follows policy.
+2. **Prompt injection.** Scope, schema validation, and the evidence gate reduce
+   impact; they do not guarantee the model follows policy. Native shell and
+   write tools in the session copy increase what a manipulated agent can try
+   inside that copy.
 3. **Harness credentials inside the harness process.** A harness must hold a
    provider token to call its model. The read-only agent tools run inside that
    harness process, so in principle a manipulated or malicious agent could try

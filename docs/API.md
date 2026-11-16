@@ -113,12 +113,42 @@ offsets return 400, and paths outside configured locations return 403.
 Import writes an immutable snapshot under `$ARGUS_DATA_DIR/repos/...`, records
 the commit/ref, and rejects empty/invalid snapshots.
 
+## Targets (dynamic / hybrid)
+
+| Method | Path | Role | Purpose |
+|---|---|---|---|
+| `GET` | `/api/projects/:id/targets` | any | List targets (`target:read`) |
+| `POST` | `/api/projects/:id/targets` | auditor | Create a target (`target:manage`) |
+| `GET` | `/api/targets/:id/authorizations` | any | List authorizations |
+| `POST` | `/api/targets/:id/authorizations` | auditor | Record who authorized the test window |
+| `GET` | `/api/targets/:id/identities` | any | List test identities (no secrets) |
+| `POST` | `/api/targets/:id/identities` | auditor | Register a test identity |
+
+`POST` target body: `label`, `base_url` (absolute `http`/`https`, no
+credentials), `environment`, `allowed_hosts` (non-empty hostnames), optional
+`allowed_cidrs`, `allowed_methods` (default `GET`/`HEAD`/`OPTIONS`), `max_rps`
+(default 5), `tls_required` (default true), optional `repository_id`.
+Authorization needs `authorized_by`, `authorization_ref`, ISO `valid_from` /
+`valid_until`, and `authorized_actions`. Identity needs `label`, `role`,
+`auth_kind` (`none|header|cookie|basic`); authenticated kinds require
+`secret_ref` naming a `test-identity` credential.
+
+## Adapter tokens
+
+| Method | Path | Role | Purpose |
+|---|---|---|---|
+| `GET` | `/api/tokens` | auditor | List the caller's unrevoked tokens (no raw secret) |
+| `POST` | `/api/tokens` | auditor | `{label,scopes,project_id?,audit_id?,expires_at?}`. Returns `raw` once |
+| `DELETE` | `/api/tokens/:id` | auditor | Revoke a token owned by the caller |
+
+Cookie session required. A worker token cannot mint another token.
+
 ## Audits and tasks
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
 | `GET` | `/api/audits?project_id=` | any | Audit list |
-| `POST` | `/api/audits` | auditor | `{project_id,repository_id?,overrides?}` |
+| `POST` | `/api/audits` | auditor | `{project_id,repository_id?,mode?,target_id?,overrides?}`. `mode` is `static` (default), `dynamic`, or `hybrid` |
 | `GET` | `/api/audits/:id` | any | Phases, coverage, counts, sessions, reports, evidence chain |
 | `POST` | `/api/audits/:id/start` | auditor | Start the six-phase workflow |
 | `POST` | `/api/audits/:id/cancel` | auditor | Stop active/queued work |
@@ -128,6 +158,10 @@ the commit/ref, and rejects empty/invalid snapshots.
 | `GET` | `/api/audits/:id/events?after=` | any | Event replay |
 | `GET` | `/api/audits/:id/stream?after=` | any | Audit SSE stream |
 | `GET` | `/api/audits/:id/evidence` | any | Evidence metadata + chain verification |
+| `GET` | `/api/audits/:id/exploration` | any | Assets, exploration graph, anchors, coverage |
+| `POST` | `/api/audits/:id/tasks` | auditor | Create a task while running; `explore*` also needs `audit:launch_dynamic` |
+| `POST` | `/api/audits/:id/candidates` | auditor | Propose a dynamic candidate (`audit:propose_candidate`) |
+| `POST` | `/api/candidates/:id/confirm` | auditor | Replay PoC checks (`audit:confirm_candidate`) |
 | `GET` | `/api/audits/:id/reports` | any | Report history |
 | `POST` | `/api/audits/:id/reports` | auditor | `{formats?}`; default all four |
 | `GET` | `/api/tasks?audit_id=&status=` | any | Cross-audit task queue |
@@ -137,12 +171,16 @@ the commit/ref, and rejects empty/invalid snapshots.
 
 Audit overrides: `max_areas`, `max_candidates_per_area`, `max_confirmations`,
 `max_reverifications`, `max_concurrent_agents`, `task_timeout_ms`,
-`require_distinct_harness_for_retest`, `max_cost_usd`, `harness_overrides`, and
-`writable_workspace`. `max_cost_usd: 0` is a real ceiling: any positive reported
-session cost fails the audit. Omit the field or send `null` for no audit-level
-cost ceiling. `writable_workspace: true` is rejected unless
-`security.allow_writable_workspace` is already enabled; it makes every harness
-task require an `allow_writable_workspace` approval.
+`require_distinct_harness_for_retest`, `max_cost_usd`, `harness_overrides`,
+`max_tasks`, `max_requests`, and `max_runtime_minutes`. `max_cost_usd: 0` is a
+real ceiling: any positive reported session cost fails the audit. Omit the
+field or send `null` for no audit-level cost ceiling. `writable_workspace` is
+rejected: every agent task already receives an isolated writable copy.
+
+`mode` `dynamic` or `hybrid` also needs `target_id` on the same project.
+Starting those modes writes an immutable scope snapshot. `dynamic` may omit a
+repository; `static` and `hybrid` still require one. See
+[dynamic audits](DYNAMIC.md).
 
 Project `max_concurrent_agents` must be `null` or an integer from 1 through 16.
 Audit concurrency, confirmation, and timeout overrides are validated before
@@ -153,7 +191,7 @@ The dashboard inherits server audit defaults and only submits edited overrides.
 For a project with no snapshot, it imports files before creating the audit.
 When start fails after creation, the saved audit is opened for recovery rather
 than leaving a form that could create another audit. Saved snapshots, limits,
-cost, deferred start, and enabled write requests are under Advanced audit settings.
+cost, deferred start, and audit mode/target are under Advanced audit settings.
 
 Task result shape for agent tasks:
 
@@ -191,40 +229,38 @@ excerpts were verified by the platform. Reverification history is immutable.
 |---|---|---|---|
 | `GET` | `/api/harnesses` | any | Detect both; return status/config/models |
 | `GET` | `/api/harnesses/:kind` | any | Detection for `pi|claude-code` |
-| `PUT` | `/api/harnesses/:kind` | admin | Save executable/model/permissions/tools |
+| `PUT` | `/api/harnesses/:kind` | admin | Save executable/model/env/extra_args |
 | `POST` | `/api/harnesses/:kind/check` | auditor | Real auth/health check |
 | `POST` | `/api/harnesses/:kind/test` | admin | Real minimal agent invocation |
 | `POST` | `/api/harnesses/:kind/assign` | admin | Explicitly use this runtime for all four audit roles |
 | `GET` | `/api/harnesses/:kind/models` | any | Detected model list |
 | `GET` | `/api/agents` | any | Role definitions |
-| `PUT` | `/api/agents/:role` | admin | Harness/model/tools/limits/enabled |
+| `PUT` | `/api/agents/:role` | admin | Harness/model/limits/instructions/enabled |
 
 Harness config `env` values are redacted in reads. Secret-looking values must be
 stored through `/api/credentials`, not harness env. `bypassPermissions` and
 `dangerously-skip-permissions` are rejected.
 
-`POST /api/harnesses/:kind/assign` atomically assigns the four audit roles to
-the selected runtime, clears role-specific model overrides to inherit its model,
-enables those roles, and sets `inherit_tools: true` so every tool in the runtime's
-configured `allowed_tools` is used. Later runtime tool changes are inherited
-automatically. It clears the legacy per-role shell flag and sets `audit.require_distinct_harness_for_retest`
-to false for future audits. Existing sessions and audit configurations are not
-rewritten. No tool-cap expansion or runtime substitution is performed.
+`POST /api/harnesses/:kind/assign` assigns the four audit roles
+(`codebase_mapper`, `security_researcher`, `independent_validator`,
+`retest_auditor`) to that runtime, clears per-role model overrides so they
+inherit the runtime model, enables those roles, and sets
+`audit.require_distinct_harness_for_retest` to false for future audits.
+Existing sessions and saved audit configurations are not rewritten. No runtime
+substitution is performed.
 
-`GET /api/agents` returns each role's resolved `allowed_tools` and `inherit_tools`
-boolean. New audit roles inherit runtime tools. `PUT /api/agents/:role` accepts
-`inherit_tools: false` with an explicit `allowed_tools` restriction; sending only
-`allowed_tools` also opts out of inheritance for compatibility. Sending
-`inherit_tools: true` restores automatic inheritance. An empty list means no
-native tools. Global shell policy, configured task approvals, workspace write
-access, and linked MCP server assignments remain independent controls.
+`GET /api/agents` returns the stored role definition (harness, model, limits,
+instructions, enabled). `PUT /api/agents/:role` updates those fields.
+`allowed_tools`, `inherit_tools`, and `allow_shell` are rejected: roles use
+the selected harness's native tools. Linked MCP grants remain a separate
+administrator control.
 
 ## Settings, users, approvals
 
 | Method | Path | Role | Purpose |
 |---|---|---|---|
 | `GET` | `/api/settings` | any | Settings and runtime posture; credential metadata only for admins |
-| `PUT` | `/api/settings` | admin | Whitelisted settings; newly enabling shell requires `confirm_shell:true`; newly enabling writable workspaces requires `confirm_writable_workspace:true`; `security.sandbox_mode` accepts `auto`, `bwrap`, or `none` |
+| `PUT` | `/api/settings` | admin | Whitelisted keys from `DEFAULT_SETTINGS`; `confirm_shell` and `confirm_writable_workspace` are rejected; `security.sandbox_mode` is `auto`, `bwrap`, or `none` |
 | `GET` | `/api/credentials` | admin | Metadata only |
 | `PUT` | `/api/credentials` | admin | `{provider,env_var,value}`; encrypted |
 | `DELETE` | `/api/credentials/:id` | admin | Delete |

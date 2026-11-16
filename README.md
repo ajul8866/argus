@@ -178,6 +178,7 @@ exposing the dashboard through a reverse proxy.
 | [Harnesses](docs/HARNESSES.md) | Pi, Claude Code, credentials, permissions, and runtime protocols |
 | [Skills & MCP](docs/LOCAL_RESOURCES.md) | Automatic discovery, role grants, linked servers, and usage |
 | [Architecture](docs/ARCHITECTURE.md) | Audit phases, evidence handling, recovery, and reports |
+| [Dynamic audits](docs/DYNAMIC.md) | Live targets, broker replay, tokens, and confirmation |
 | [API](docs/API.md) | Authentication, endpoints, and event streaming |
 | [Deployment](deploy/README.md) | Docker, persistence, and operational configuration |
 | [Security](docs/SECURITY.md) | Trust boundaries, isolation, and known limitations |

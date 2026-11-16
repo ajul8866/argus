@@ -20,10 +20,10 @@
 │        Harness Manager        │          Evidence + Report               │
 │  detection · health · routes  │  SHA-256 chain · append-only rows        │
 │  concurrency · timeout        │  Markdown/JSON/HTML/PDF                   │
-├───────────────┬───────────────┴───────────────────────────────────────────┤
-│ PiAdapter     │ ClaudeCodeAdapter                                         │
-│ real RPC      │ real CLI stream-json                                      │
-└───────────────┴───────────────────────────────────────────────────────────┘
+├───────────────┬───────────────┼───────────────────────────────────────────┤
+│ PiAdapter     │ ClaudeCode    │  Dynamic layer (`src/dynamic/`)           │
+│ real RPC      │ stream-json   │  targets · in-process broker · graphs     │
+└───────────────┴───────────────┴───────────────────────────────────────────┘
         │                                   │
    `pi --mode rpc`                  `claude -p ...`
    JSONL stdin/stdout               structured NDJSON
@@ -65,6 +65,8 @@ phase barriers. Executor and intent contracts live in `src/dynamic/types.ts`;
 the engine re-exports them for existing callers. The default executor uses an
 in-process broker for a baseline GET probe. Container runtime support is a
 separate integration surface; server composition does not select it by default.
+Operator setup, token scopes, and confirmation rules are in
+[docs/DYNAMIC.md](DYNAMIC.md).
 
 ### 2.2 Harness Manager
 
@@ -127,17 +129,19 @@ finding or report fact.
 
 #### Claude Code
 
-- Spawned as `claude -p <prompt> --output-format stream-json --verbose
-  --permission-mode plan --permission-prompts none --strict-mcp-config
-  --mcp-config '{"mcpServers":{}}' ...`.
+- Audit runs spawn `claude -p <prompt> --output-format stream-json --verbose
+  --permission-mode acceptEdits --permission-prompts none --strict-mcp-config
+  --mcp-config <session file> ...`. Health checks use `--permission-mode plan`
+  and a Read-only tool list.
 - The prompt is passed as an argument; JSON Schema is enforced with
   `--json-schema`. Structured output is read from `result.structured_output`.
 - Assistant text/thinking and tool use/results are normalized from stream
   records. `result` is the completion record; non-zero exit or `is_error`
   fails the task.
-- `--allowedTools` is an explicit allowlist; the platform additionally passes
-  `--disallowedTools` for Bash/Edit/Write/NotebookEdit/WebFetch/WebSearch when
-  not explicitly allowed. Permission bypass flags are rejected.
+- `--allowedTools` is the native set `Read,Grep,Glob,LS,Bash,Edit,Write,
+  NotebookEdit,WebFetch,WebSearch` plus any linked MCP namespaces. There is
+  no per-role tool allowlist and no `--disallowedTools` list. Permission
+  bypass flags are still rejected by the API.
 - Session identity is allocated by Argus. Cancellation kills the process.
 - Credentials come from the harness's configured environment (`ANTHROPIC_*`
   keys found in the host Claude settings) or platform-stored credentials.
@@ -244,7 +248,8 @@ package registries. The imported snapshot remains the evidence authority.
 Single-page app with a tiny DOM helper, hash router, REST client with CSRF, and
 one EventSource for live updates. Pages: Dashboard, Projects, Project detail,
 Audits, Audit detail (tasks/findings/coverage/decisions/evidence/reports/
-activity/sessions), Explorer (source/architecture/coverage), Harnesses, Agents,
+activity/sessions), Explorer (source/architecture/coverage), Exploration,
+Harnesses, Agents,
 Tasks, Approvals, Findings, Reports, Settings, Login.
 
 All data is fetched from implemented APIs. The UI never fabricates a finding,

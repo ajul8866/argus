@@ -78,4 +78,12 @@ ARGUS_SANDBOX=bwrap bun run start
 ```
 
 Use the Docker route when nested namespaces are unavailable, and treat the
-container plus read-only workspace copies as the boundary.
+container plus disposable workspace copies as the boundary. The imported
+snapshot remains read-only.
+
+## 6. Broker and worker images (not the default)
+
+`deploy/Dockerfile.broker` and `deploy/Dockerfile.worker` build the optional
+per-audit container runtime in `src/dynamic/runtime.ts`. The Compose file
+above does **not** start those services. Default dynamic audits use the
+in-process broker described in [docs/DYNAMIC.md](../docs/DYNAMIC.md).

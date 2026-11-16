@@ -67,18 +67,14 @@ hashes in the inventory.
 but the workspace, explorer, and evidence checker independently enforce scope.
 Files outside the include globs never enter the snapshot.
 
-**Read-only workspaces by default.** Agents have no write/edit tools by
-default. The workspace is also mounted read-only under Bubblewrap. This
-deliberately rules out exploit execution and repository mutation. A writable
-workspace is a gated exception, not a mode switch: it requires the global
-`security.allow_writable_workspace` setting (administrator plus a second
-explicit confirmation), a `writable_workspace` request on the individual
-audit, and an `allow_writable_workspace` approval for every task. The runtime
-re-checks both the setting and the approval at task start and fails the task
-closed if either is missing. Only the disposable session copy becomes
-writable; the imported snapshot remains the quote-verification source, so
-write access cannot forge evidence. Defaults, existing audits, and the
-`workspace-copy` host/container boundary are unchanged.
+**Isolated writable copies, read-only evidence.** Every agent task gets a
+fresh 0700 copy of in-scope files. Pi and Claude Code run with their native
+tools, including shell and edits, inside that copy. Bubblewrap (when used)
+binds the copy read-write and keeps the imported snapshot, host home, and
+Argus data unmounted. Quote verification always reads the snapshot, never the
+session copy, so workspace edits cannot forge evidence. The previous
+shell/writable settings and per-task approvals were removed because they
+duplicated a boundary the sandbox already owns.
 
 ## Harnesses
 
@@ -91,10 +87,10 @@ compaction, and event stream are used. Claude Code's native CLI loop, tool
 permissions, structured output, session identity, and cost reporting are used.
 Argus does not reimplement either internal loop.
 
-**Permission policy.** Claude Code is started in `plan` mode with an explicit
-tool allowlist and disallowed dangerous tools. Shell tools are off by default.
-If enabled, they require a per-task approval. The platform rejects permission
-bypass flags.
+**Permission policy.** Claude Code audit sessions use `acceptEdits` and a
+fixed native tool allowlist. Health checks stay on `plan` with Read only.
+The API still rejects permission-bypass flags. Role-level tool lists are not
+a second policy layer.
 
 ## Isolation
 
@@ -115,7 +111,9 @@ need the stronger local boundary should run on a host with Bubblewrap and set
 - Harness session resume across server restart (adapter interface supports it;
   the audit workflow intentionally uses fresh sessions).
 - OIDC/SAML, multi-tenancy, clustered execution, and distributed locks.
-- Live exploit execution and dynamic application testing.
+- A harness-backed dynamic planner/worker. The default executor is an
+  in-process GET baseline through the broker; `ContainerRuntime` is not
+  selected by `src/server.ts`. See [docs/DYNAMIC.md](DYNAMIC.md).
 - Automatic SCM synchronization/webhooks.
 - Optional agent-written executive narrative is not implemented; the report
   path is deterministic.

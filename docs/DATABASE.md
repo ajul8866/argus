@@ -11,8 +11,11 @@ users 1─* auth_sessions
 users 1─* projects (created_by)
 projects 1─* repositories
 projects 1─* audits
+projects 1─* project_targets
 repositories 1─* audits
 audits 1─* audit_phases (1..6)
+audits 1─1 audit_scope_snapshots
+users 1─* api_tokens
 audits 1─* tasks
 audits 1─* agent_sessions
 audits 1─* candidates
@@ -46,7 +49,9 @@ The raw token lives only in the HttpOnly cookie. Deleting a session revokes it.
 ### `settings`
 
 Key/value JSON. Defaults are seeded in `src/settings.ts`; updates are validated
-against a whitelist and type/range rules.
+against that whitelist and type/range rules. The former
+`security.allow_shell_tools`, `security.allow_writable_workspace`, and
+`security.require_approval_for_shell` keys are deleted by migration 13.
 
 ### `provider_credentials`
 
@@ -60,12 +65,10 @@ capabilities JSON, config JSON, detection timestamps.
 
 ### `agent_defs`
 
-Role-primary-keyed. Harness, model, system instructions, allowed tools JSON,
-max duration, retries, concurrency, budget, shell flag, enabled flag.
-Migration 3 adds `inherit_tools`: inherited roles resolve their tools from the
-chosen runtime, including audit overrides. Existing untouched four-tool audit
-roles are migrated to inheritance; custom restrictions and legacy shell choices
-are preserved. Stored `allowed_tools` remains the explicit list for restricted roles.
+Role-primary-keyed. Harness, model, system instructions, max duration, retries,
+concurrency, budget, enabled flag. Historical `allowed_tools`, `inherit_tools`,
+and shell-flag columns may still exist from earlier migrations; the API no
+longer accepts those fields. Roles use the selected harness's native tools.
 
 ### `projects`
 
@@ -81,8 +84,12 @@ imports), graph JSON, file count, total bytes, imported timestamp.
 
 ### `audits`
 
-Project, repository, status, current phase, config JSON, creator, timestamps,
-error. Statuses: `queued|running|completed|completed_with_errors|failed|cancelling|cancelled`.
+Project, optional repository, `mode` (`static|dynamic|hybrid`), optional
+`exploration_status` (`not_applicable|open|closing|closed`), `stop_reason`,
+`exploration_cost_usd`, status, current phase, config JSON, creator,
+timestamps, error. Statuses:
+`queued|running|completed|completed_with_errors|failed|cancelling|cancelled`.
+`dynamic` audits may have a null `repository_id`.
 
 ### `audit_phases`
 
@@ -109,15 +116,18 @@ notes, updated timestamp. Includes an `unmapped` pseudo-area.
 
 ### `agent_sessions`
 
-Audit, task, role, harness, model, status, read-only workspace, actual sandbox
+Audit, task, role, harness, model, status, workspace path, actual sandbox
 mode, harness session reference, PID, exit code, normalized usage JSON,
-metadata, timing, error. Each retry gets a new session.
+metadata, timing, error. Each retry gets a new session. The workspace is a
+writable copy; the imported snapshot stays read-only.
 
 ### `candidates`
 
-Discovery output: area, discovery task/session, title, category, CWE, severity,
-status `discovered|confirming|confirmed|refuted|inconclusive|duplicate|persisted`,
-finding id, full payload JSON (includes platform discovery excerpt checks).
+Discovery output: optional area, discovery task/session, title, category, CWE,
+severity, status
+`discovered|confirming|confirmed|refuted|inconclusive|duplicate|persisted`,
+finding id, `provenance` (`static|dynamic|hybrid`), optional `link_key`, full
+payload JSON. Dynamic-only candidates store `area_id = NULL`.
 
 ### `verifications` — append-only
 
@@ -157,12 +167,26 @@ Audit, format, status, path, SHA-256, size, meta JSON, generated timestamp.
 ### `approvals`
 
 Audit/task, action, scope, status `pending|approved|denied`, requester,
-decider, reason, timestamps. A task requiring approval is created as
-`waiting_approval` and cannot be claimed until approved.
+decider, reason, timestamps. Shell and writable-workspace approvals were
+retired by migration 13. The table remains for history; new audits do not
+queue those actions.
 
 ### `audit_log`
 
 Append-only security log: actor, action, target, detail JSON, IP, timestamp.
+
+### Dynamic tables
+
+| Table | Role |
+| --- | --- |
+| `project_targets` | Authorized live target: URL, hosts, CIDRs, methods, rps, TLS |
+| `target_authorizations` | Who authorized the test window and until when |
+| `test_identities` | Test accounts; `secret_ref` points at a `test-identity` credential |
+| `audit_scope_snapshots` | Frozen JSON + SHA-256 at start; one per audit |
+| `api_tokens` | SHA-256 of the bearer secret, scopes, optional project/audit bind |
+| `assets` / `asset_edges` | Project asset graph |
+| `exploration_nodes` / `exploration_edges` / `anchors` | Per-audit exploration lineage |
+| `retests` | Later dynamic retests of a finding, with their own authorization snapshot |
 
 ## Indexes
 
@@ -177,10 +201,12 @@ indexes.
 evidence_no_update / evidence_no_delete
 verifications_no_update / verifications_no_delete
 findings_provenance_immutable
+audit_scope_snapshots_no_update / audit_scope_snapshots_no_delete
 ```
 
 The finding trigger blocks changing `audit_id`, `candidate_id`, or replacing an
-already-set discovery/verification/retest session id.
+already-set discovery/verification/retest session id. Scope snapshots are
+immutable after audit start.
 
 ## Migration policy
 

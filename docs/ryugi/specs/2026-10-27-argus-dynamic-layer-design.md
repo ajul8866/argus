@@ -1,9 +1,14 @@
 # Argus Dynamic Layer — Design
 
-Status: approved
+Status: approved (design history)
 Date: 2026-10-27
 Scope: v1
 Repo: `/root/lala` (Argus v0.0.2)
+
+**Operator note:** this is the original design. The implemented default is an
+in-process broker with a GET baseline probe; `src/server.ts` does not start
+`ContainerRuntime`. For current usage, constraints, and API, see
+[Dynamic audits](../../DYNAMIC.md).
 
 ## 1. Intent
 

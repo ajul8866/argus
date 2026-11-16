@@ -12,6 +12,11 @@
   running audits no longer flash loading, reset scroll/focus, or starve updates
   under a continuous event stream.
 
+### Documentation
+
+- Operator guides now match native-tool writable sessions and the implemented
+  dynamic/hybrid path (in-process broker, target authorization, adapter tokens).
+
 ### Fixed
 
 - HTML reports no longer throw on fenced code blocks.

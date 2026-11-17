@@ -710,6 +710,59 @@ describe("repository import", () => {
     expect(existsSync(marker)).toBe(false);
   });
 
+  test("does not omit in-scope files marked export-ignore during a ref import", async () => {
+    const repository = join(dir, "export-ignore-repository");
+    createGitRepository(repository, {
+      ".gitattributes": "src/hidden.ts export-ignore\ndropdir/ export-ignore\n",
+      "src/app.ts": "export const value = 1;\n",
+      "src/hidden.ts": "export const hidden = true;\n",
+      "dropdir/payload.ts": "export const payload = true;\n",
+      "nested/.gitattributes": "secret.ts export-ignore\n",
+      "nested/visible.ts": "export const visible = true;\n",
+      "nested/secret.ts": "export const secret = true;\n",
+    });
+    const ignoreProject = {
+      ...project,
+      source_path: repository,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    };
+    const imported = await importRepository({ config, store }, ignoreProject, "HEAD", "tester");
+    expect(await Bun.file(join(imported.path, "src/app.ts")).text()).toBe("export const value = 1;\n");
+    expect(await Bun.file(join(imported.path, "src/hidden.ts")).text()).toBe("export const hidden = true;\n");
+    expect(await Bun.file(join(imported.path, "dropdir/payload.ts")).text()).toBe("export const payload = true;\n");
+    expect(await Bun.file(join(imported.path, "nested/visible.ts")).text()).toBe("export const visible = true;\n");
+    expect(await Bun.file(join(imported.path, "nested/secret.ts")).text()).toBe("export const secret = true;\n");
+  });
+
+  test("does not follow refs/replace to a different tree during a ref import", async () => {
+    const repository = join(dir, "replaced-repository");
+    const original = createGitRepository(repository, {
+      "src/app.ts": "export const version = 1;\n",
+    });
+    writeFileSync(join(repository, "src/app.ts"), "export const version = 2;\n");
+    writeFileSync(join(repository, "src/hidden.ts"), "export const hidden = true;\n");
+    runGit(repository, ["add", "-A"]);
+    runGit(repository, [
+      "-c", "user.name=Argus tests",
+      "-c", "user.email=tests@example.invalid",
+      "commit", "-qm", "second",
+    ]);
+    const head = runGit(repository, ["rev-parse", "HEAD"]);
+    expect(head).not.toBe(original);
+    runGit(repository, ["replace", head, original]);
+    const replacedProject = {
+      ...project,
+      source_path: repository,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    };
+    const imported = await importRepository({ config, store }, replacedProject, "HEAD", "tester");
+    expect(imported.commit_sha).toBe(head);
+    expect(await Bun.file(join(imported.path, "src/app.ts")).text()).toBe("export const version = 2;\n");
+    expect(await Bun.file(join(imported.path, "src/hidden.ts")).text()).toBe("export const hidden = true;\n");
+  });
+
   test("a concurrent commondir rewrite cannot redirect an in-progress import", async () => {
     const handoff = join(dir, "commondir-handoff");
     const inside = join(handoff, "common");

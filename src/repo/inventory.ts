@@ -155,6 +155,7 @@ const GIT_ENV = (): Record<string, string> => ({
   GIT_CONFIG_NOSYSTEM: "1",
   GIT_CONFIG_GLOBAL: "/dev/null",
   GIT_ATTR_NOSYSTEM: "1",
+  GIT_NO_REPLACE_OBJECTS: "1",
 });
 
 async function runGit(path: string, args: string[]): Promise<string | null> {
@@ -474,6 +475,16 @@ export async function preparePrivateGitDirectory(
       // replace it instead of truncating the shared inode.
       await rm(join(privateDirectory, "config"), { force: true });
       await writeFile(join(privateDirectory, "config"), `${config.join("\n")}\n`, { mode: 0o600 });
+      // `git archive` still honours committed `.gitattributes`. Disable
+      // `export-ignore` so in-scope blobs cannot be omitted from the snapshot,
+      // and disable `export-subst`/`ident` so `$Format:%G?$` cannot invoke gpg
+      // and `$Id$` cannot rewrite archived bytes away from the committed blob.
+      await mkdir(join(privateDirectory, "info"), { recursive: true, mode: 0o700 });
+      await writeFile(
+        join(privateDirectory, "info", "attributes"),
+        "* -export-ignore -export-subst -ident\n",
+        { mode: 0o600 },
+      );
       return { gitDirectory: privateDirectory };
     } finally {
       if (commonHandle) await commonHandle.close().catch(() => undefined);

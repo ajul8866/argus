@@ -23,6 +23,7 @@ function privateGitEnvironment(staging: string): Record<string, string> {
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_CONFIG_GLOBAL: "/dev/null",
     GIT_ATTR_NOSYSTEM: "1",
+    GIT_NO_REPLACE_OBJECTS: "1",
   };
 }
 

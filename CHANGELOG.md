@@ -27,6 +27,10 @@
   redirects, and `objects/info/alternates`. Git metadata and ref-import objects
   are materialized into private staging before use, with a whitelisted config;
   a folder import no longer records a parent repository's commit.
+- Git-ref import disables committed `export-ignore`, `export-subst`, and
+  `ident` attributes in private staging, and sets `GIT_NO_REPLACE_OBJECTS`,
+  so archive cannot omit in-scope files, rewrite `$Format`/`$Id$` placeholders,
+  or follow `refs/replace` to a different tree.
 
 
 ## [0.0.2](https://github.com/ajul8866/argus/releases/tag/v0.0.2) — 2026-10-26

@@ -710,6 +710,102 @@ describe("repository import", () => {
     expect(existsSync(marker)).toBe(false);
   });
 
+  test("does not fetch submodules or run submodule update commands during a ref import", async () => {
+    const marker = join(dir, "submodule-update-ran");
+    const submodule = join(dir, "submodule-source");
+    createGitRepository(submodule, { "secret.ts": "SUBMODULE_SECRET=hunter2\n" });
+    const repository = join(dir, "submodule-parent");
+    createGitRepository(repository, {
+      "src/app.ts": "export const value = 1;\n",
+      ".gitmodules": `[submodule "vendor"]\n\tpath = vendor\n\turl = ${submodule}\n\tupdate = !touch "${marker}"\n`,
+    });
+    const gitlink = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    runGit(repository, ["update-index", "--add", "--cacheinfo", `160000,${gitlink},vendor`]);
+    runGit(repository, [
+      "-c", "user.name=Argus tests",
+      "-c", "user.email=tests@example.invalid",
+      "commit", "-qm", "add submodule gitlink",
+    ]);
+    const submoduleProject = {
+      ...project,
+      source_path: repository,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    };
+    const imported = await importRepository({ config, store }, submoduleProject, "HEAD", "tester");
+    expect(await Bun.file(join(imported.path, "src/app.ts")).text()).toBe("export const value = 1;\n");
+    expect(await Bun.file(join(imported.path, ".gitmodules")).text()).toContain("path = vendor");
+    expect(await Bun.file(join(imported.path, "vendor/secret.ts")).exists()).toBe(false);
+    expect(existsSync(join(imported.path, "vendor"))).toBe(false);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  test("imports an annotated tag as the peeled commit without running repository hooks", async () => {
+    const hookMarker = join(dir, "repository-hook-ran");
+    const repository = join(dir, "annotated-tag-repository");
+    const tagged = createGitRepository(repository, { "src/app.ts": "export const version = 1;\n" });
+    runGit(repository, [
+      "-c", "user.name=Argus tests",
+      "-c", "user.email=tests@example.invalid",
+      "tag", "-a", "v1.0", "-m", "annotated release",
+    ]);
+    writeFileSync(join(repository, "src/app.ts"), "export const version = 2;\n");
+    writeFileSync(join(repository, "src/later.ts"), "export const later = true;\n");
+    runGit(repository, ["add", "-A"]);
+    runGit(repository, [
+      "-c", "user.name=Argus tests",
+      "-c", "user.email=tests@example.invalid",
+      "commit", "-qm", "after the tag",
+    ]);
+    const hook = `#!/bin/sh\ntouch "${hookMarker}"\nexit 0\n`;
+    for (const name of ["post-checkout", "post-commit", "reference-transaction", "update", "push-to-checkout"]) {
+      const path = join(repository, ".git", "hooks", name);
+      writeFileSync(path, hook);
+      chmodSync(path, 0o755);
+    }
+    const worktreeHooks = join(repository, "hooks");
+    mkdirSync(worktreeHooks, { recursive: true });
+    writeFileSync(join(worktreeHooks, "post-checkout"), hook);
+    chmodSync(join(worktreeHooks, "post-checkout"), 0o755);
+    runGit(repository, ["config", "core.hooksPath", worktreeHooks]);
+    const tagProject = {
+      ...project,
+      source_path: repository,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    };
+    const imported = await importRepository({ config, store }, tagProject, "v1.0", "tester");
+    expect(imported.commit_sha).toBe(tagged);
+    expect(imported.branch).toBe("v1.0");
+    expect(await Bun.file(join(imported.path, "src/app.ts")).text()).toBe("export const version = 1;\n");
+    expect(await Bun.file(join(imported.path, "src/later.ts")).exists()).toBe(false);
+    expect(existsSync(hookMarker)).toBe(false);
+  });
+
+  test("does not copy or follow committed symlinks during a ref import", async () => {
+    const secret = join(dir, "outside-secret.ts");
+    writeFileSync(secret, "OUTSIDE_SECRET=hunter2\n");
+    const repository = join(dir, "symlink-snapshot-repository");
+    createGitRepository(repository, { "src/app.ts": "export const value = 1;\n" });
+    symlinkSync(secret, join(repository, "leak.ts"));
+    runGit(repository, ["add", "-A"]);
+    runGit(repository, [
+      "-c", "user.name=Argus tests",
+      "-c", "user.email=tests@example.invalid",
+      "commit", "-qm", "add committed symlink",
+    ]);
+    const symlinkProject = {
+      ...project,
+      source_path: repository,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    };
+    const imported = await importRepository({ config, store }, symlinkProject, "HEAD", "tester");
+    expect(await Bun.file(join(imported.path, "src/app.ts")).text()).toBe("export const value = 1;\n");
+    expect(existsSync(join(imported.path, "leak.ts"))).toBe(false);
+    expect(await Bun.file(join(imported.path, "leak.ts")).exists()).toBe(false);
+  });
+
   test("a concurrent commondir rewrite cannot redirect an in-progress import", async () => {
     const handoff = join(dir, "commondir-handoff");
     const inside = join(handoff, "common");

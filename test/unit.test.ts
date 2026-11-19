@@ -71,6 +71,21 @@ function createGitRepository(directory: string, files: Record<string, string>): 
   return runGit(directory, ["rev-parse", "HEAD"]);
 }
 
+function assignProcessEnv(overrides: Record<string, string | undefined>): () => void {
+  const previous: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(overrides)) {
+    previous[key] = process.env[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  return () => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+}
+
 function testConfig(dataDir: string): Config {
   return {
     port: 0,
@@ -681,6 +696,22 @@ describe("repository import", () => {
     }
   });
 
+  test("rejects an http-alternates file before a ref import can fetch outside objects", async () => {
+    const repository = join(dir, "http-alternates-git");
+    createGitRepository(repository, { "mine.ts": "export const mine = true;\n" });
+    mkdirSync(join(repository, ".git", "objects", "info"), { recursive: true });
+    writeFileSync(join(repository, ".git", "objects", "info", "http-alternates"), "http://127.0.0.1:1/\n");
+    const httpProject = {
+      ...project,
+      source_path: repository,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    };
+    await expect(importRepository({ config, store }, httpProject, "HEAD", "tester"))
+      .rejects.toThrow("outside the authorized repository");
+    expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+  });
+
   test("ignores repository filter configuration from includes and config.worktree", async () => {
     const marker = join(dir, "filter-executed");
     const driver = join(dir, "filter-driver.sh");
@@ -708,6 +739,70 @@ describe("repository import", () => {
     const imported = await importRepository({ config, store }, filteredProject, "HEAD", "tester");
     expect(imported.file_count).toBe(2);
     expect(existsSync(marker)).toBe(false);
+  });
+
+  test("host GIT_CONFIG_COUNT filter drivers cannot run during a ref import", async () => {
+    // git archive applies a smudge filter when .gitattributes names one and the
+    // process environment supplies filter.<name>.smudge. Ref import replaces
+    // that environment, so a host GIT_CONFIG_COUNT injection must not run.
+    const marker = join(dir, "host-filter-ran");
+    const driver = join(dir, "host-filter.sh");
+    writeFileSync(driver, `#!/bin/sh\ntouch "${marker}"\nexec cat\n`);
+    chmodSync(driver, 0o755);
+    const repository = join(dir, "host-filter-repository");
+    createGitRepository(repository, {
+      ".gitattributes": "* filter=evil\n",
+      "src/app.ts": "export const value = 1;\n",
+    });
+    const restoreEnv = assignProcessEnv({
+      GIT_CONFIG_COUNT: "2",
+      GIT_CONFIG_KEY_0: "filter.evil.smudge",
+      GIT_CONFIG_VALUE_0: driver,
+      GIT_CONFIG_KEY_1: "filter.evil.required",
+      GIT_CONFIG_VALUE_1: "true",
+      GIT_CONFIG_PARAMETERS: `'filter.evil.smudge=${driver}'`,
+    });
+    try {
+      const filteredProject = {
+        ...project,
+        source_path: repository,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      };
+      const imported = await importRepository({ config, store }, filteredProject, "HEAD", "tester");
+      expect(await Bun.file(join(imported.path, "src/app.ts")).text()).toBe("export const value = 1;\n");
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test("host GIT_OBJECT_DIRECTORY and GIT_ALTERNATE_OBJECT_DIRECTORIES cannot redirect a ref import", async () => {
+    const victim = mkdtempSync(join(tmpdir(), "argus-object-env-victim-"));
+    try {
+      createGitRepository(victim, { "confidential.ts": "OFF_ROOT_SECRET=hunter2\n" });
+      const repository = join(dir, "object-env-repository");
+      createGitRepository(repository, { "mine.ts": "export const mine = true;\n" });
+      const restoreEnv = assignProcessEnv({
+        GIT_OBJECT_DIRECTORY: join(victim, ".git", "objects"),
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: join(victim, ".git", "objects"),
+      });
+      try {
+        const objectProject = {
+          ...project,
+          source_path: repository,
+          scope_include: JSON.stringify(["**/*"]),
+          scope_exclude: "[]",
+        };
+        const imported = await importRepository({ config, store }, objectProject, "HEAD", "tester");
+        expect(await Bun.file(join(imported.path, "mine.ts")).text()).toBe("export const mine = true;\n");
+        expect(await Bun.file(join(imported.path, "confidential.ts")).exists()).toBe(false);
+      } finally {
+        restoreEnv();
+      }
+    } finally {
+      rmSync(victim, { recursive: true, force: true });
+    }
   });
 
   test("a concurrent commondir rewrite cannot redirect an in-progress import", async () => {

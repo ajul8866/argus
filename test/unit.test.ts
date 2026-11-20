@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import type { Config } from "../src/config.ts";
 import { loadConfig, PHASE_NAMES } from "../src/config.ts";
 import { KeyedSerialQueue } from "../src/concurrency.ts";
@@ -595,6 +595,50 @@ describe("repository import", () => {
     }
   });
 
+  test("rejects a .git symlink or relative gitdir pointer that escapes the authorized repository", async () => {
+    const victim = mkdtempSync(join(tmpdir(), "argus-offroot-gitlink-"));
+    try {
+      createGitRepository(victim, { "confidential.ts": "OFF_ROOT_SECRET=hunter2\n" });
+      // The victim may itself be an allowed root; the project's source path is the boundary.
+      const permissive = { ...config, allowedRoots: [...config.allowedRoots, victim] };
+
+      const symlinkHandoff = join(dir, "git-symlink");
+      mkdirSync(symlinkHandoff, { recursive: true });
+      symlinkSync(join(victim, ".git"), join(symlinkHandoff, ".git"));
+      writeFileSync(join(symlinkHandoff, "mine.ts"), "export const mine = true;\n");
+      const symlinkProject = {
+        ...project,
+        source_path: symlinkHandoff,
+        scope_include: JSON.stringify(["**/*"]),
+      };
+      for (const ref of [null, "HEAD"]) {
+        await expect(importRepository({ config: permissive, store }, symlinkProject, ref, "tester"))
+          .rejects.toMatchObject({
+            code: "bad_request",
+            message: expect.stringContaining("outside the authorized repository"),
+          });
+      }
+      expect(await gitInfo(symlinkHandoff)).toEqual({ commit: null, branch: null });
+
+      const relativeHandoff = join(dir, "relative-gitdir");
+      mkdirSync(relativeHandoff, { recursive: true });
+      writeFileSync(join(relativeHandoff, ".git"), `gitdir: ${relative(relativeHandoff, join(victim, ".git"))}\n`);
+      writeFileSync(join(relativeHandoff, "mine.ts"), "export const mine = true;\n");
+      const relativeProject = { ...symlinkProject, source_path: relativeHandoff };
+      for (const ref of [null, "HEAD"]) {
+        await expect(importRepository({ config: permissive, store }, relativeProject, ref, "tester"))
+          .rejects.toMatchObject({
+            code: "bad_request",
+            message: expect.stringContaining("outside the authorized repository"),
+          });
+      }
+      expect(await gitInfo(relativeHandoff)).toEqual({ commit: null, branch: null });
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+    } finally {
+      rmSync(victim, { recursive: true, force: true });
+    }
+  });
+
   test("rejects a git directory whose common object store escapes the repository root", async () => {
     const victim = mkdtempSync(join(tmpdir(), "argus-offroot-common-"));
     try {
@@ -649,6 +693,57 @@ describe("repository import", () => {
       await expect(importRepository({ config, store }, refsProject, "main", "tester"))
         .rejects.toThrow("outside the authorized repository");
       await expect(importRepository({ config, store }, refsProject, null, "tester"))
+        .rejects.toThrow("outside the authorized repository");
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+    } finally {
+      rmSync(victim, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects symlinked git metadata files and nested object blobs", async () => {
+    const victim = mkdtempSync(join(tmpdir(), "argus-symlink-meta-"));
+    try {
+      createGitRepository(victim, { "confidential.ts": "OFF_ROOT_SECRET=hunter2\n" });
+      const replaceWithSymlink = (target: string, destination: string) => {
+        rmSync(destination, { force: true });
+        symlinkSync(target, destination);
+      };
+
+      for (const name of ["HEAD", "config", "packed-refs", "commondir"] as const) {
+        const handoff = join(dir, `symlinked-${name}`);
+        createGitRepository(handoff, { "mine.ts": "export const mine = true;\n" });
+        const target = name === "commondir" || name === "packed-refs"
+          ? join(victim, ".git", "HEAD")
+          : join(victim, ".git", name);
+        replaceWithSymlink(target, join(handoff, ".git", name));
+        const metadataProject = {
+          ...project,
+          source_path: handoff,
+          scope_include: JSON.stringify(["**/*"]),
+          scope_exclude: "[]",
+        };
+        for (const ref of [null, "HEAD"]) {
+          // A symlink HEAD makes git refuse the directory entirely; the other
+          // metadata files are rejected after the git directory is located.
+          await expect(importRepository({ config, store }, metadataProject, ref, "tester"))
+            .rejects.toMatchObject({
+              code: "bad_request",
+              message: expect.stringMatching(/outside the authorized repository|Failed to locate the git directory/),
+            });
+        }
+      }
+
+      const objectsHandoff = join(dir, "symlinked-object-blob");
+      createGitRepository(objectsHandoff, { "mine.ts": "export const mine = true;\n" });
+      mkdirSync(join(objectsHandoff, ".git", "objects", "zz"), { recursive: true });
+      symlinkSync(join(victim, "confidential.ts"), join(objectsHandoff, ".git", "objects", "zz", "deadbeef"));
+      const objectsProject = {
+        ...project,
+        source_path: objectsHandoff,
+        scope_include: JSON.stringify(["**/*"]),
+        scope_exclude: "[]",
+      };
+      await expect(importRepository({ config, store }, objectsProject, "HEAD", "tester"))
         .rejects.toThrow("outside the authorized repository");
       expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
     } finally {

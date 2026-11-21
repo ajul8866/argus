@@ -33,8 +33,13 @@ LLM agents. Use it only on repositories you are authorized to assess.
 - Git directory resolution is canonicalized and the resolved git directory,
   common directory, ref store, and object store must remain inside the project's
   authorized repository root. A `.git` file whose `gitdir:` pointer redirects
-  git elsewhere, a `commondir` redirect, symlinked git metadata, and an
-  `objects/info/alternates` file are rejected.
+  git elsewhere, a `commondir` redirect (including a relative `../` pointer),
+  a linked worktree whose git directory lives outside the nominated folder,
+  symlinked or non-regular git metadata, named pipes in the object store, and
+  an `objects/info/alternates` file are rejected. Git discovery is time-bounded
+  so a FIFO `commondir` cannot stall import waiting for a writer. Repository
+  format extensions other than `sha1`/`sha256` and `files`/`reftable` are
+  refused before archive.
 - Git metadata and, for ref imports, the object store are materialized into
   private staging (hard links where possible, copies across filesystems) before
   any git command runs. Linux pins the validated directory inodes through

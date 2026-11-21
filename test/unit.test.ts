@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { open, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import type { Config } from "../src/config.ts";
 import { loadConfig, PHASE_NAMES } from "../src/config.ts";
 import { KeyedSerialQueue } from "../src/concurrency.ts";
@@ -617,6 +617,125 @@ describe("repository import", () => {
     } finally {
       rmSync(victim, { recursive: true, force: true });
     }
+  });
+
+  test("rejects a relative commondir pointer that escapes the authorized repository", async () => {
+    const victim = mkdtempSync(join(tmpdir(), "argus-relative-common-"));
+    try {
+      createGitRepository(victim, { "confidential.ts": "OFF_ROOT_SECRET=hunter2\n" });
+      const handoff = join(dir, "relative-commondir");
+      mkdirSync(join(handoff, ".git"), { recursive: true });
+      writeFileSync(join(handoff, ".git", "HEAD"), "ref: refs/heads/main\n");
+      writeFileSync(
+        join(handoff, ".git", "commondir"),
+        `${relative(join(handoff, ".git"), join(victim, ".git"))}\n`,
+      );
+      writeFileSync(join(handoff, "mine.ts"), "export const mine = true;\n");
+      const commonProject = {
+        ...project,
+        source_path: handoff,
+        scope_include: JSON.stringify(["**/*"]),
+      };
+      for (const ref of [null, "HEAD"]) {
+        await expect(importRepository({ config, store }, commonProject, ref, "tester"))
+          .rejects.toThrow("outside the authorized repository");
+      }
+      expect(await gitInfo(handoff)).toEqual({ commit: null, branch: null });
+      expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+    } finally {
+      rmSync(victim, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects named pipes in git metadata and object stores without waiting", { timeout: 20_000 }, async () => {
+    const fifoProject = {
+      ...project,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    };
+    const mkfifo = (path: string) => {
+      expect(Bun.spawnSync(["mkfifo", path]).exitCode).toBe(0);
+    };
+    const rejected = {
+      code: "bad_request",
+      message: expect.stringMatching(/outside the authorized repository|Failed to locate the git directory/),
+    };
+
+    const commondirHandoff = join(dir, "fifo-commondir");
+    mkdirSync(join(commondirHandoff, ".git"), { recursive: true });
+    writeFileSync(join(commondirHandoff, ".git", "HEAD"), "ref: refs/heads/main\n");
+    mkfifo(join(commondirHandoff, ".git", "commondir"));
+    writeFileSync(join(commondirHandoff, "mine.ts"), "export const mine = true;\n");
+    await expect(importRepository({ config, store }, { ...fifoProject, source_path: commondirHandoff }, "HEAD", "tester"))
+      .rejects.toMatchObject(rejected);
+
+    const packedHandoff = join(dir, "fifo-packed-refs");
+    createGitRepository(packedHandoff, { "mine.ts": "export const mine = true;\n" });
+    rmSync(join(packedHandoff, ".git", "packed-refs"), { force: true });
+    mkfifo(join(packedHandoff, ".git", "packed-refs"));
+    await expect(importRepository({ config, store }, { ...fifoProject, source_path: packedHandoff }, "HEAD", "tester"))
+      .rejects.toMatchObject(rejected);
+
+    const objectsHandoff = join(dir, "fifo-objects");
+    createGitRepository(objectsHandoff, { "mine.ts": "export const mine = true;\n" });
+    mkdirSync(join(objectsHandoff, ".git", "objects", "zz"), { recursive: true });
+    mkfifo(join(objectsHandoff, ".git", "objects", "zz", "deadbeef"));
+    await expect(importRepository({ config, store }, { ...fifoProject, source_path: objectsHandoff }, "HEAD", "tester"))
+      .rejects.toMatchObject(rejected);
+    expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+  });
+
+  test("rejects a linked worktree whose git directory lives in another folder", async () => {
+    const main = join(dir, "linked-main");
+    createGitRepository(main, { "mine.ts": "export const mine = true;\n" });
+    runGit(main, ["branch", "feature"]);
+    const linked = join(dir, "linked-worktree");
+    runGit(main, ["worktree", "add", "-q", linked, "feature"]);
+    const linkedProject = {
+      ...project,
+      source_path: linked,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    };
+    for (const ref of [null, "HEAD"]) {
+      await expect(importRepository({ config, store }, linkedProject, ref, "tester"))
+        .rejects.toThrow("outside the authorized repository");
+    }
+    expect(await gitInfo(linked)).toEqual({ commit: null, branch: null });
+    expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
+  });
+
+  test("rejects repository format extensions outside the import whitelist", async () => {
+    const objectFormat = join(dir, "invalid-objectformat");
+    createGitRepository(objectFormat, { "mine.ts": "export const mine = true;\n" });
+    appendFileSync(
+      join(objectFormat, ".git", "config"),
+      "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = sha3\n",
+    );
+    const formatProject = {
+      ...project,
+      source_path: objectFormat,
+      scope_include: JSON.stringify(["**/*"]),
+      scope_exclude: "[]",
+    };
+    await expect(importRepository({ config, store }, formatProject, "HEAD", "tester"))
+      .rejects.toMatchObject({
+        code: "bad_request",
+        message: expect.stringMatching(/outside the authorized repository|Failed to locate the git directory|Failed to archive/),
+      });
+
+    const refStorage = join(dir, "invalid-refstorage");
+    createGitRepository(refStorage, { "mine.ts": "export const mine = true;\n" });
+    appendFileSync(
+      join(refStorage, ".git", "config"),
+      "[core]\n\trepositoryformatversion = 1\n[extensions]\n\trefstorage = sqlite\n",
+    );
+    await expect(importRepository({ config, store }, { ...formatProject, source_path: refStorage }, "HEAD", "tester"))
+      .rejects.toMatchObject({
+        code: "bad_request",
+        message: expect.stringMatching(/outside the authorized repository|Failed to locate the git directory|Failed to archive/),
+      });
+    expect(store.get<{ count: number }>("SELECT COUNT(*) AS count FROM repositories")?.count).toBe(0);
   });
 
   test("rejects symlinked refs and object stores inside an in-root git directory", async () => {

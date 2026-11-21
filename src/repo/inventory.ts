@@ -165,7 +165,20 @@ async function runGit(path: string, args: string[]): Promise<string | null> {
       stderr: "ignore",
       env: GIT_ENV(),
     });
+    // Auditor-controlled metadata can be a FIFO or socket. Bound discovery so
+    // `rev-parse` cannot block the import on a writer that never arrives.
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // already gone
+      }
+    }, 5_000);
     const [output, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    clearTimeout(timer);
+    if (timedOut) return null;
     return code === 0 ? output.trim() : null;
   } catch {
     return null;

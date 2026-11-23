@@ -988,6 +988,19 @@ describe("evidence chain", () => {
     expect(() => store.run("DELETE FROM evidence WHERE id = ?", row.id)).toThrow();
   });
 
+  test("verifications table is append-only at the database layer after schema rebuilds", () => {
+    store.run(
+      `INSERT INTO verifications (id, audit_id, candidate_id, finding_id, kind, agent_session_id, discovery_session_id, verdict, rationale, evidence_check, payload, created_at)
+       VALUES ('v1', 'a1', NULL, NULL, 'confirmation', NULL, NULL, 'CONFIRMED', 'locked', '{}', '{}', '2026-01-01')`,
+    );
+    expect(() => store.run("UPDATE verifications SET rationale = 'rewritten' WHERE id = 'v1'")).toThrow(/append-only/i);
+    expect(() => store.run("DELETE FROM verifications WHERE id = 'v1'")).toThrow(/append-only/i);
+    expect(store.get("SELECT verdict, rationale FROM verifications WHERE id = 'v1'")).toEqual({
+      verdict: "CONFIRMED",
+      rationale: "locked",
+    });
+  });
+
   test("evidence content fails closed when the sidecar does not match the database record", async () => {
     const row = await evidence.append({ auditId: "a1", kind: "agent_prompt", title: "one", content: "alpha" });
     expect((await evidence.content(row.id))?.content).toBe("alpha");

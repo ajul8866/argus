@@ -1354,6 +1354,68 @@ test("retired writable audit overrides fail with migration guidance", () => {
   }
 });
 
+test("cancelling a report task after generation starts does not complete it", async () => {
+  store.run("UPDATE audits SET status = 'running', started_at = ? WHERE id = ?", now(), auditId);
+  const reports = (engine as unknown as { reports: ReportService }).reports;
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  reports.generate = async () => {
+    entered.resolve();
+    await release.promise;
+    return ["markdown", "json", "html", "pdf"].map((format) => ({
+      id: uid(),
+      format: format as "markdown" | "json" | "html" | "pdf",
+      path: join(dir, `report.${format}`),
+      sha256: "abc",
+      size: 1,
+    }));
+  };
+  const taskId = engine.createTask({
+    auditId, phase: 6, kind: "phase6.report", taskKey: "phase6:cancel-report",
+    title: "Generate reports", payload: {}, agentRole: null,
+  });
+  await entered.promise;
+  engine.cancelTask(taskId, "u1");
+  release.resolve();
+  await waitFor(() => ["completed", "failed", "cancelled", "blocked"].includes(
+    store.get<{ status: string }>("SELECT status FROM tasks WHERE id = ?", taskId)?.status ?? "",
+  ));
+  expect(store.get("SELECT status, failure_kind FROM tasks WHERE id = ?", taskId)).toMatchObject({
+    status: "cancelled",
+    failure_kind: "cancelled",
+  });
+  await engine.cancelAudit(auditId, "u1");
+}, 15_000);
+
+test("cancelling a persist task after persistence starts does not complete it", async () => {
+  store.run("UPDATE audits SET status = 'running', started_at = ? WHERE id = ?", now(), auditId);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  (engine as unknown as {
+    persistFinding: (task: unknown, payload: Record<string, unknown>) => Promise<Record<string, unknown>>;
+  }).persistFinding = async () => {
+    entered.resolve();
+    await release.promise;
+    return { finding_id: "cancelled-persist" };
+  };
+  const taskId = engine.createTask({
+    auditId, phase: 4, kind: "phase4.persist", taskKey: "phase4:cancel-persist",
+    title: "Persist finding", payload: { candidate_id: "c-cancel-persist", verification_id: "v-cancel-persist" },
+    agentRole: null,
+  });
+  await entered.promise;
+  engine.cancelTask(taskId, "u1");
+  release.resolve();
+  await waitFor(() => ["completed", "failed", "cancelled", "blocked"].includes(
+    store.get<{ status: string }>("SELECT status FROM tasks WHERE id = ?", taskId)?.status ?? "",
+  ));
+  expect(store.get("SELECT status, failure_kind FROM tasks WHERE id = ?", taskId)).toMatchObject({
+    status: "cancelled",
+    failure_kind: "cancelled",
+  });
+  await engine.cancelAudit(auditId, "u1");
+}, 15_000);
+
 describe("audit modes", () => {
   function insertRepositorylessProject(): void {
     store.run(
@@ -1493,6 +1555,56 @@ describe("audit modes", () => {
 
     await engine.closeExploration(id, "done");
     await (engine as unknown as { reconcile(id: string): Promise<void> }).reconcile(id);
+    expect(
+      store.get<{ status: string }>("SELECT status FROM audit_phases WHERE audit_id = ? AND phase = 2", id)?.status,
+    ).toBe("completed");
+  });
+
+  test("a hybrid audit cannot complete phase 2 before exploration closes", async () => {
+    await engine.stop();
+    const targets = new TargetService(store);
+    const target = targets.createTarget({
+      projectId: "p1",
+      label: "Staging",
+      baseUrl: "https://app.example.test",
+      environment: "staging",
+      allowedHosts: ["app.example.test"],
+      allowedMethods: ["GET"],
+    });
+    targets.createAuthorization({
+      targetId: target.id,
+      authorizedBy: "Tester",
+      reference: "AUTH-HYBRID",
+      validFrom: "2020-01-01T00:00:00.000Z",
+      validUntil: "2099-01-01T00:00:00.000Z",
+      authorizedActions: { methods: ["GET"] },
+      restrictions: {},
+    });
+    const id = engine.createAudit({
+      projectId: "p1",
+      repositoryId: "r1",
+      userId: "u1",
+      mode: "hybrid",
+      targetId: target.id,
+    });
+    store.run("UPDATE audits SET status = 'running', exploration_status = 'open', started_at = ? WHERE id = ?", now(), id);
+    store.run(
+      "INSERT INTO tasks (id, audit_id, phase, kind, task_key, title, status, payload, attempts, max_attempts, created_at) VALUES ('t-hybrid-2', ?, 2, 'phase2.discover', 'phase2:hybrid', 'Discover', 'completed', '{}', 1, 2, ?)",
+      id,
+      now(),
+    );
+
+    const reconcile = (engine as unknown as { reconcile(id: string): Promise<void> }).reconcile.bind(engine);
+    await reconcile(id);
+    expect(
+      store.get<{ status: string }>("SELECT status FROM audit_phases WHERE audit_id = ? AND phase = 2", id)?.status,
+    ).toBe("running");
+    expect(
+      store.get<{ status: string }>("SELECT status FROM audit_phases WHERE audit_id = ? AND phase = 3", id)?.status,
+    ).toBe("pending");
+
+    await engine.closeExploration(id, "done");
+    await reconcile(id);
     expect(
       store.get<{ status: string }>("SELECT status FROM audit_phases WHERE audit_id = ? AND phase = 2", id)?.status,
     ).toBe("completed");

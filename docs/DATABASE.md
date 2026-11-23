@@ -98,8 +98,11 @@ deadline, timestamps.
 
 ### `task_dependencies`
 
-`(task_id, depends_on_task_id)` primary key. A task is schedulable only when all
-dependencies are `completed`.
+`(task_id, depends_on_task_id)` primary key. A task stays queued while any
+dependency is still `queued`, `running`, or `waiting_approval`. A terminal
+dependency (`completed`, `failed`, `cancelled`, or `blocked`) releases the
+successor. A predecessor that already committed its output must not wedge the
+audit by ending unsuccessfully.
 
 ### `coverage`
 
